@@ -1,6 +1,6 @@
 {
   "name": "Padel Bot1",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "slug": "padel_bot",
   "icon": "mdi:tennis-ball",
   "description": "Mein Python Padel Bot für Home Assistant",
