@@ -9,6 +9,10 @@
   kein hardcodierter Fallback mehr – Warnung wenn nicht gefunden
 • Startup-Check meldet fehlende Person-IDs per Telegram
 
+FIXES:
+• Bug 1: Wartezeit-Anzeige beim 7-Tage-Fenster korrekt aus sek_bis berechnet
+• Bug 2: Sinnlose Vorprüfung vor Storno entfernt – direkt stornieren, dann buchen
+
 MENÜ-STRUKTUR:
 Ebene 1 → Account-Auswahl (Live-Status + Aktualisieren)
 Ebene 2 → Klassisch buchen | Schiebe-Taktik | Stornieren | Status
@@ -986,7 +990,7 @@ def _schiebe_intern(k: str):
             senden(msg)
         zeige_account_menue(k)
 
-    # Phase 1: Warten auf 7-Tage-Fenster
+    # ── Phase 1: Warten auf 7-Tage-Fenster ───────────────────────────────────
     if modus in ("frueh", "direkt"):
         while aktiv():
             jetzt   = jetzt_lokal()
@@ -995,13 +999,24 @@ def _schiebe_intern(k: str):
                 datetime.strptime("07:00", "%H:%M").time())
             if jetzt >= fenster:
                 break
-            sek_bis  = (fenster - jetzt).total_seconds()
-            tage_bis = (datum_obj.date() - jetzt.date()).days
+            sek_bis = (fenster - jetzt).total_seconds()
+
+            # BUG 1 FIX: Wartezeit korrekt aus sek_bis berechnen
+            tage_r_w = int(sek_bis // 86400)
+            std_r_w  = int((sek_bis % 86400) // 3600)
+            min_r_w  = int((sek_bis % 3600) // 60)
+            if tage_r_w > 0:
+                warte_str_w = f"{tage_r_w}T {std_r_w}h {min_r_w}min"
+            elif std_r_w > 0:
+                warte_str_w = f"{std_r_w}h {min_r_w}min"
+            else:
+                warte_str_w = f"{min_r_w}min"
+
             senden(f"⏳ <b>[{k}] Wartet auf 7-Tage-Fenster</b>\n"
                    f"📅 {datum_de}\n"
                    f"🔓 Buchbar ab: {fenster.strftime('%d.%m.%Y um 07:00 Uhr')}\n"
-                   f"⏱️ Noch {max(0, tage_bis-7)} Tag(e) "
-                   f"{int((sek_bis % 86400) // 3600)}h")
+                   f"⏱️ Noch {warte_str_w}")
+
             schlaf = min(sek_bis - 30, 23 * 3600)
             if schlaf > 1:
                 if not schlafe(schlaf):
@@ -1014,7 +1029,7 @@ def _schiebe_intern(k: str):
     if not aktiv():
         return
 
-    # Phase 2: Ersten Slot buchen
+    # ── Phase 2: Ersten Slot buchen ───────────────────────────────────────────
     if modus == "frueh":
         jetzt       = jetzt_lokal()
         fenster_tag = (datum_obj - timedelta(days=7)).date()
@@ -1128,8 +1143,8 @@ def _schiebe_intern(k: str):
                f"🕐 {buchung['fromTime']}–{buchung['toTime']} | Court {buchung['court']}\n"
                f"🔄 Schiebe Richtung {ziel_str} Uhr...")
 
-    # Phase 3: Schrittweise schieben
-    stuck_zaehler         = {}
+    # ── Phase 3: Schrittweise schieben ───────────────────────────────────────
+    # BUG 2 FIX: stuck_zaehler und Vorprüfung entfernt – direkt stornieren, dann buchen
     letzter_session_check = time.time()
 
     while aktiv():
@@ -1214,35 +1229,8 @@ def _schiebe_intern(k: str):
         naechster_von = neuer_start.strftime("%H:%M")
         naechster_bis = neues_ende.strftime("%H:%M")
 
-        freie     = berechne_freie_slots(k, datum_de, dauer_min, ignoriere_booking_id=booking_id)
-        court_neu = next((c for c in [2, 1]
-                          if any(s["fromTime"] == naechster_von and s["court"] == c
-                                 for s in freie)), None)
-
-        if court_neu is None:
-            cnt = stuck_zaehler.get(naechster_von, 0) + 1
-            stuck_zaehler[naechster_von] = cnt
-            if cnt >= 20:
-                stuck_zaehler.pop(naechster_von, None)
-                beende(f"❌ [{k}] {naechster_von} Uhr dauerhaft belegt (20 Versuche).\n"
-                       f"🆘 Manuell: {BASE_URL}/padel?currentDate={datum_api}")
-                return
-            senden(f"⏳ [{k}] {naechster_von} Uhr belegt ({cnt}/20) – retry in 15s...")
-            if not schlafe(15):
-                return
-            continue
-        stuck_zaehler.pop(naechster_von, None)
-
-        neuer_slot = {
-            "court":     court_neu,
-            "fromTime":  naechster_von,
-            "toTime":    naechster_bis,
-            "dauer":     dauer_min,
-            "datum_api": datum_api,
-            "datum_de":  datum_de,
-            "key":       f"{datum_api}_{court_neu}_{naechster_von}_{dauer_min}",
-        }
-
+        # Direkt stornieren – keine Vorprüfung nötig, da eigene Buchung den
+        # Zielslot sowieso blockiert (überlappende Zeiten)
         senden(f"⚡ <b>[{k}] Schiebe jetzt!</b>\n"
                f"🗑️ {aktive_b['fromTime']}–{aktive_b['toTime']} "
                f"→ {naechster_von}–{naechster_bis}")
@@ -1259,21 +1247,31 @@ def _schiebe_intern(k: str):
                 return
             continue
 
-        time.sleep(2.0)
+        # Kurz warten damit der Server die Stornierung verarbeitet hat
+        time.sleep(1.5)
 
         if not stelle_session_sicher(k):
             beende(f"❌ [{k}] Session vor Neubuchung fehlgeschlagen!\n"
                    f"🆘 SOFORT manuell buchen:\n{BASE_URL}/padel?currentDate={datum_api}")
             return
 
+        neuer_slot = {
+            "fromTime":  naechster_von,
+            "toTime":    naechster_bis,
+            "dauer":     dauer_min,
+            "datum_api": datum_api,
+            "datum_de":  datum_de,
+        }
+
         ok = False
-        for versuch in range(5):
+        for versuch in range(6):
             court_v = [2, 1][versuch % 2]
-            neuer_slot["court"] = court_v
-            if buche_slot(k, neuer_slot):
+            slot_v  = {**neuer_slot, "court": court_v,
+                       "key": f"{datum_api}_{court_v}_{naechster_von}_{dauer_min}"}
+            if buche_slot(k, slot_v):
                 ok = True
                 break
-            time.sleep(0.3 * (2 ** versuch))
+            time.sleep(0.3 * (2 ** min(versuch, 3)))
 
         letzter_session_check = time.time()
 
