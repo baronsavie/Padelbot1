@@ -1,6 +1,6 @@
 {
   "name": "Padel Bot1",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "slug": "padel_bot",
   "icon": "mdi:tennis-ball",
   "description": "Mein Python Padel Bot für Home Assistant",
@@ -11,17 +11,21 @@
   "options": {
     "telegram_bot_token": "",
     "telegram_chat_id": "",
-    "sb_email": "",
-    "sb_passwort": "",
-    "ks_email": "",
-    "ks_passwort": ""
+    "account_1_label": "ACC1",
+    "account_1_email": "",
+    "account_1_passwort": "",
+    "account_2_label": "",
+    "account_2_email": "",
+    "account_2_passwort": ""
   },
   "schema": {
     "telegram_bot_token": "str",
     "telegram_chat_id": "str",
-    "sb_email": "str",
-    "sb_passwort": "str",
-    "ks_email": "str",
-    "ks_passwort": "str"
+    "account_1_label": "str",
+    "account_1_email": "str",
+    "account_1_passwort": "str",
+    "account_2_label": "str?",
+    "account_2_email": "str?",
+    "account_2_passwort": "str?"
   }
 }
