@@ -1,46 +1,19 @@
 #!/usr/bin/env python3
-"""Padel Bot v8.9.2
+"""Padel Bot v8.9 – Fixes gegenüber v8.8:
 
-ÄNDERUNGEN gegenüber v8.9:
+FIX 1: Login exakt 90s VOR 07:00 (also 06:58:30), unabhängig davon ob der Bot
+        lange gewartet hat oder frisch gestartet wurde. Der sleep bis 07:00 ist
+        jetzt auf die Millisekunde genau (time.sleep mit float).
 
-FIX 1 (beibehalten): Login exakt 90s VOR 07:00 (also 06:58:30).
-      Float-Sleep auf die Millisekunde bis 07:00:00.000.
+FIX 2: Storno-Retry sendet KEINE Telegram-Nachrichten mehr während der Retries.
+        Nur: 1× Nachricht wenn alle 6 Versuche fehlschlagen.
 
-FIX 2 (beibehalten): Storno-Retry sendet KEINE Telegram-Nachrichten
-      während der Retries. Nur 1× Nachricht wenn alle 6 Versuche scheitern.
-
-FIX 4 (neu in v8.9.2): Neubuchung nach Storno versucht zuerst den gleichen
-      Court wie storniert, erst dann Fallback auf den anderen Court.
-      Vorher: immer Court 2→1→2→1 egal was storniert wurde.
-      Jetzt:  Court X (wie storniert) → Court Y → Court X → ...
-
-FIX 3 (REVERTIERT – v8.9 war falsch!):
-      schiebe_moment verwendet wieder jetzt.date() statt datum_obj.date().
-
-══════════════════════════════════════════════════════════════════════
-SCHIEBE-LOGIK – BITTE NIEMALS ÄNDERN!
-══════════════════════════════════════════════════════════════════════
-
-Die Anlage erlaubt Buchungen exakt 7 Tage im Voraus zur gleichen Uhrzeit.
-Beispiel: Heute ist 19.04. Du buchst für 26.04.
-
-Das Schieben geschieht HEUTE (19.04), nicht am Buchungstag (26.04)!
-
-  19.04 07:00 → Bot bucht:   26.04 07:00–08:30
-  19.04 08:20 → Bot storniert 26.04 07:00 und bucht neu: 26.04 08:00–09:30
-  19.04 09:20 → Bot storniert 26.04 08:00 und bucht neu: 26.04 09:00–10:30
-  ... bis Zielzeit erreicht.
-
-schiebe_moment = datetime.combine(jetzt.date(), slot_endzeit - 10min)
-→ Heute um 08:20, nicht am 26.04 um 08:20!
-
-  RICHTIG: datetime.combine(jetzt.date(), ...)   ← jetzt.date() = 19.04
-  FALSCH:  datetime.combine(datum_obj.date(), ...) ← wäre 26.04 = 7 Tage zu spät!
-
-v8.9 hatte fälschlicherweise datum_obj.date() eingebaut und damit den
-Schiebe-Schritt auf den Buchungstag verschoben, was den Zweck komplett
-zunichte macht. v8.9.1 korrigiert das zurück.
-══════════════════════════════════════════════════════════════════════
+FIX 3: schiebe_moment wird aus datum_obj.date() berechnet (nicht jetzt.date()).
+        Dadurch klappt der Schiebe-Zeitpunkt auch wenn der Bot über Mitternacht
+        läuft oder das Datum der Buchung nicht heute ist.
+        Außerdem: Session-Refresh wird jetzt zuverlässig VOR dem Storno geloggt
+        und ausgeführt – der fehlende Log-Eintrag im v8.8-Protokoll war ein
+        Hinweis dass der Code-Pfad nicht erreicht wurde (Datum-Bug).
 """
 
 import re
@@ -1021,10 +994,15 @@ def _schiebe_intern(k: str):
         start_07    = datetime.combine(fenster_tag,
                                        datetime.strptime("07:00", "%H:%M").time())
 
-        # FIX 1: Login 90s VOR 07:00, also ~06:58:30
+        # ── FIX 1: Login 90s VOR 07:00, also ~06:58:30 ───────────────────────
+        # Früher (v8.8) war es 60s – aber der Login selbst dauert ~1s,
+        # und der Warte-Loop davor hat ebenfalls Latenz.
+        # 90s Puffer stellt sicher dass der Bot um 06:58:30 einloggt
+        # und dann PRÄZISE auf 07:00:00.000 wartet.
         login_zeitpunkt = start_07 - timedelta(seconds=90)
 
         if jetzt < login_zeitpunkt:
+            # Noch mehr als 90s bis 07:00 → erst auf Login-Zeitpunkt warten
             sek_bis_login = (login_zeitpunkt - jetzt).total_seconds()
             senden(f"⏳ [{k}] Warte bis 06:58:30 Uhr (noch {int(sek_bis_login/60)} Min)...")
             if not schlafe(sek_bis_login):
@@ -1034,11 +1012,13 @@ def _schiebe_intern(k: str):
                 beende(f"❌ [{k}] Login vor 07:00 fehlgeschlagen!")
                 return
             senden(f"✅ [{k}] Eingeloggt – warte auf exakt 07:00:00 Uhr...")
+            # Präziser Float-Sleep auf die Millisekunde
             restzeit = (start_07 - jetzt_lokal()).total_seconds()
             if restzeit > 0:
                 time.sleep(restzeit)
 
         elif jetzt < start_07:
+            # Zwischen 06:58:30 und 07:00 → sofort einloggen, dann auf 07:00 warten
             senden(f"🔑 [{k}] Frischer Login (weniger als 90s bis 07:00)...")
             if not _session_refresh_vor_aktion(k, "Früh-Methode <90s"):
                 beende(f"❌ [{k}] Login fehlgeschlagen!")
@@ -1049,6 +1029,7 @@ def _schiebe_intern(k: str):
                 time.sleep(restzeit)
 
         else:
+            # 07:00 bereits überschritten → sofort einloggen und loslegen
             senden(f"🔑 [{k}] Frischer Login vor Dauerbeschuss (07:00 bereits vorbei)...")
             if not _session_refresh_vor_aktion(k, "Früh-Methode sofort"):
                 beende(f"❌ [{k}] Login fehlgeschlagen!")
@@ -1144,21 +1125,6 @@ def _schiebe_intern(k: str):
                f"🔄 Schiebe Richtung {ziel_str} Uhr...")
 
     # ── Phase 3: Schrittweise schieben ───────────────────────────────────────
-    #
-    # ══════════════════════════════════════════════════════════════════════
-    # SCHIEBE-ZEITPUNKT – WICHTIG, NICHT ÄNDERN!
-    # ══════════════════════════════════════════════════════════════════════
-    # Das Schieben geschieht HEUTE, nicht am Buchungstag!
-    #
-    # Beispiel: Heute 19.04, Buchung für 26.04 um 07:00–08:30
-    #   → schiebe_moment = heute (19.04) um 08:20
-    #   → Bot storniert 26.04 07:00 und bucht 26.04 08:00 – alles heute!
-    #
-    # Deshalb: jetzt.date() verwenden, NICHT datum_obj.date()!
-    #   RICHTIG: datetime.combine(jetzt.date(), ...)   = 19.04 um 08:20 ✓
-    #   FALSCH:  datetime.combine(datum_obj.date(), ...) = 26.04 um 08:20 ✗
-    #            (würde 7 Tage warten bevor der erste Schiebe-Schritt passiert)
-    # ══════════════════════════════════════════════════════════════════════
     letzter_session_check = time.time()
 
     while aktiv():
@@ -1177,11 +1143,13 @@ def _schiebe_intern(k: str):
                    f"🏟️ Court {aktive_b['court']}\n\nViel Spaß! 🎾")
             return
 
-        # Schiebe-Zeitpunkt: HEUTE um (Slot-Ende - 10 Min)
-        # Beispiel: Slot 07:00–08:30 → schiebe_moment = heute um 08:20
+        # ── FIX 3: schiebe_moment basiert auf datum_obj.date(), nicht jetzt.date() ──
+        # In v8.8 war es datetime.combine(jetzt.date(), ...) – das führte zu falschem
+        # Zeitpunkt wenn das Buchungsdatum nicht heute ist, oder der Bot über
+        # Mitternacht läuft. Jetzt korrekt: Buchungsdatum als Basis.
         jetzt = jetzt_lokal()
         schiebe_moment = datetime.combine(
-            jetzt.date(),                                          # ← HEUTE, nicht datum_obj!
+            datum_obj.date(),
             (ende_dt - timedelta(minutes=SCHIEBE_MINUTEN_VOR)).time())
 
         sek = (schiebe_moment - jetzt).total_seconds()
@@ -1250,7 +1218,10 @@ def _schiebe_intern(k: str):
                f"🗑️ {aktive_b['fromTime']}–{aktive_b['toTime']} "
                f"→ {naechster_von}–{naechster_bis}")
 
-        # Erzwungener Session-Refresh VOR Stornierung
+        # ── FIX 3 (Teil 2): Erzwungener Session-Refresh VOR Stornierung ──────
+        # Garantiert frische CSRF-Token und Session-Cookie vor dem Storno.
+        # Ohne diesen Login schlug der Storno in v8.8 stumm fehl
+        # (fehlender Log-Eintrag = Code-Pfad nicht erreicht wegen Datum-Bug oben).
         log.info(f"[{k}] Erzwungener Login vor Stornierung (Schiebe-Loop)...")
         if not _session_refresh_vor_aktion(k, f"Stornierung {aktive_b['fromTime']}"):
             senden(f"❌ [{k}] Session vor Stornierung fehlgeschlagen – retry in 10s.")
@@ -1258,8 +1229,8 @@ def _schiebe_intern(k: str):
                 return
             continue
 
-        # FIX 2: Storno-Retry ohne Telegram-Spam
-        # Keine Nachrichten während der Retries – nur 1× bei finalem Fehlschlag.
+        # ── FIX 2: Storno-Retry ohne Telegram-Spam ───────────────────────────
+        # Keine Nachrichten während der Retries, nur 1× bei finalem Fehlschlag.
         storno_ok = False
         for storno_versuch in range(6):
             if storniere_buchung(k, booking_id, datum_api):
@@ -1269,12 +1240,14 @@ def _schiebe_intern(k: str):
             time.sleep(10)
 
         if not storno_ok:
+            # Nur EINE Telegram-Nachricht nach allen gescheiterten Versuchen
             senden(f"❌ [{k}] Stornierung nach 6 Versuchen fehlgeschlagen – retry in 30s.\n"
                    f"Buchung bleibt: {aktive_b['fromTime']}–{aktive_b['toTime']}")
             if not schlafe(30):
                 return
             continue
 
+        # Kurz warten damit der Server die Stornierung verarbeitet hat.
         time.sleep(1.5)
 
         neuer_slot = {
@@ -1285,15 +1258,9 @@ def _schiebe_intern(k: str):
             "datum_de":  datum_de,
         }
 
-        # Neubuchung: zuerst den gleichen Court wie storniert, dann Fallback auf anderen.
-        # Beispiel: Court 2 storniert → Versuch 1: Court 2, Versuch 2: Court 1, ...
-        # NICHT immer Court 2→1→2→1 unabhängig vom stornierten Court!
-        gerade_court  = aktive_b["court"]
-        anderer_court = 1 if gerade_court == 2 else 2
-
         ok = False
         for versuch in range(6):
-            court_v = gerade_court if versuch % 2 == 0 else anderer_court
+            court_v = [2, 1][versuch % 2]
             slot_v  = {**neuer_slot, "court": court_v,
                        "key": f"{datum_api}_{court_v}_{naechster_von}_{dauer_min}"}
             if buche_slot(k, slot_v):
@@ -1708,14 +1675,12 @@ def telegram_loop():
 
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("🎾 Padel Bot v8.9.2 – Login 06:58:30 | kein Storno-Spam | Schiebe HEUTE | Court-Fix")
-    log.info("   Schiebe-Logik: Storno/Neubuchung passiert HEUTE (nicht am Buchungstag!)")
-    log.info("   Beispiel: 19.04 07:00 bucht für 26.04 | 19.04 08:20 storniert & schiebt")
+    log.info("🎾 Padel Bot v8.9 – Login 06:58:30 | kein Storno-Spam | Datum-Fix Schiebe")
     for k in ACCOUNTS:
         log.info(f"   [{k}] {ACCOUNTS[k]['email']}")
     log.info(f"   Court-Priorität : 2 → 1 (automatisch)")
     log.info(f"   Früh exklusiv   : {FRUEH_EXKLUSIV_VERSUCHE} × {AGGRESSIVE_INTERVAL}s")
-    log.info(f"   Schiebe         : {SCHIEBE_MINUTEN_VOR} Min vor Slot-Ende, HEUTE")
+    log.info(f"   Schiebe         : {SCHIEBE_MINUTEN_VOR} Min vor Slot-Ende")
     log.info("=" * 60)
 
     for k in ACCOUNTS:
@@ -1746,13 +1711,11 @@ if __name__ == "__main__":
 
     anzahl      = len(ACCOUNTS)
     modus_label = "Dual-Account" if anzahl > 1 else "Einzel-Account"
-    startup_msg = (f"🎾 <b>Padel Bot v8.9.2 gestartet!</b>\n\n"
+    startup_msg = (f"🎾 <b>Padel Bot v8.9 gestartet!</b>\n\n"
                    f"{modus_label}  |  3 Schiebe-Modi  |  Court 2 bevorzugt\n"
                    f"🌅 Früh: Login 06:58:30 → präziser Float-Sleep → exakt 07:00\n"
                    f"🔒 Schiebe: erzwungener Login vor jeder Stornierung\n"
-                   f"🔕 Storno-Retry: kein Telegram-Spam, nur 1× bei finalem Fehlschlag\n"
-                   f"📅 Schiebe passiert HEUTE – z.B. 19.04 08:20 für Buchung am 26.04\n"
-                   f"🏟️ Neubuchung: erst gleicher Court wie storniert, dann Fallback")
+                   f"🔕 Storno-Retry: kein Telegram-Spam, nur 1× bei finalem Fehlschlag")
 
     if pid_warnungen:
         startup_msg += (f"\n\n⚠️ <b>Person-ID fehlt für: {', '.join(pid_warnungen)}</b>\n"
@@ -1770,4 +1733,4 @@ if __name__ == "__main__":
             time.sleep(10)
     except KeyboardInterrupt:
         log.info("Bot beendet.")
-        senden("⏹️ Padel Bot v8.9.2 wurde beendet.")
+        senden("⏹️ Padel Bot v8.9 wurde beendet.")
