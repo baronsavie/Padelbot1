@@ -1,23 +1,7 @@
 #!/usr/bin/env python3
-"""Padel Bot v8.9.3
+"""Padel Bot v8.9.2
 
-ÄNDERUNGEN gegenüber v8.9.2:
-
-FIX 5 (neu in v8.9.3): Pre-Fire Buchung – minimale Lücke beim Schieben
-      Statt: Storno → sleep(1.5) → Buchung (3–6s Lücke)
-      Jetzt:
-        1. Buchungs-Thread startet 500ms VOR der Stornierung
-           und feuert Dauerbeschuss auf den neuen Slot (wird erstmal
-           abgelehnt solange eigene Buchung noch drauf liegt)
-        2. Stornierung passiert
-        3. Buchungs-Thread trifft beim nächsten Schuss sofort
-      → Effektive Lücke: < 300ms statt 3–6 Sekunden
-
-FIX 6 (neu in v8.9.3): Zufällige Storno-Zeit
-      Statt immer exakt bei Slot-Ende minus 10 Min zu stornieren,
-      wird ein zufälliger Offset von ±5 Minuten addiert
-      (konfigurierbar: SCHIEBE_RANDOM_OFFSET_MIN/MAX).
-      Macht das Muster für andere Nutzer schwerer erkennbar.
+ÄNDERUNGEN gegenüber v8.9:
 
 FIX 1 (beibehalten): Login exakt 90s VOR 07:00 (also 06:58:30).
       Float-Sleep auf die Millisekunde bis 07:00:00.000.
@@ -25,10 +9,13 @@ FIX 1 (beibehalten): Login exakt 90s VOR 07:00 (also 06:58:30).
 FIX 2 (beibehalten): Storno-Retry sendet KEINE Telegram-Nachrichten
       während der Retries. Nur 1× Nachricht wenn alle 6 Versuche scheitern.
 
-FIX 4 (beibehalten): Neubuchung nach Storno versucht zuerst den gleichen
+FIX 4 (neu in v8.9.2): Neubuchung nach Storno versucht zuerst den gleichen
       Court wie storniert, erst dann Fallback auf den anderen Court.
+      Vorher: immer Court 2→1→2→1 egal was storniert wurde.
+      Jetzt:  Court X (wie storniert) → Court Y → Court X → ...
 
-FIX 3 (beibehalten): schiebe_moment verwendet jetzt.date() statt datum_obj.date().
+FIX 3 (REVERTIERT – v8.9 war falsch!):
+      schiebe_moment verwendet wieder jetzt.date() statt datum_obj.date().
 
 ══════════════════════════════════════════════════════════════════════
 SCHIEBE-LOGIK – BITTE NIEMALS ÄNDERN!
@@ -44,32 +31,20 @@ Das Schieben geschieht HEUTE (19.04), nicht am Buchungstag (26.04)!
   19.04 09:20 → Bot storniert 26.04 08:00 und bucht neu: 26.04 09:00–10:30
   ... bis Zielzeit erreicht.
 
-schiebe_moment = datetime.combine(jetzt.date(), slot_endzeit - RANDOM_OFFSET)
-→ Heute um 08:10–08:20 (zufällig), nicht am 26.04!
+schiebe_moment = datetime.combine(jetzt.date(), slot_endzeit - 10min)
+→ Heute um 08:20, nicht am 26.04 um 08:20!
 
   RICHTIG: datetime.combine(jetzt.date(), ...)   ← jetzt.date() = 19.04
   FALSCH:  datetime.combine(datum_obj.date(), ...) ← wäre 26.04 = 7 Tage zu spät!
 
-══════════════════════════════════════════════════════════════════════
-PRE-FIRE LOGIK – BITTE NIEMALS ÄNDERN!
-══════════════════════════════════════════════════════════════════════
-
-Ziel: Lücke zwischen Storno und Neubuchung auf < 300ms reduzieren.
-
-Ablauf:
-  t=0:     Buchungs-Thread B startet, feuert auf neuen Slot
-           → Server antwortet mit Fehler (Slot belegt durch eigene Buchung)
-  t=0.5s:  Stornierung von altem Slot durch Thread A
-  t=0.5s+: Nächster Schuss von Thread B trifft den jetzt freien Slot
-
-Der Buchungs-Thread läuft mit PREFIRE_INTERVAL (0.15s) zwischen Versuchen.
-Die TCP-Verbindung ist bereits warm wenn die Stornierung durchgeht.
+v8.9 hatte fälschlicherweise datum_obj.date() eingebaut und damit den
+Schiebe-Schritt auf den Buchungstag verschoben, was den Zweck komplett
+zunichte macht. v8.9.1 korrigiert das zurück.
 ══════════════════════════════════════════════════════════════════════
 """
 
 import re
 import json
-import random
 import requests
 import threading
 import time
@@ -119,19 +94,11 @@ TELEGRAM_CHAT_ID   = _required("telegram_chat_id")
 ANLAGE_OEFFNUNG     = "07:00"
 ANLAGE_SCHLUSS      = "22:00"
 
-SCHIEBE_MINUTEN_VOR         = 10   # Basis-Offset vor Slot-Ende (Minuten)
-SCHIEBE_RANDOM_OFFSET_MIN   = 0    # Frühester zufälliger Zusatz-Offset (Minuten, kann 0 sein)
-SCHIEBE_RANDOM_OFFSET_MAX   = 5    # Spätester zufälliger Zusatz-Offset (Minuten)
-                                    # Ergebnis: Storno zwischen (Ende - 15min) und (Ende - 10min)
-
-PREFIRE_VORLAUF_SEK         = 0.5  # Sekunden VOR Stornierung, die Buchungs-Thread startet
-PREFIRE_INTERVAL            = 0.15 # Sekunden zwischen Pre-Fire Buchungsversuchen
-PREFIRE_TIMEOUT             = 15   # Maximale Sekunden für Pre-Fire Buchungsversuche
-
-LOGIN_CHECK_COOLDOWN        = 30
-AGGRESSIVE_TIMEOUT          = 300
-AGGRESSIVE_INTERVAL         = 0.3
-FRUEH_EXKLUSIV_VERSUCHE     = 8   # 8 × 0.3s ≈ 2.4 Sekunden
+SCHIEBE_MINUTEN_VOR     = 10
+LOGIN_CHECK_COOLDOWN    = 30
+AGGRESSIVE_TIMEOUT      = 300
+AGGRESSIVE_INTERVAL     = 0.3
+FRUEH_EXKLUSIV_VERSUCHE = 8   # 8 × 0.3s ≈ 2.4 Sekunden
 
 # ─────────────────────────────────────────────
 # KONSTANTEN
@@ -967,89 +934,6 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str, dauer_min: int,
     return False
 
 # ══════════════════════════════════════════════
-# PRE-FIRE SCHIEBE-SCHRITT (NEU in v8.9.3)
-# ══════════════════════════════════════════════
-
-def schiebe_schritt_prefire(k: str, aktive_b: dict, neuer_slot: dict,
-                             datum_api: str, dauer_min: int) -> bool:
-    """
-    Pre-Fire Schiebe-Schritt:
-
-    1. Buchungs-Thread B startet PREFIRE_VORLAUF_SEK vor der Stornierung.
-       Er feuert Dauerbeschuss auf den neuen Slot – wird zunächst abgelehnt
-       weil der alte Slot noch belegt ist.
-    2. Stornierung des alten Slots durch Hauptthread A.
-    3. Buchungs-Thread B trifft beim nächsten Schuss sofort den freien Slot.
-
-    Effektive Lücke: < PREFIRE_INTERVAL (150ms) statt 3–6 Sekunden.
-    Das sleep(1.5) aus v8.9.2 entfällt komplett.
-    """
-    booking_id    = aktive_b["booking_id"]
-    gerade_court  = aktive_b["court"]
-    anderer_court = 1 if gerade_court == 2 else 2
-
-    ergebnis = {"ok": False}
-    storno_fertig = threading.Event()
-
-    def buchungs_thread():
-        deadline_b = time.time() + PREFIRE_TIMEOUT
-        versuch    = 0
-        log.info(f"[{k}] Pre-Fire: Buchungsthread gestartet → {neuer_slot['fromTime']}–{neuer_slot['toTime']}")
-
-        while time.time() < deadline_b:
-            if not az_get(k, "schiebe_aktiv"):
-                return
-
-            court_v = gerade_court if versuch % 2 == 0 else anderer_court
-            slot_v  = {
-                **neuer_slot,
-                "court": court_v,
-                "key": f"{datum_api}_{court_v}_{neuer_slot['fromTime']}_{dauer_min}",
-            }
-
-            if buche_slot(k, slot_v):
-                ergebnis["ok"] = True
-                log.info(f"[{k}] Pre-Fire: ✅ Buchung nach {versuch+1} Versuchen "
-                         f"(Court {court_v}, Storno bereits: {storno_fertig.is_set()})")
-                return
-
-            versuch += 1
-            time.sleep(PREFIRE_INTERVAL)
-
-        log.warning(f"[{k}] Pre-Fire: Buchungsthread Timeout nach {PREFIRE_TIMEOUT}s")
-
-    # Buchungsthread starten (feuert sofort, wird zunächst abgelehnt)
-    bt = threading.Thread(target=buchungs_thread, daemon=True)
-    bt.start()
-
-    # Kurze Vorlaufzeit damit TCP-Verbindung im Buchungsthread steht
-    time.sleep(PREFIRE_VORLAUF_SEK)
-
-    # Stornierung (FIX 2: kein Telegram-Spam bei Retries)
-    storno_ok = False
-    for storno_versuch in range(6):
-        if storniere_buchung(k, booking_id, datum_api):
-            storno_ok = True
-            storno_fertig.set()
-            log.info(f"[{k}] Pre-Fire: Stornierung nach {storno_versuch+1} Versuch(en) OK")
-            break
-        log.warning(f"[{k}] Storno-Retry {storno_versuch+1}/6")
-        time.sleep(10)
-
-    if not storno_ok:
-        # Buchungsthread stoppen
-        az_set(k, "schiebe_aktiv", False)
-        bt.join(timeout=2)
-        az_set(k, "schiebe_aktiv", True)  # wieder auf True – Fehlermeldung folgt im Aufrufer
-        senden(f"❌ [{k}] Stornierung nach 6 Versuchen fehlgeschlagen.\n"
-               f"Buchung bleibt: {aktive_b['fromTime']}–{aktive_b['toTime']}")
-        return False
-
-    # Auf Buchungsthread warten
-    bt.join(timeout=PREFIRE_TIMEOUT)
-    return ergebnis["ok"]
-
-# ══════════════════════════════════════════════
 # SCHIEBE-TAKTIK
 # ══════════════════════════════════════════════
 
@@ -1267,12 +1151,13 @@ def _schiebe_intern(k: str):
     # Das Schieben geschieht HEUTE, nicht am Buchungstag!
     #
     # Beispiel: Heute 19.04, Buchung für 26.04 um 07:00–08:30
-    #   → schiebe_moment = heute (19.04) um 08:10–08:20 (zufällig)
+    #   → schiebe_moment = heute (19.04) um 08:20
     #   → Bot storniert 26.04 07:00 und bucht 26.04 08:00 – alles heute!
     #
     # Deshalb: jetzt.date() verwenden, NICHT datum_obj.date()!
-    #   RICHTIG: datetime.combine(jetzt.date(), ...)   = 19.04 um 08:XX ✓
-    #   FALSCH:  datetime.combine(datum_obj.date(), ...) = 26.04 um 08:XX ✗
+    #   RICHTIG: datetime.combine(jetzt.date(), ...)   = 19.04 um 08:20 ✓
+    #   FALSCH:  datetime.combine(datum_obj.date(), ...) = 26.04 um 08:20 ✗
+    #            (würde 7 Tage warten bevor der erste Schiebe-Schritt passiert)
     # ══════════════════════════════════════════════════════════════════════
     letzter_session_check = time.time()
 
@@ -1292,17 +1177,12 @@ def _schiebe_intern(k: str):
                    f"🏟️ Court {aktive_b['court']}\n\nViel Spaß! 🎾")
             return
 
-        # ── Zufälliger Schiebe-Zeitpunkt ─────────────────────────────────────
-        # Basis: Slot-Ende minus SCHIEBE_MINUTEN_VOR
-        # Zusatz: zufällig zwischen SCHIEBE_RANDOM_OFFSET_MIN und SCHIEBE_RANDOM_OFFSET_MAX
-        # Ergebnis: Storno passiert zwischen (Ende - 15min) und (Ende - 10min)
-        # → Muster für andere Nutzer schwerer erkennbar
-        zufalls_offset  = random.randint(SCHIEBE_RANDOM_OFFSET_MIN, SCHIEBE_RANDOM_OFFSET_MAX)
-        gesamt_offset   = SCHIEBE_MINUTEN_VOR + zufalls_offset
-        jetzt           = jetzt_lokal()
-        schiebe_moment  = datetime.combine(
+        # Schiebe-Zeitpunkt: HEUTE um (Slot-Ende - 10 Min)
+        # Beispiel: Slot 07:00–08:30 → schiebe_moment = heute um 08:20
+        jetzt = jetzt_lokal()
+        schiebe_moment = datetime.combine(
             jetzt.date(),                                          # ← HEUTE, nicht datum_obj!
-            (ende_dt - timedelta(minutes=gesamt_offset)).time())
+            (ende_dt - timedelta(minutes=SCHIEBE_MINUTEN_VOR)).time())
 
         sek = (schiebe_moment - jetzt).total_seconds()
 
@@ -1317,8 +1197,7 @@ def _schiebe_intern(k: str):
             else:
                 warte_str = f"{min_r}min"
 
-            log.info(f"[{k}] Warte {sek:.0f}s bis {schiebe_moment.strftime('%d.%m.%Y %H:%M:%S')} "
-                     f"(Offset: -{gesamt_offset}min, Zufall: -{zufalls_offset}min)")
+            log.info(f"[{k}] Warte {sek:.0f}s bis {schiebe_moment.strftime('%d.%m.%Y %H:%M:%S')}")
             senden(f"⏳ [{k}] Nächstes Schieben um "
                    f"<b>{schiebe_moment.strftime('%d.%m.%Y %H:%M')} Uhr</b>\n"
                    f"   📅 {aktive_b['datum_de']} | "
@@ -1354,6 +1233,7 @@ def _schiebe_intern(k: str):
 
         neuer_start = ende_dt - timedelta(minutes=30)
         neues_ende  = neuer_start + timedelta(minutes=dauer_min)
+        booking_id  = aktive_b.get("booking_id")
 
         if neuer_start > ziel_dt:
             neuer_start = ziel_dt
@@ -1366,6 +1246,37 @@ def _schiebe_intern(k: str):
         naechster_von = neuer_start.strftime("%H:%M")
         naechster_bis = neues_ende.strftime("%H:%M")
 
+        senden(f"⚡ <b>[{k}] Schiebe jetzt!</b>\n"
+               f"🗑️ {aktive_b['fromTime']}–{aktive_b['toTime']} "
+               f"→ {naechster_von}–{naechster_bis}")
+
+        # Erzwungener Session-Refresh VOR Stornierung
+        log.info(f"[{k}] Erzwungener Login vor Stornierung (Schiebe-Loop)...")
+        if not _session_refresh_vor_aktion(k, f"Stornierung {aktive_b['fromTime']}"):
+            senden(f"❌ [{k}] Session vor Stornierung fehlgeschlagen – retry in 10s.")
+            if not schlafe(10):
+                return
+            continue
+
+        # FIX 2: Storno-Retry ohne Telegram-Spam
+        # Keine Nachrichten während der Retries – nur 1× bei finalem Fehlschlag.
+        storno_ok = False
+        for storno_versuch in range(6):
+            if storniere_buchung(k, booking_id, datum_api):
+                storno_ok = True
+                break
+            log.warning(f"[{k}] Storno-Retry {storno_versuch+1}/6 (kein Telegram-Spam)")
+            time.sleep(10)
+
+        if not storno_ok:
+            senden(f"❌ [{k}] Stornierung nach 6 Versuchen fehlgeschlagen – retry in 30s.\n"
+                   f"Buchung bleibt: {aktive_b['fromTime']}–{aktive_b['toTime']}")
+            if not schlafe(30):
+                return
+            continue
+
+        time.sleep(1.5)
+
         neuer_slot = {
             "fromTime":  naechster_von,
             "toTime":    naechster_bis,
@@ -1374,37 +1285,37 @@ def _schiebe_intern(k: str):
             "datum_de":  datum_de,
         }
 
-        senden(f"⚡ <b>[{k}] Pre-Fire Schieben startet!</b>\n"
-               f"🗑️ {aktive_b['fromTime']}–{aktive_b['toTime']} "
-               f"→ {naechster_von}–{naechster_bis}\n"
-               f"🚀 Buchungsthread startet {PREFIRE_VORLAUF_SEK}s vor Stornierung")
+        # Neubuchung: zuerst den gleichen Court wie storniert, dann Fallback auf anderen.
+        # Beispiel: Court 2 storniert → Versuch 1: Court 2, Versuch 2: Court 1, ...
+        # NICHT immer Court 2→1→2→1 unabhängig vom stornierten Court!
+        gerade_court  = aktive_b["court"]
+        anderer_court = 1 if gerade_court == 2 else 2
 
-        # Erzwungener Session-Refresh VOR dem Schiebe-Schritt
-        log.info(f"[{k}] Erzwungener Login vor Pre-Fire Schiebe-Schritt...")
-        if not _session_refresh_vor_aktion(k, f"Pre-Fire {aktive_b['fromTime']}→{naechster_von}"):
-            senden(f"❌ [{k}] Session vor Pre-Fire fehlgeschlagen – retry in 10s.")
-            if not schlafe(10):
-                return
-            continue
-
-        # ── PRE-FIRE SCHIEBE-SCHRITT ──────────────────────────────────────────
-        ok = schiebe_schritt_prefire(k, aktive_b, neuer_slot, datum_api, dauer_min)
+        ok = False
+        for versuch in range(6):
+            court_v = gerade_court if versuch % 2 == 0 else anderer_court
+            slot_v  = {**neuer_slot, "court": court_v,
+                       "key": f"{datum_api}_{court_v}_{naechster_von}_{dauer_min}"}
+            if buche_slot(k, slot_v):
+                ok = True
+                break
+            time.sleep(0.3 * (2 ** min(versuch, 3)))
 
         letzter_session_check = time.time()
 
         if ok:
             gebuchter = az_get(k, "aktive_buchung")
             ist_ziel  = (neuer_start >= ziel_dt)
-            court_str = str(gebuchter["court"]) if gebuchter else "?"
             senden(f"✅ <b>[{k}] {'🎯 Ziel erreicht!' if ist_ziel else 'Verschoben!'}</b>\n"
-                   f"🕐 {naechster_von}–{naechster_bis} | Court {court_str}\n"
+                   f"🕐 {naechster_von}–{naechster_bis} | "
+                   f"Court {gebuchter['court'] if gebuchter else court_v}\n"
                    + ("" if ist_ziel else f"🔄 Weiter → {ziel_str} Uhr..."))
             if ist_ziel:
                 az_set(k, "schiebe_aktiv", False)
                 zeige_account_menue(k)
                 return
         else:
-            beende(f"❌ [{k}] Pre-Fire Neubuchung fehlgeschlagen!\n"
+            beende(f"❌ [{k}] Neubuchung nach Stornierung fehlgeschlagen!\n"
                    f"🆘 SOFORT manuell buchen:\n{BASE_URL}/padel?currentDate={datum_api}")
             return
 
@@ -1797,16 +1708,14 @@ def telegram_loop():
 
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("🎾 Padel Bot v8.9.3 – Pre-Fire | Zufalls-Offset | kein Storno-Spam | Schiebe HEUTE")
-    log.info("   Pre-Fire: Buchungsthread startet 500ms VOR Stornierung → Lücke < 300ms")
-    log.info(f"   Zufalls-Offset: -{SCHIEBE_MINUTEN_VOR+SCHIEBE_RANDOM_OFFSET_MAX}min bis "
-             f"-{SCHIEBE_MINUTEN_VOR+SCHIEBE_RANDOM_OFFSET_MIN}min vor Slot-Ende")
+    log.info("🎾 Padel Bot v8.9.2 – Login 06:58:30 | kein Storno-Spam | Schiebe HEUTE | Court-Fix")
     log.info("   Schiebe-Logik: Storno/Neubuchung passiert HEUTE (nicht am Buchungstag!)")
+    log.info("   Beispiel: 19.04 07:00 bucht für 26.04 | 19.04 08:20 storniert & schiebt")
     for k in ACCOUNTS:
         log.info(f"   [{k}] {ACCOUNTS[k]['email']}")
     log.info(f"   Court-Priorität : 2 → 1 (automatisch)")
     log.info(f"   Früh exklusiv   : {FRUEH_EXKLUSIV_VERSUCHE} × {AGGRESSIVE_INTERVAL}s")
-    log.info(f"   Pre-Fire Vorlauf: {PREFIRE_VORLAUF_SEK}s | Interval: {PREFIRE_INTERVAL}s")
+    log.info(f"   Schiebe         : {SCHIEBE_MINUTEN_VOR} Min vor Slot-Ende, HEUTE")
     log.info("=" * 60)
 
     for k in ACCOUNTS:
@@ -1837,21 +1746,18 @@ if __name__ == "__main__":
 
     anzahl      = len(ACCOUNTS)
     modus_label = "Dual-Account" if anzahl > 1 else "Einzel-Account"
-    startup_msg = (f"🎾 <b>Padel Bot v8.9.3 gestartet!</b>\n\n"
-                   f"{modus_label}  |  3 Schiebe-Modi  |  Court 2 bevorzugt\n\n"
-                   f"🚀 <b>Pre-Fire Schieben (NEU):</b>\n"
-                   f"   Buchungsthread startet {PREFIRE_VORLAUF_SEK}s VOR Stornierung\n"
-                   f"   Effektive Lücke: &lt;300ms statt 3–6 Sekunden\n\n"
-                   f"🎲 <b>Zufälliger Storno-Zeitpunkt (NEU):</b>\n"
-                   f"   Storno zwischen -{SCHIEBE_MINUTEN_VOR+SCHIEBE_RANDOM_OFFSET_MAX}min "
-                   f"und -{SCHIEBE_MINUTEN_VOR+SCHIEBE_RANDOM_OFFSET_MIN}min vor Slot-Ende\n\n"
+    startup_msg = (f"🎾 <b>Padel Bot v8.9.2 gestartet!</b>\n\n"
+                   f"{modus_label}  |  3 Schiebe-Modi  |  Court 2 bevorzugt\n"
                    f"🌅 Früh: Login 06:58:30 → präziser Float-Sleep → exakt 07:00\n"
                    f"🔒 Schiebe: erzwungener Login vor jeder Stornierung\n"
-                   f"📅 Schiebe passiert HEUTE – z.B. 19.04 08:XX für Buchung am 26.04")
+                   f"🔕 Storno-Retry: kein Telegram-Spam, nur 1× bei finalem Fehlschlag\n"
+                   f"📅 Schiebe passiert HEUTE – z.B. 19.04 08:20 für Buchung am 26.04\n"
+                   f"🏟️ Neubuchung: erst gleicher Court wie storniert, dann Fallback")
 
     if pid_warnungen:
         startup_msg += (f"\n\n⚠️ <b>Person-ID fehlt für: {', '.join(pid_warnungen)}</b>\n"
-                        f"Buchungen werden beim ersten Versuch einen Neu-Login auslösen.")
+                        f"Buchungen werden beim ersten Versuch einen Neu-Login auslösen.\n"
+                        f"Bitte prüfe ob der Login korrekt funktioniert.")
 
     senden(startup_msg)
     zeige_account_auswahl()
@@ -1864,4 +1770,4 @@ if __name__ == "__main__":
             time.sleep(10)
     except KeyboardInterrupt:
         log.info("Bot beendet.")
-        senden("⏹️ Padel Bot v8.9.3 wurde beendet.")
+        senden("⏹️ Padel Bot v8.9.2 wurde beendet.")
