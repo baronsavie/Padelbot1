@@ -14,12 +14,12 @@
     "account_1_label": "ACC1",
     "account_1_email": "",
     "account_1_passwort": "",
-    "account_2_label": null,
-    "account_2_email": null,
-    "account_2_passwort": null,
-    "account_3_label": null,
-    "account_3_email": null,
-    "account_3_passwort": null
+    "account_2_label": "",
+    "account_2_email": "",
+    "account_2_passwort": "",
+    "account_3_label": "",
+    "account_3_email": "",
+    "account_3_passwort": ""
   },
   "schema": {
     "telegram_bot_token": "str",
