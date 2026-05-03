@@ -1,6 +1,6 @@
 {
   "name": "Padel Bot",
-  "version": "8.1.8",
+  "version": "9.0.2",
   "slug": "padel_bot",
   "icon": "mdi:tennis-ball",
   "description": "Padel Court Booking Bot mit Telegram-Steuerung | 3 Schiebe-Modi | Court-2-Präferenz",
@@ -16,7 +16,10 @@
     "account_1_passwort": "",
     "account_2_label": null,
     "account_2_email": null,
-    "account_2_passwort": null
+    "account_2_passwort": null,
+    "account_3_label": null,
+    "account_3_email": null,
+    "account_3_passwort": null
   },
   "schema": {
     "telegram_bot_token": "str",
@@ -26,6 +29,9 @@
     "account_1_passwort": "str",
     "account_2_label": "str?",
     "account_2_email": "str?",
-    "account_2_passwort": "str?"
+    "account_2_passwort": "str?",
+    "account_3_label": "str?",
+    "account_3_email": "str?",
+    "account_3_passwort": "str?"
   }
 }
