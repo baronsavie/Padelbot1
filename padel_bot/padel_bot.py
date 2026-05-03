@@ -341,16 +341,12 @@ def account_status_label(k: str) -> str:
         schiebe = False
     if aktiv:
         datum_str = _datum_mit_tag(aktiv.get('datum_de', '?'))
-        basis = (f"\U0001f534 {k} – {datum_str} "
-                 f"{aktiv.get('fromTime','?')}–{aktiv.get('toTime','?')}")
-        wetter = hole_wetter(aktiv.get('datum_de', ''), aktiv.get('fromTime', ''))
-        if wetter:
-            return basis + "\n" + wetter.strip()
-        return basis
+        return (f"🔴 {k} – {datum_str} "
+                f"{aktiv.get('fromTime','?')}–{aktiv.get('toTime','?')}")
     elif schiebe:
         datum_str = _datum_mit_tag(snap['schiebe_datum'] or '?')
-        return f"\U0001f7e1 {k} – Schiebe {datum_str}"
-    return f"\u2705 {k} – frei"
+        return f"🟡 {k} – Schiebe {datum_str}"
+    return f"✅ {k} – frei"
 
 def zeige_account_auswahl():
     set_flow_account(None)
@@ -367,8 +363,22 @@ def zeige_account_auswahl():
         buttons.append([{"text": account_status_label(k), "callback_data": f"acc_{k}"}])
     buttons.append([{"text": "🔄 Aktualisieren", "callback_data": "refresh_accounts"}])
 
-    senden(f"\U0001f3be <b>Padel Bot – Account wählen</b> ({modus_label})\n\n"
-           "\u2705 frei  |  \U0001f534 Buchung  |  \U0001f7e1 Schiebe",
+    # Status + Wetter pro Account in Nachrichtentext
+    status_zeilen = ""
+    for k in ACCOUNTS:
+        label = account_status_label(k)
+        aktiv = az_get(k, "aktive_buchung")
+        if aktiv:
+            w = hole_wetter(aktiv["datum_de"], aktiv["fromTime"])
+            status_zeilen += f"\n{label}"
+            if w:
+                status_zeilen += f"\n{w.strip()}"
+        else:
+            status_zeilen += f"\n{label}"
+
+    senden(f"🎾 <b>Padel Bot – Account wählen</b> ({modus_label})\n\n"
+           f"✅ frei  |  🔴 Buchung  |  🟡 Schiebe"
+           f"{status_zeilen}",
            buttons=buttons)
 
 def zeige_account_menue(k: str):
