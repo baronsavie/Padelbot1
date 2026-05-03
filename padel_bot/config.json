@@ -1,6 +1,6 @@
 {
   "name": "Padel Bot",
-  "version": "9.0.2",
+  "version": "9.0.3",
   "slug": "padel_bot",
   "icon": "mdi:tennis-ball",
   "description": "Padel Court Booking Bot mit Telegram-Steuerung | 3 Schiebe-Modi | Court-2-Präferenz",
