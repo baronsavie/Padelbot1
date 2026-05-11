@@ -153,7 +153,7 @@ SCHIEBE_MINUTEN_VOR_MIN = 5
 SCHIEBE_MINUTEN_VOR_MAX = 20
 LOGIN_CHECK_COOLDOWN    = 30
 AGGRESSIVE_TIMEOUT      = 300
-AGGRESSIVE_INTERVAL     = 0.3
+AGGRESSIVE_INTERVAL     = 0.1
 FRUEH_EXKLUSIV_VERSUCHE = 8
 
 # ─────────────────────────────────────────────
@@ -770,6 +770,7 @@ def buche_slot(k: str, slot: dict) -> bool:
     to_t      = slot["toTime"]
     datum_de  = slot["datum_de"]
     datum_api = slot["datum_api"]
+
     snap      = az_snap(k, "csrf_token", "person_id", "http")
     csrf_t    = snap["csrf_token"]
     person_id = snap["person_id"]
@@ -779,109 +780,222 @@ def buche_slot(k: str, slot: dict) -> bool:
         log.warning(f"[{k}] Person-ID fehlt – versuche erneuten Login...")
         einloggen(k)
         person_id = az_get(k, "person_id")
+
         if not person_id:
             log.error(f"[{k}] Person-ID konnte nicht ermittelt werden – Buchung abgebrochen!")
             senden(f"❌ [{k}] Person-ID fehlt!\nManuell buchen: {BASE_URL}/padel")
             return False
 
     log.info(f"🎾 [{k}] Buche Court {court} | {datum_de} | {from_t}–{to_t}")
-    h  = {"accept": "*/*", "x-ajax-call": "true", "x-csrf-token": csrf_t,
-          "x-requested-with": "XMLHttpRequest",
-          "referer": f"{BASE_URL}/padel?currentDate={datum_api}"}
-    hp = {**h, "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-          "origin": BASE_URL}
+
+    h = {
+        "accept": "*/*",
+        "x-ajax-call": "true",
+        "x-csrf-token": csrf_t,
+        "x-requested-with": "XMLHttpRequest",
+        "referer": f"{BASE_URL}/padel?currentDate={datum_api}"
+    }
+
+    hp = {
+        **h,
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "origin": BASE_URL
+    }
+
     try:
-        r1 = http.get(f"{BASE_URL}/court-single-booking-flow", headers=h,
-                      params={"module": MODULE, "court": court, "courts": "1,2",
-                              "fromTime": from_t, "toTime": to_t, "date": datum_api},
-                      timeout=10)
+        # STEP 1
+        r1 = http.get(
+            f"{BASE_URL}/court-single-booking-flow",
+            headers=h,
+            params={
+                "module": MODULE,
+                "court": court,
+                "courts": "1,2",
+                "fromTime": from_t,
+                "toTime": to_t,
+                "date": datum_api,
+            },
+            timeout=10,
+        )
+
         execution = "e1s1"
         m = re.search(r"execution=(e\d+s\d+)", r1.text)
+
         if m:
             execution = m.group(1)
 
         if not person_id:
             person_id = extrahiere_person_id(r1.text)
+
             if person_id:
                 az_set(k, "person_id", person_id)
 
-        r2 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
-                       params={"execution": execution, "_eventId": "next"},
-                       data=(f"purchaseTemplate.repetition.date={datum_de}"
-                             f"&purchaseTemplate.repetition.fromTime={from_t.replace(':', '%3A')}"
-                             f"&purchaseTemplate.repetition.toTime={to_t.replace(':', '%3A')}"
-                             f"&bookingModel.courts%5B0%5D={court}"
-                             f"&purchaseTemplate.court={court}"
-                             f"&purchaseTemplate.person={person_id}"
-                             f"&purchaseTemplate.bookingType={BOOKING_TYPE}"
-                             f"&_csrf={csrf_t}"),
-                       timeout=10)
+        # STEP 2
+        r2 = http.post(
+            f"{BASE_URL}/court-single-booking-flow",
+            headers=hp,
+            params={"execution": execution, "_eventId": "next"},
+            data=(
+                f"purchaseTemplate.repetition.date={datum_de}"
+                f"&purchaseTemplate.repetition.fromTime={from_t.replace(':', '%3A')}"
+                f"&purchaseTemplate.repetition.toTime={to_t.replace(':', '%3A')}"
+                f"&bookingModel.courts%5B0%5D={court}"
+                f"&purchaseTemplate.court={court}"
+                f"&purchaseTemplate.person={person_id}"
+                f"&purchaseTemplate.bookingType={BOOKING_TYPE}"
+                f"&_csrf={csrf_t}"
+            ),
+            timeout=10,
+        )
+
         exec2 = execution.replace("s1", "s2")
         m2 = re.search(r"execution=(e\d+s\d+)", r2.text)
+
         if m2:
             exec2 = m2.group(1)
 
-        r3 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
-                       params={"execution": exec2, "_eventId": "commit"},
-                       data=f"purchaseTemplate.comment=&_csrf={csrf_t}",
-                       timeout=10)
+        # STEP 3 COMMIT
+        r3 = http.post(
+            f"{BASE_URL}/court-single-booking-flow",
+            headers=hp,
+            params={"execution": exec2, "_eventId": "commit"},
+            data=f"purchaseTemplate.comment=&_csrf={csrf_t}",
+            timeout=10,
+        )
 
         if r3.status_code not in [200, 302]:
             return False
+
         if any(w in r3.text.lower() for w in ["fehler", "error", "nicht möglich"]):
             log.warning(f"[{k}] Buchung: Server-Fehler")
             return False
 
         booking_id = None
-        for pat in [r'"bookingId"\s*:\s*(\d+)', r'/bookings/(\d+)', r'booking[=_](\d+)']:
+
+        for pat in [
+            r'"bookingId"\s*:\s*(\d+)',
+            r'/bookings/(\d+)',
+            r'booking[=_](\d+)'
+        ]:
             mid = re.search(pat, r3.text)
+
             if mid:
                 booking_id = int(mid.group(1))
                 break
 
-        # ── FIX 1: Verifizierung ohne Exception-Fallback ──────────────────────
-        time.sleep(1.0)
+        # ═══════════════════════════════════════
+        # HOTFIX v11.0.1 VERIFIKATION
+        # ═══════════════════════════════════════
+
+        time.sleep(0.8)
+
         verifiziert = False
+
+        # VERIFIKATION 1:
+        # /user/my-bookings
+
         try:
-            server_res = hole_reservierungen(k, datum_api)
-            for res in server_res:
-                if (res["court"] == int(court) and
-                        res["fromTime"] == from_t and res["toTime"] == to_t):
-                    res_bid = res.get("booking") or res.get("bookingOrBlockingId")
-                    if booking_id and res_bid and res_bid == booking_id:
-                        verifiziert = True
-                        break
-                    elif not booking_id and res_bid:
-                        booking_id  = res_bid
-                        verifiziert = True
-                        break
+            r_my = http.get(
+                f"{BASE_URL}/user/my-bookings/page",
+                params={
+                    "page": "0",
+                    "size": "50",
+                    "sort": ["serviceDate,desc", "id,desc"]
+                },
+                headers={
+                    "accept": "text/html,*/*",
+                    "x-requested-with": "XMLHttpRequest",
+                    "referer": f"{BASE_URL}/user/my-bookings"
+                },
+                timeout=10,
+            )
+
+            if r_my.status_code == 200:
+                text = r_my.text
+
+                slot_match = (
+                    datum_de in text and
+                    from_t in text and
+                    to_t in text
+                )
+
+                court_match = (
+                    f"Court {court}" in text or
+                    f"court {court}" in text or
+                    f">{court}<" in text
+                )
+
+                if slot_match and court_match:
+                    verifiziert = True
+                    log.info(f"✅ [{k}] Verifiziert über /user/my-bookings")
+
         except Exception as ve1:
-            log.warning(f"[{k}] Verifikations-Versuch 1 fehlgeschlagen: {ve1}")
+            log.warning(f"[{k}] Verifikation my-bookings Fehler: {ve1}")
+
+        # VERIFIKATION 2:
+        # FALLBACK → /padel + PERSON-ID MATCH
 
         if not verifiziert:
             try:
-                time.sleep(1.5)
-                server_res2 = hole_reservierungen(k, datum_api)
-                for res in server_res2:
-                    if (res["court"] == int(court) and
-                            res["fromTime"] == from_t and res["toTime"] == to_t):
-                        res_bid = res.get("booking") or res.get("bookingOrBlockingId")
-                        if res_bid:
-                            booking_id  = res_bid
-                        verifiziert = True
-                        break
+                time.sleep(0.7)
+
+                server_res = hole_reservierungen(k, datum_api)
+
+                for res in server_res:
+                    if (
+                        str(res.get("court")) == court and
+                        res.get("fromTime") == from_t and
+                        res.get("toTime") == to_t
+                    ):
+
+                        res_person = str(
+                            res.get("person") or
+                            res.get("personId") or
+                            res.get("customerId") or
+                            ""
+                        )
+
+                        res_bid = (
+                            res.get("booking") or
+                            res.get("bookingOrBlockingId")
+                        )
+
+                        # PERSON-ID MATCH
+                        if person_id and res_person and res_person == str(person_id):
+                            verifiziert = True
+                            booking_id = res_bid or booking_id
+                            log.info(f"✅ [{k}] Verifiziert über Person-ID Match")
+                            break
+
+                        # FALLBACK booking_id MATCH
+                        if booking_id and res_bid and str(res_bid) == str(booking_id):
+                            verifiziert = True
+                            booking_id = res_bid
+                            log.info(f"✅ [{k}] Verifiziert über booking_id Match")
+                            break
+
             except Exception as ve2:
-                log.warning(f"[{k}] Verifikations-Versuch 2 fehlgeschlagen: {ve2}")
-                # KEIN Fallback auf True mehr! Nur False zurückgeben.
+                log.warning(f"[{k}] Verifikation Fallback Fehler: {ve2}")
+
+        # FINAL CHECK
 
         if not verifiziert:
-            log.warning(f"[{k}] ⚠️ Buchung NICHT verifiziert – möglicherweise zwischengebucht!")
+            log.warning(
+                f"[{k}] ⚠️ Buchung NICHT verifiziert – vermutlich Race Condition verloren!"
+            )
+
             az_set(k, "aktive_buchung", None)
             return False
 
-        az_set(k, "aktive_buchung", {**slot, "court": int(court), "booking_id": booking_id})
+        az_set(k, "aktive_buchung", {
+            **slot,
+            "court": int(court),
+            "booking_id": booking_id,
+        })
+
         log.info(f"✅ [{k}] Buchung OK + verifiziert – ID: {booking_id}")
         return True
+
     except Exception as e:
         log.error(f"[{k}] Buchungsfehler: {e}")
         return False
