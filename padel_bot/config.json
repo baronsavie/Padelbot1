@@ -1,9 +1,9 @@
 {
   "name": "Padel Bot",
-  "version": "9.0.6",
+  "version": "9.0.7",
   "slug": "padel_bot",
   "icon": "mdi:tennis-ball",
-  "description": "Padel Court Booking Bot mit Telegram-Steuerung | 3 Schiebe-Modi | Court-2-Präferenz",
+  "description": "Padel Court Booking Bot mit Telegram-Steuerung | 3 Schiebe-Modi | Sniper | 3h-Modus | bis zu 6 Accounts",
   "arch": ["amd64", "aarch64", "armv7"],
   "startup": "application",
   "boot": "auto",
@@ -19,7 +19,16 @@
     "account_2_passwort": "",
     "account_3_label": "",
     "account_3_email": "",
-    "account_3_passwort": ""
+    "account_3_passwort": "",
+    "account_4_label": "",
+    "account_4_email": "",
+    "account_4_passwort": "",
+    "account_5_label": "",
+    "account_5_email": "",
+    "account_5_passwort": "",
+    "account_6_label": "",
+    "account_6_email": "",
+    "account_6_passwort": ""
   },
   "schema": {
     "telegram_bot_token": "str",
@@ -32,6 +41,15 @@
     "account_2_passwort": "str?",
     "account_3_label": "str?",
     "account_3_email": "str?",
-    "account_3_passwort": "str?"
+    "account_3_passwort": "str?",
+    "account_4_label": "str?",
+    "account_4_email": "str?",
+    "account_4_passwort": "str?",
+    "account_5_label": "str?",
+    "account_5_email": "str?",
+    "account_5_passwort": "str?",
+    "account_6_label": "str?",
+    "account_6_email": "str?",
+    "account_6_passwort": "str?"
   }
-}
+}}
