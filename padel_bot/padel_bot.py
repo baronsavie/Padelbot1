@@ -1485,7 +1485,8 @@ def _schiebe_intern(k: str):
         zeige_account_menue(k)
 
     # ── Phase 1: Warten auf 7-Tage-Fenster ───────────────────────────────────
-    if modus in ("frueh", "direkt"):
+    # NUR für frueh! direkt hat eigene Startzeit – kein 7-Uhr-Fenster!
+    if modus in ("frueh",):
         while aktiv():
             jetzt   = jetzt_lokal()
             fenster = datetime.combine(
@@ -1661,24 +1662,26 @@ def _schiebe_intern(k: str):
 
         jetzt        = jetzt_lokal()
         buchbar_zeit = datetime.strptime(buchbar_ab, "%H:%M").time()
-        buchbar_dt   = datetime.combine(jetzt.date(), buchbar_zeit)
+        # Buchbar am 7-Tage-Tag (datum - 7 Tage) zur angegebenen Uhrzeit
+        sieben_tage_tag = (datum_obj - timedelta(days=7)).date()
+        buchbar_dt      = datetime.combine(sieben_tage_tag, buchbar_zeit)
         # Spam startet 1 Sekunde VOR der buchbaren Zeit
         spam_start_dt = buchbar_dt - timedelta(seconds=1)
 
         if jetzt < buchbar_dt:
             sek_wait = (buchbar_dt - jetzt).total_seconds()
             senden(f"🎯 <b>[{k}] Direkte Taktik – warte auf Startzeit</b>\n"
-                   f"📅 {datum_de} | Buchbar ab heute {buchbar_ab} Uhr\n"
+                   f"📅 {datum_de} | Buchbar ab {buchbar_dt.strftime('%d.%m.%Y')} {buchbar_ab} Uhr\n"
                    f"🎯 Ziel: {ziel_str} Uhr | {dauer_min} Min\n"
                    f"⏳ Noch {int(sek_wait/60)} Min bis {buchbar_ab} Uhr...\n"
-                   f"⚡ Spam startet 1s früher: {spam_start_dt.strftime('%H:%M:%S')} Uhr")
+                   f"⚡ Spam startet 1s früher: {spam_start_dt.strftime('%d.%m.%Y %H:%M:%S')} Uhr")
             if not schlafe(max(0, sek_wait - 90)):
                 return
             senden(f"🔑 [{k}] Frischer Login 90s vor {buchbar_ab} Uhr...")
             if not _session_refresh_vor_aktion(k, f"Direkt {buchbar_ab}"):
                 beende(f"❌ [{k}] Login vor {buchbar_ab} fehlgeschlagen!")
                 return
-            senden(f"✅ [{k}] Eingeloggt – warte auf {spam_start_dt.strftime('%H:%M:%S')} Uhr (1s vor {buchbar_ab})...")
+            senden(f"✅ [{k}] Eingeloggt – warte auf {spam_start_dt.strftime('%d.%m.%Y %H:%M:%S')} Uhr (1s vor {buchbar_ab})...")
             restzeit = (spam_start_dt - jetzt_lokal()).total_seconds()
             if restzeit > 0:
                 time.sleep(restzeit)
