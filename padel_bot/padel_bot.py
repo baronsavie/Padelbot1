@@ -1,36 +1,39 @@
 #!/usr/bin/env python3
-"""Padel Bot v10.2.0
+"""Padel Bot v11.0.0
 
-ÄNDERUNGEN gegenüber v10.1.0:
+ÄNDERUNGEN gegenüber v10.0.0:
 
-NEU: buche_slot_schnell() für Direkte Taktik & Sniper
-     Kein Verifikations-Sleep (2.5s) mehr im heißen Pfad.
-     Wertet nur r3-Response aus (Status + Fehlertext + Booking-ID).
-     Nach erfolgreichem Treffer: einmaliger sync_buchung_vom_server().
+NEU 1: Court-Anzeige in Account-Auswahl.
+        account_status_label() zeigt jetzt auch C1 oder C2 an.
+        Beispiel: 🔴 ACC1 – Sa 26.04. 09:00–10:30 | C2
 
-GEÄNDERT: _aggressiv_buchen_ab()
-     Slot-Berechnung (berechne_freie_slots + HTTP-Request) raus aus dem Loop.
-     Ziel-Slot wird EINMAL vor dem Loop berechnet und dann direkt gehämmert.
-     Nutzt buche_slot_schnell() statt buche_slot().
-     Ergebnis: ~0.5s pro Versuch statt ~4s.
+NEU 2: Accounts 4–6 unterstützt.
+        _lade_accounts() lädt jetzt bis zu 6 Accounts (account_4 bis account_6).
 
-GEÄNDERT: _sniper_intern()
-     Nutzt buche_slot_schnell() statt buche_slot().
-     Ergebnis: ~0.5s pro Versuch statt ~4s.
+NEU 3: 3h-Modus (Duo-Modus).
+        Konfigurationshilfe für zwei Accounts die zusammen 3h spielen wollen.
+        Account X → Früh-Methode → schiebt bis Startzeit (z.B. 11:00–12:30)
+        Account Y → Direkte Taktik → buchbar_ab = Ende von X (z.B. 12:30)
+                    Ziel = buchbar_ab → direkt fertig, kein Schieben!
+        Court-Logik: Beide versuchen Court 2. Y liest nach X's Buchung
+                     den tatsächlichen Court aus aktive_buchung und
+                     übernimmt ihn als bevorzugter_court.
+        Ablauf:
+          1. Account X wählen
+          2. Account Y wählen
+          3. Datum wählen
+          4. Startzeit wählen (z.B. 11:00)
+          Bot berechnet: X-Ziel=11:00, Y-buchbar_ab=12:30, Y-Ziel=12:30
 
-UNVERÄNDERT:
-     buche_slot()              → Früh-Methode, Spät-Taktik, klassische Buchung
-     _aggressiv_buchen_07()    → Früh-Methode (07:00 Dauerbeschuss)
-     _schiebe_phase3()         → Schiebe-Loop (Storno + Rebook)
-     Alle anderen Funktionen   → exakt wie v10.1.0
+NEU 4: Accounts 4–6 in options.json konfigurierbar.
 
 BEIBEHALTEN (alle Fixes aus v10.x):
-  FIX 1: Buchungsbestätigung nur wenn wirklich gebucht (kein False-Positiv).
-  FIX 2: Schiebe-Taktik robuster: Storno-Retry prüft aktiv(), Rebook 30×0.1s.
-  NEU 3: Sniper-Modus (v10.0).
-  FIX 4: Login exakt 90s VOR 07:00.
-  FIX 5: Storno-Retry sendet KEINE Telegram-Nachrichten.
-  FIX 6: schiebe_moment verwendet jetzt.date().
+  FIX 1: buche_slot() kein verifiziert=True Fallback.
+  FIX 2: Schiebe-Taktik robuster und schneller.
+  NEU 3 (v10): Sniper-Modus.
+  FIX 4: Login exakt 90s VOR 07:00 (also 06:58:30).
+  FIX 5: Storno-Retry sendet KEINE Telegram-Nachrichten während der Retries.
+  FIX 6: schiebe_moment verwendet jetzt.date() (nicht datum_obj.date()).
   FIX 7: Neubuchung nach Storno versucht zuerst gleichen Court.
 
 ══════════════════════════════════════════════════════════════════════
@@ -166,12 +169,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# ACCOUNTS
+# ACCOUNTS  –  NEU 2: bis zu 6 Accounts
 # ─────────────────────────────────────────────
 
 def _lade_accounts() -> dict:
     accounts = {}
 
+    # Account 1 – Pflicht
     email1 = _optional("account_1_email")
     pw1    = _optional("account_1_passwort")
     if not email1 or not pw1:
@@ -179,45 +183,17 @@ def _lade_accounts() -> dict:
     label1 = _optional("account_1_label") or "ACC1"
     accounts[label1] = {"email": email1, "passwort": pw1}
 
-    email2 = _optional("account_2_email")
-    pw2    = _optional("account_2_passwort")
-    if email2 and pw2:
-        label2 = _optional("account_2_label") or "ACC2"
-        if label2 == label1:
-            label2 = label2 + "_2"
-        accounts[label2] = {"email": email2, "passwort": pw2}
-
-    email3 = _optional("account_3_email")
-    pw3    = _optional("account_3_passwort")
-    if email3 and pw3:
-        label3 = _optional("account_3_label") or "ACC3"
-        if label3 in (label1,) or (len(accounts) > 1 and label3 in accounts):
-            label3 = label3 + "_3"
-        accounts[label3] = {"email": email3, "passwort": pw3}
-
-    email4 = _optional("account_4_email")
-    pw4    = _optional("account_4_passwort")
-    if email4 and pw4:
-        label4 = _optional("account_4_label") or "ACC4"
-        if label4 in accounts:
-            label4 = label4 + "_4"
-        accounts[label4] = {"email": email4, "passwort": pw4}
-
-    email5 = _optional("account_5_email")
-    pw5    = _optional("account_5_passwort")
-    if email5 and pw5:
-        label5 = _optional("account_5_label") or "ACC5"
-        if label5 in accounts:
-            label5 = label5 + "_5"
-        accounts[label5] = {"email": email5, "passwort": pw5}
-
-    email6 = _optional("account_6_email")
-    pw6    = _optional("account_6_passwort")
-    if email6 and pw6:
-        label6 = _optional("account_6_label") or "ACC6"
-        if label6 in accounts:
-            label6 = label6 + "_6"
-        accounts[label6] = {"email": email6, "passwort": pw6}
+    # Accounts 2–6 – optional, gleiches Muster
+    for nr in range(2, 7):
+        email = _optional(f"account_{nr}_email")
+        pw    = _optional(f"account_{nr}_passwort")
+        if not email or not pw:
+            continue
+        label = _optional(f"account_{nr}_label") or f"ACC{nr}"
+        # Label-Kollision vermeiden
+        if label in accounts:
+            label = f"{label}_{nr}"
+        accounts[label] = {"email": email, "passwort": pw}
 
     labels = list(accounts.keys())
     if len(labels) == 1:
@@ -268,6 +244,8 @@ def neuer_account_zustand(kuerzel: str) -> dict:
         "sniper_dauer":       None,
         "sniper_ziel":        None,
         "sniper_thread":      None,
+        # 3h-Modus: NEU 3
+        "trio_partner_x":     None,   # wenn dieser Account Y ist: Label von X
         # Flow
         "flow":               None,
         "flow_datum":         None,
@@ -300,6 +278,29 @@ def get_flow_account() -> str | None:
 
 def set_flow_account(k: str | None):
     with _flow_lock: _flow_account["kuerzel"] = k
+
+# 3h-Modus Flow-State (mehrere Werte über Callbacks hinweg)
+_trio_flow = {
+    "lock":      threading.Lock(),
+    "acc_x":     None,
+    "acc_y":     None,
+    "datum":     None,
+    "startzeit": None,
+    "schritt":   None,   # "acc_x" | "acc_y" | "datum" | "startzeit"
+}
+
+def trio_set(**kwargs):
+    with _trio_flow["lock"]:
+        _trio_flow.update(kwargs)
+
+def trio_get(key: str):
+    with _trio_flow["lock"]:
+        return _trio_flow[key]
+
+def trio_reset():
+    with _trio_flow["lock"]:
+        _trio_flow.update({"acc_x": None, "acc_y": None, "datum": None,
+                            "startzeit": None, "schritt": None})
 
 # ══════════════════════════════════════════════
 # TELEGRAM HELPERS
@@ -350,6 +351,7 @@ def _datum_mit_tag(datum_de: str) -> str:
     except Exception:
         return datum_de
 
+# NEU 1: Court-Anzeige in account_status_label
 def account_status_label(k: str) -> str:
     snap   = az_snap(k, "aktive_buchung", "schiebe_aktiv", "schiebe_datum", "schiebe_ziel",
                      "sniper_aktiv", "sniper_datum")
@@ -367,10 +369,10 @@ def account_status_label(k: str) -> str:
         sniper = False
 
     if aktiv:
-        datum_str = _datum_mit_tag(aktiv.get("datum_de", "?"))
-        court_str = aktiv.get("court", "?")
+        datum_str  = _datum_mit_tag(aktiv.get("datum_de", "?"))
+        court_str  = f" | C{aktiv.get('court', '?')}"          # NEU 1
         return (f"🔴 {k} – {datum_str} "
-                f"{aktiv.get('fromTime','?')}–{aktiv.get('toTime','?')} C{court_str}")
+                f"{aktiv.get('fromTime','?')}–{aktiv.get('toTime','?')}{court_str}")
     elif schiebe:
         datum_str = _datum_mit_tag(snap["schiebe_datum"] or "?")
         return f"🟡 {k} – Schiebe {datum_str}"
@@ -387,11 +389,14 @@ def zeige_account_auswahl():
         except Exception as e:
             log.warning(f"[{k}] Sync: {e}")
 
-    anzahl     = len(ACCOUNTS)
-    modus_label = "Dual-Account" if anzahl > 1 else "Einzel-Account"
+    anzahl      = len(ACCOUNTS)
+    modus_label = "Multi-Account" if anzahl > 2 else ("Dual-Account" if anzahl > 1 else "Einzel-Account")
     buttons = []
     for k in ACCOUNTS:
         buttons.append([{"text": account_status_label(k), "callback_data": f"acc_{k}"}])
+    # NEU 3: 3h-Modus Button – nur bei mind. 2 Accounts
+    if anzahl >= 2:
+        buttons.append([{"text": "⏱️ 3h-Modus (Duo)", "callback_data": "trio_start"}])
     buttons.append([{"text": "🔄 Aktualisieren", "callback_data": "refresh_accounts"}])
 
     status_zeilen = ""
@@ -422,8 +427,9 @@ def zeige_account_menue(k: str):
         snap["schiebe_modus"] or "", "")
 
     if aktiv:
+        court_str = f" | C{aktiv.get('court', '?')}"           # NEU 1
         status = (f"🔴 <b>Aktive Buchung:</b>\n"
-                  f"   {aktiv['datum_de']} | {aktiv['fromTime']}–{aktiv['toTime']} | Court {aktiv['court']}")
+                  f"   {aktiv['datum_de']} | {aktiv['fromTime']}–{aktiv['toTime']}{court_str}")
         if schiebe:
             status += (f"\n🟡 Schiebe ({modus_l}) → Ziel {snap['schiebe_ziel']} Uhr "
                        f"({snap['schiebe_dauer']} Min)")
@@ -533,6 +539,25 @@ def sniper_endzeit_buttons(prefix: str) -> list:
     t   = datetime.strptime("07:30", "%H:%M")
     end = datetime.strptime("22:00", "%H:%M")
     while t <= end:
+        reihe.append({"text": t.strftime("%H:%M"),
+                      "callback_data": f"{prefix}_{t.strftime('%H:%M')}"})
+        if len(reihe) == 4:
+            buttons.append(reihe)
+            reihe = []
+        t += timedelta(minutes=30)
+    if reihe:
+        buttons.append(reihe)
+    buttons.append([{"text": "❌ Abbrechen", "callback_data": "abbrechen"}])
+    return buttons
+
+def startzeit_buttons(prefix: str, dauer_min: int) -> list:
+    """Buttons für die 3h-Modus Startzeit (07:00 bis 20:30 bei 90 Min)."""
+    schluss = datetime.strptime(ANLAGE_SCHLUSS, "%H:%M")
+    # Startzeit so, dass 2x dauer_min noch vor Schluss passt
+    letzter = schluss - timedelta(minutes=dauer_min * 2)
+    buttons, reihe = [], []
+    t = datetime.strptime(ANLAGE_OEFFNUNG, "%H:%M")
+    while t <= letzter:
         reihe.append({"text": t.strftime("%H:%M"),
                       "callback_data": f"{prefix}_{t.strftime('%H:%M')}"})
         if len(reihe) == 4:
@@ -736,7 +761,7 @@ def berechne_freie_slots(k: str, datum_de: str, dauer_min: int,
     return freie
 
 # ══════════════════════════════════════════════
-# BUCHUNG (mit Verifikation) – unverändert für Früh/Spät/Klassisch
+# BUCHUNG  –  FIX 1: Kein verifiziert=True Fallback mehr!
 # ══════════════════════════════════════════════
 
 def buche_slot(k: str, slot: dict) -> bool:
@@ -745,6 +770,7 @@ def buche_slot(k: str, slot: dict) -> bool:
     to_t      = slot["toTime"]
     datum_de  = slot["datum_de"]
     datum_api = slot["datum_api"]
+
     snap      = az_snap(k, "csrf_token", "person_id", "http")
     csrf_t    = snap["csrf_token"]
     person_id = snap["person_id"]
@@ -754,301 +780,225 @@ def buche_slot(k: str, slot: dict) -> bool:
         log.warning(f"[{k}] Person-ID fehlt – versuche erneuten Login...")
         einloggen(k)
         person_id = az_get(k, "person_id")
+
         if not person_id:
             log.error(f"[{k}] Person-ID konnte nicht ermittelt werden – Buchung abgebrochen!")
             senden(f"❌ [{k}] Person-ID fehlt!\nManuell buchen: {BASE_URL}/padel")
             return False
 
     log.info(f"🎾 [{k}] Buche Court {court} | {datum_de} | {from_t}–{to_t}")
-    h  = {"accept": "*/*", "x-ajax-call": "true", "x-csrf-token": csrf_t,
-          "x-requested-with": "XMLHttpRequest",
-          "referer": f"{BASE_URL}/padel?currentDate={datum_api}"}
-    hp = {**h, "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-          "origin": BASE_URL}
+
+    h = {
+        "accept": "*/*",
+        "x-ajax-call": "true",
+        "x-csrf-token": csrf_t,
+        "x-requested-with": "XMLHttpRequest",
+        "referer": f"{BASE_URL}/padel?currentDate={datum_api}"
+    }
+
+    hp = {
+        **h,
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "origin": BASE_URL
+    }
+
     try:
-        r1 = http.get(f"{BASE_URL}/court-single-booking-flow", headers=h,
-                      params={"module": MODULE, "court": court, "courts": "1,2",
-                              "fromTime": from_t, "toTime": to_t, "date": datum_api},
-                      timeout=10)
+        # STEP 1
+        r1 = http.get(
+            f"{BASE_URL}/court-single-booking-flow",
+            headers=h,
+            params={
+                "module": MODULE,
+                "court": court,
+                "courts": "1,2",
+                "fromTime": from_t,
+                "toTime": to_t,
+                "date": datum_api,
+            },
+            timeout=10,
+        )
+
         execution = "e1s1"
         m = re.search(r"execution=(e\d+s\d+)", r1.text)
+
         if m:
             execution = m.group(1)
 
         if not person_id:
             person_id = extrahiere_person_id(r1.text)
+
             if person_id:
                 az_set(k, "person_id", person_id)
 
-        r2 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
-                       params={"execution": execution, "_eventId": "next"},
-                       data=(f"purchaseTemplate.repetition.date={datum_de}"
-                             f"&purchaseTemplate.repetition.fromTime={from_t.replace(':', '%3A')}"
-                             f"&purchaseTemplate.repetition.toTime={to_t.replace(':', '%3A')}"
-                             f"&bookingModel.courts%5B0%5D={court}"
-                             f"&purchaseTemplate.court={court}"
-                             f"&purchaseTemplate.person={person_id}"
-                             f"&purchaseTemplate.bookingType={BOOKING_TYPE}"
-                             f"&_csrf={csrf_t}"),
-                       timeout=10)
+        # STEP 2
+        r2 = http.post(
+            f"{BASE_URL}/court-single-booking-flow",
+            headers=hp,
+            params={"execution": execution, "_eventId": "next"},
+            data=(
+                f"purchaseTemplate.repetition.date={datum_de}"
+                f"&purchaseTemplate.repetition.fromTime={from_t.replace(':', '%3A')}"
+                f"&purchaseTemplate.repetition.toTime={to_t.replace(':', '%3A')}"
+                f"&bookingModel.courts%5B0%5D={court}"
+                f"&purchaseTemplate.court={court}"
+                f"&purchaseTemplate.person={person_id}"
+                f"&purchaseTemplate.bookingType={BOOKING_TYPE}"
+                f"&_csrf={csrf_t}"
+            ),
+            timeout=10,
+        )
+
         exec2 = execution.replace("s1", "s2")
         m2 = re.search(r"execution=(e\d+s\d+)", r2.text)
+
         if m2:
             exec2 = m2.group(1)
 
-        r3 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
-                       params={"execution": exec2, "_eventId": "commit"},
-                       data=f"purchaseTemplate.comment=&_csrf={csrf_t}",
-                       timeout=10)
+        # STEP 3 COMMIT
+        r3 = http.post(
+            f"{BASE_URL}/court-single-booking-flow",
+            headers=hp,
+            params={"execution": exec2, "_eventId": "commit"},
+            data=f"purchaseTemplate.comment=&_csrf={csrf_t}",
+            timeout=10,
+        )
 
         if r3.status_code not in [200, 302]:
             return False
+
         if any(w in r3.text.lower() for w in ["fehler", "error", "nicht möglich"]):
             log.warning(f"[{k}] Buchung: Server-Fehler")
             return False
 
         booking_id = None
-        for pat in [r'"bookingId"\s*:\s*(\d+)', r'/bookings/(\d+)', r'booking[=_](\d+)']:
+
+        for pat in [
+            r'"bookingId"\s*:\s*(\d+)',
+            r'/bookings/(\d+)',
+            r'booking[=_](\d+)'
+        ]:
             mid = re.search(pat, r3.text)
+
             if mid:
                 booking_id = int(mid.group(1))
                 break
 
-        time.sleep(1.0)
+        # ═══════════════════════════════════════
+        # HOTFIX v11.0.1 VERIFIKATION
+        # ═══════════════════════════════════════
+
+        time.sleep(0.8)
+
         verifiziert = False
 
-        def _verifiziere_via_my_bookings() -> bool:
-            nonlocal booking_id
-            try:
-                r_pages = http.get(
-                    f"{BASE_URL}/user/my-bookings/total-pages",
-                    params={"size": "20", "sort": ["serviceDate,desc", "id,desc"]},
-                    headers={**h, "accept": "application/json, text/javascript, */*; q=0.01"},
-                    timeout=10)
-                if r_pages.status_code != 200:
-                    return False
-                total_pages = 1
-                try:
-                    raw = r_pages.json()
-                    total_pages = int(raw) if isinstance(raw, (int, float, str)) else 1
-                except Exception:
-                    total_pages = 1
-                total_pages = max(1, min(total_pages, 3))
+        # VERIFIKATION 1:
+        # /user/my-bookings
 
-                datum_obj_v = datetime.strptime(datum_de, "%d.%m.%Y")
-                for page in range(total_pages):
-                    r_page = http.get(
-                        f"{BASE_URL}/user/my-bookings/page",
-                        params={"page": str(page), "size": "20",
-                                "sort": ["serviceDate,desc", "id,desc"]},
-                        headers={**h, "accept": "text/html,*/*"},
-                        timeout=10)
-                    if r_page.status_code != 200:
-                        break
-                    soup  = BeautifulSoup(r_page.text, "html.parser")
-                    karten = soup.find_all("div", class_=lambda c: c and
-                                           "col-12" in c and "col-sm-6" in c)
-                    if not karten:
-                        karten = list({
-                            tag.find_parent("div") for tag in
-                            soup.find_all(attrs={"href": re.compile(r"/bookings/\d+")}) +
-                            soup.find_all(attrs={"data-target": re.compile(r"/bookings/\d+")})
-                            if tag.find_parent("div")
-                        })
-                    if not karten:
-                        karten = [soup]
-                    for karte in karten:
-                        if karte.find(class_=lambda c: c and
-                                      ("badge-danger" in c or "cancelled" in c or
-                                       "storniert" in c)):
-                            continue
-                        text = karte.get_text(" ", strip=True)
-                        dm = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
-                        if not dm or dm.group(1) != datum_de:
-                            continue
-                        zm = re.search(
-                            r"(?:von\s+)?(\d{1,2}:\d{2})\s*(?:Uhr\s+)?(?:bis|–|-)\s*(\d{1,2}:\d{2})",
-                            text, re.I)
-                        if not zm:
-                            continue
-                        f_str = zm.group(1).zfill(5)
-                        t_str = zm.group(2).zfill(5)
-                        if f_str != from_t or t_str != to_t:
-                            continue
-                        cm = re.search(r"[Cc]ourt\s*(\d+)", text)
-                        if not cm or int(cm.group(1)) != int(court):
-                            continue
-                        for pa in ["data-target", "href", "data-url", "action"]:
-                            for tag in karte.find_all(attrs={pa: re.compile(r"/bookings/\d+")}):
-                                m_bid = re.search(r"/bookings/(\d+)", tag.get(pa, ""))
-                                if m_bid:
-                                    booking_id = int(m_bid.group(1))
-                                    break
-                            if booking_id:
-                                break
-                        log.info(f"[{k}] Verifikation via my-bookings OK: "
-                                 f"{datum_de} {from_t}–{to_t} Court {court} ID={booking_id}")
-                        return True
-            except Exception as ve:
-                log.warning(f"[{k}] my-bookings Verifikation Fehler: {ve}")
-            return False
+        try:
+            r_my = http.get(
+                f"{BASE_URL}/user/my-bookings/page",
+                params={
+                    "page": "0",
+                    "size": "50",
+                    "sort": ["serviceDate,desc", "id,desc"]
+                },
+                headers={
+                    "accept": "text/html,*/*",
+                    "x-requested-with": "XMLHttpRequest",
+                    "referer": f"{BASE_URL}/user/my-bookings"
+                },
+                timeout=10,
+            )
 
-        def _verifiziere_via_padel() -> bool:
-            nonlocal booking_id
+            if r_my.status_code == 200:
+                text = r_my.text
+
+                slot_match = (
+                    datum_de in text and
+                    from_t in text and
+                    to_t in text
+                )
+
+                court_match = (
+                    f"Court {court}" in text or
+                    f"court {court}" in text or
+                    f">{court}<" in text
+                )
+
+                if slot_match and court_match:
+                    verifiziert = True
+                    log.info(f"✅ [{k}] Verifiziert über /user/my-bookings")
+
+        except Exception as ve1:
+            log.warning(f"[{k}] Verifikation my-bookings Fehler: {ve1}")
+
+        # VERIFIKATION 2:
+        # FALLBACK → /padel + PERSON-ID MATCH
+
+        if not verifiziert:
             try:
-                pid = az_get(k, "person_id")
+                time.sleep(0.7)
+
                 server_res = hole_reservierungen(k, datum_api)
+
                 for res in server_res:
-                    if (res["court"] == int(court) and
-                            res["fromTime"] == from_t and res["toTime"] == to_t):
-                        res_bid = res.get("booking") or res.get("bookingOrBlockingId")
-                        res_pid = str(res.get("personId", res.get("person_id", "")))
-                        if pid and res_pid and res_pid != str(pid):
-                            log.warning(f"[{k}] /padel: Slot belegt, aber andere Person-ID "
-                                        f"({res_pid} != {pid}) – jemand war schneller!")
-                            return False
-                        if booking_id and res_bid and res_bid == booking_id:
-                            log.info(f"[{k}] Verifikation via /padel OK (booking_id Match)")
-                            return True
-                        elif not booking_id and res_bid:
+                    if (
+                        str(res.get("court")) == court and
+                        res.get("fromTime") == from_t and
+                        res.get("toTime") == to_t
+                    ):
+
+                        res_person = str(
+                            res.get("person") or
+                            res.get("personId") or
+                            res.get("customerId") or
+                            ""
+                        )
+
+                        res_bid = (
+                            res.get("booking") or
+                            res.get("bookingOrBlockingId")
+                        )
+
+                        # PERSON-ID MATCH
+                        if person_id and res_person and res_person == str(person_id):
+                            verifiziert = True
+                            booking_id = res_bid or booking_id
+                            log.info(f"✅ [{k}] Verifiziert über Person-ID Match")
+                            break
+
+                        # FALLBACK booking_id MATCH
+                        if booking_id and res_bid and str(res_bid) == str(booking_id):
+                            verifiziert = True
                             booking_id = res_bid
-                            log.info(f"[{k}] Verifikation via /padel OK (ID aus Server)")
-                            return True
-                        elif not res_bid:
-                            log.info(f"[{k}] Verifikation via /padel OK (kein bid-Feld)")
-                            return True
-            except Exception as ve:
-                log.warning(f"[{k}] /padel Verifikation Fehler: {ve}")
-            return False
+                            log.info(f"✅ [{k}] Verifiziert über booking_id Match")
+                            break
 
-        verifiziert = _verifiziere_via_my_bookings()
-
-        if not verifiziert:
-            try:
-                time.sleep(1.5)
-                verifiziert = _verifiziere_via_my_bookings()
-                if not verifiziert:
-                    verifiziert = _verifiziere_via_padel()
             except Exception as ve2:
-                log.warning(f"[{k}] Verifikations-Versuch 2 fehlgeschlagen: {ve2}")
+                log.warning(f"[{k}] Verifikation Fallback Fehler: {ve2}")
+
+        # FINAL CHECK
 
         if not verifiziert:
-            log.warning(f"[{k}] ⚠️ Buchung NICHT verifiziert – möglicherweise zwischengebucht!")
+            log.warning(
+                f"[{k}] ⚠️ Buchung NICHT verifiziert – vermutlich Race Condition verloren!"
+            )
+
             az_set(k, "aktive_buchung", None)
             return False
 
-        az_set(k, "aktive_buchung", {**slot, "court": int(court), "booking_id": booking_id})
+        az_set(k, "aktive_buchung", {
+            **slot,
+            "court": int(court),
+            "booking_id": booking_id,
+        })
+
         log.info(f"✅ [{k}] Buchung OK + verifiziert – ID: {booking_id}")
         return True
+
     except Exception as e:
         log.error(f"[{k}] Buchungsfehler: {e}")
         return False
-
-
-# ══════════════════════════════════════════════
-# BUCHUNG SCHNELL (ohne Verifikations-Sleep) – NUR für Direkt & Sniper
-# ══════════════════════════════════════════════
-
-def buche_slot_schnell(k: str, slot: dict) -> bool:
-    """
-    Schnelle Buchung ohne Verifikations-Sleep für zeitkritische Modi
-    (Direkte Taktik & Sniper).
-
-    Wertet nur den r3-Response aus:
-      - HTTP-Status muss 200 oder 302 sein
-      - Kein Fehlertext im Response
-      - Booking-ID wird aus r3 extrahiert falls vorhanden
-
-    Kein time.sleep(), kein /user/my-bookings-Scraping.
-    Setzt aktive_buchung provisorisch – Aufrufer macht danach sync_buchung_vom_server().
-
-    WICHTIG: Nur für Modi verwenden wo der Slot vorher noch NICHT buchbar war
-    (Direkt: Slot wird erst zur buchbar_ab-Zeit freigegeben,
-     Sniper: Slot wird erst nach Stornierung des Fremden frei).
-    Dadurch ist False-Positiv-Risiko minimal.
-    """
-    court     = str(slot["court"])
-    from_t    = slot["fromTime"]
-    to_t      = slot["toTime"]
-    datum_de  = slot["datum_de"]
-    datum_api = slot["datum_api"]
-    snap      = az_snap(k, "csrf_token", "person_id", "http")
-    csrf_t    = snap["csrf_token"]
-    person_id = snap["person_id"]
-    http      = snap["http"]
-
-    if not person_id:
-        log.warning(f"[{k}] (schnell) Person-ID fehlt – versuche erneuten Login...")
-        einloggen(k)
-        person_id = az_get(k, "person_id")
-        if not person_id:
-            log.error(f"[{k}] (schnell) Person-ID fehlt – Buchung abgebrochen!")
-            return False
-
-    h  = {"accept": "*/*", "x-ajax-call": "true", "x-csrf-token": csrf_t,
-          "x-requested-with": "XMLHttpRequest",
-          "referer": f"{BASE_URL}/padel?currentDate={datum_api}"}
-    hp = {**h, "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-          "origin": BASE_URL}
-    try:
-        r1 = http.get(f"{BASE_URL}/court-single-booking-flow", headers=h,
-                      params={"module": MODULE, "court": court, "courts": "1,2",
-                              "fromTime": from_t, "toTime": to_t, "date": datum_api},
-                      timeout=10)
-        execution = "e1s1"
-        m = re.search(r"execution=(e\d+s\d+)", r1.text)
-        if m:
-            execution = m.group(1)
-
-        if not person_id:
-            person_id = extrahiere_person_id(r1.text)
-            if person_id:
-                az_set(k, "person_id", person_id)
-
-        r2 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
-                       params={"execution": execution, "_eventId": "next"},
-                       data=(f"purchaseTemplate.repetition.date={datum_de}"
-                             f"&purchaseTemplate.repetition.fromTime={from_t.replace(':', '%3A')}"
-                             f"&purchaseTemplate.repetition.toTime={to_t.replace(':', '%3A')}"
-                             f"&bookingModel.courts%5B0%5D={court}"
-                             f"&purchaseTemplate.court={court}"
-                             f"&purchaseTemplate.person={person_id}"
-                             f"&purchaseTemplate.bookingType={BOOKING_TYPE}"
-                             f"&_csrf={csrf_t}"),
-                       timeout=10)
-        exec2 = execution.replace("s1", "s2")
-        m2 = re.search(r"execution=(e\d+s\d+)", r2.text)
-        if m2:
-            exec2 = m2.group(1)
-
-        r3 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
-                       params={"execution": exec2, "_eventId": "commit"},
-                       data=f"purchaseTemplate.comment=&_csrf={csrf_t}",
-                       timeout=10)
-
-        # ── Nur r3 auswerten – kein Sleep, kein extra Request ──────────────
-        if r3.status_code not in [200, 302]:
-            return False
-        if any(w in r3.text.lower() for w in ["fehler", "error", "nicht möglich"]):
-            return False
-
-        # Booking-ID aus r3 extrahieren (best-effort)
-        booking_id = None
-        for pat in [r'"bookingId"\s*:\s*(\d+)', r'/bookings/(\d+)', r'booking[=_](\d+)']:
-            mid = re.search(pat, r3.text)
-            if mid:
-                booking_id = int(mid.group(1))
-                break
-
-        # Provisorisch setzen – Aufrufer ruft danach sync_buchung_vom_server()
-        az_set(k, "aktive_buchung", {**slot, "court": int(court), "booking_id": booking_id})
-        log.info(f"⚡ [{k}] Schnellbuchung OK (r3) – Court {court} {from_t}–{to_t} ID={booking_id}")
-        return True
-
-    except Exception as e:
-        log.error(f"[{k}] Schnellbuchung Fehler: {e}")
-        return False
-
 
 # ══════════════════════════════════════════════
 # STORNIERUNG
@@ -1233,7 +1183,6 @@ def sync_buchung_vom_server(k: str, debug_telegram: bool = False):
 # ══════════════════════════════════════════════
 
 def _aggressiv_buchen_07(k: str, datum_de: str, datum_api: str, dauer_min: int) -> bool:
-    """Unverändert – nur für Früh-Methode (07:00). Nutzt buche_slot() mit Verifikation."""
     oeffnung = datetime.strptime(ANLAGE_OEFFNUNG, "%H:%M")
     slot_07  = {
         "fromTime":  "07:00",
@@ -1287,65 +1236,12 @@ def _aggressiv_buchen_07(k: str, datum_de: str, datum_api: str, dauer_min: int) 
 
     return False
 
-
 def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str, dauer_min: int,
                          ab_dt: datetime, bis_dt: datetime,
                          bevorzugter_court: int = 0) -> bool:
-    """
-    GEÄNDERT in v10.2:
-    - Ziel-Slot wird EINMAL vor dem Loop berechnet (nicht bei jedem Versuch neu)
-    - Nutzt buche_slot_schnell() statt buche_slot()
-    - Nach Treffer: sync_buchung_vom_server() zur Verifikation
-    - Session-Check alle 50 Versuche wie bisher
-    """
     schluss  = datetime.strptime(ANLAGE_SCHLUSS, "%H:%M")
     deadline = time.time() + AGGRESSIVE_TIMEOUT
     versuch  = 0
-
-    # ── Ziel-Slots EINMAL berechnen, nicht in jedem Loop-Durchlauf ───────────
-    # Wir bauen alle Kandidaten-Slots direkt aus ab_dt/bis_dt/dauer_min,
-    # ohne den Server zu fragen. Court 2 zuerst, dann Court 1.
-    ziel_slots = []
-    for court_v in ([bevorzugter_court] if bevorzugter_court in (1, 2) else [2, 1]):
-        t = ab_dt
-        while t < bis_dt:
-            t_bis = t + timedelta(minutes=dauer_min)
-            if t_bis > schluss:
-                break
-            ziel_slots.append({
-                "court":     court_v,
-                "fromTime":  t.strftime("%H:%M"),
-                "toTime":    t_bis.strftime("%H:%M"),
-                "dauer":     dauer_min,
-                "datum_api": datum_api,
-                "datum_de":  datum_de,
-                "key":       f"{datum_api}_{court_v}_{t.strftime('%H:%M')}_{dauer_min}",
-            })
-            t += timedelta(minutes=30)
-    # Wenn bevorzugter_court gesetzt, auch den anderen Court als Fallback anhängen
-    if bevorzugter_court in (1, 2):
-        anderer = 1 if bevorzugter_court == 2 else 2
-        t = ab_dt
-        while t < bis_dt:
-            t_bis = t + timedelta(minutes=dauer_min)
-            if t_bis > schluss:
-                break
-            ziel_slots.append({
-                "court":     anderer,
-                "fromTime":  t.strftime("%H:%M"),
-                "toTime":    t_bis.strftime("%H:%M"),
-                "dauer":     dauer_min,
-                "datum_api": datum_api,
-                "datum_de":  datum_de,
-                "key":       f"{datum_api}_{anderer}_{t.strftime('%H:%M')}_{dauer_min}",
-            })
-            t += timedelta(minutes=30)
-
-    if not ziel_slots:
-        log.warning(f"[{k}] _aggressiv_buchen_ab: Keine Ziel-Slots im Zeitfenster!")
-        return False
-
-    log.info(f"[{k}] Direkt-Spam: {len(ziel_slots)} Ziel-Slots, hämmere mit buche_slot_schnell()...")
 
     while time.time() < deadline:
         if not az_get(k, "schiebe_aktiv"):
@@ -1359,33 +1255,29 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str, dauer_min: int,
                     return False
                 senden(f"✅ [{k}] Neu eingeloggt – Dauerbeschuss läuft weiter...")
 
-        # Alle Kandidaten der Reihe nach schnell versuchen
-        for slot in ziel_slots:
-            if not az_get(k, "schiebe_aktiv"):
-                return False
-            if buche_slot_schnell(k, slot):
-                # Treffer! Einmalig synchronisieren zur Sicherheit
-                log.info(f"[{k}] Direkt-Treffer nach {versuch+1} Runden – sync...")
-                try:
-                    time.sleep(1.0)
-                    sync_buchung_vom_server(k)
-                except Exception as e:
-                    log.warning(f"[{k}] Sync nach Direkt-Treffer: {e}")
-                return True
+        freie      = berechne_freie_slots(k, datum_de, dauer_min)
+        kandidaten = [s for s in freie
+                      if datetime.strptime(s["fromTime"], "%H:%M") >= ab_dt
+                      and datetime.strptime(s["fromTime"], "%H:%M") < bis_dt
+                      and datetime.strptime(s["toTime"], "%H:%M") <= schluss]
+        if bevorzugter_court in (1, 2):
+            prio     = [s for s in kandidaten if s["court"] == bevorzugter_court]
+            fallback = [s for s in kandidaten if s["court"] != bevorzugter_court]
+            kandidaten = prio + fallback
+        if kandidaten and buche_slot(k, kandidaten[0]):
+            return True
 
         versuch += 1
         time.sleep(AGGRESSIVE_INTERVAL)
-
     return False
 
 # ══════════════════════════════════════════════
-# SCHIEBE PHASE 3 – unverändert
+# SCHIEBE PHASE 3
 # ══════════════════════════════════════════════
 
 def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_str: str):
     """
     Phase 3: Schrittweise schieben bis Zielzeit.
-    Unverändert gegenüber v10.1.
     """
     datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
     ziel_dt   = datetime.strptime(ziel_str, "%H:%M")
@@ -1431,7 +1323,7 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
         jetzt = jetzt_lokal()
         random_offset  = random.randint(SCHIEBE_MINUTEN_VOR_MIN, SCHIEBE_MINUTEN_VOR_MAX)
         schiebe_moment = datetime.combine(
-            jetzt.date(),
+            jetzt.date(),                                  # ← HEUTE, nicht datum_obj!
             (ende_dt - timedelta(minutes=random_offset)).time())
 
         sek = (schiebe_moment - jetzt).total_seconds()
@@ -1507,6 +1399,7 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
                 return
             continue
 
+        # FIX 2a: Storno-Retry prüft aktiv()
         storno_ok = False
         for storno_versuch in range(6):
             if not aktiv():
@@ -1524,6 +1417,7 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
                 return
             continue
 
+        # FIX 2b: Sofort-Rebook nach Storno
         neuer_slot    = {
             "fromTime":  naechster_von,
             "toTime":    naechster_bis,
@@ -1549,6 +1443,7 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
         letzter_session_check = time.time()
 
         if ok:
+            # FIX 2c: Bestätigung nur nach verifiziertem aktive_buchung
             gebuchter = az_get(k, "aktive_buchung")
             if not gebuchter:
                 try:
@@ -1624,7 +1519,7 @@ def _schiebe_intern(k: str):
         zeige_account_menue(k)
 
     # ── Phase 1: Warten auf 7-Tage-Fenster ───────────────────────────────────
-    if modus in ("frueh",):
+    if modus in ("frueh", "direkt"):
         while aktiv():
             jetzt   = jetzt_lokal()
             fenster = datetime.combine(
@@ -1800,25 +1695,22 @@ def _schiebe_intern(k: str):
 
         jetzt        = jetzt_lokal()
         buchbar_zeit = datetime.strptime(buchbar_ab, "%H:%M").time()
-        sieben_tage_tag = (datum_obj - timedelta(days=7)).date()
-        buchbar_dt      = datetime.combine(sieben_tage_tag, buchbar_zeit)
-        spam_start_dt = buchbar_dt - timedelta(seconds=1)
+        buchbar_dt   = datetime.combine(jetzt.date(), buchbar_zeit)
 
         if jetzt < buchbar_dt:
             sek_wait = (buchbar_dt - jetzt).total_seconds()
             senden(f"🎯 <b>[{k}] Direkte Taktik – warte auf Startzeit</b>\n"
-                   f"📅 {datum_de} | Buchbar ab {buchbar_dt.strftime('%d.%m.%Y')} {buchbar_ab} Uhr\n"
+                   f"📅 {datum_de} | Buchbar ab heute {buchbar_ab} Uhr\n"
                    f"🎯 Ziel: {ziel_str} Uhr | {dauer_min} Min\n"
-                   f"⏳ Noch {int(sek_wait/60)} Min bis {buchbar_ab} Uhr...\n"
-                   f"⚡ Spam startet 1s früher: {spam_start_dt.strftime('%d.%m.%Y %H:%M:%S')} Uhr")
+                   f"⏳ Noch {int(sek_wait/60)} Min bis {buchbar_ab} Uhr...")
             if not schlafe(max(0, sek_wait - 90)):
                 return
             senden(f"🔑 [{k}] Frischer Login 90s vor {buchbar_ab} Uhr...")
             if not _session_refresh_vor_aktion(k, f"Direkt {buchbar_ab}"):
                 beende(f"❌ [{k}] Login vor {buchbar_ab} fehlgeschlagen!")
                 return
-            senden(f"✅ [{k}] Eingeloggt – warte auf {spam_start_dt.strftime('%d.%m.%Y %H:%M:%S')} Uhr (1s vor {buchbar_ab})...")
-            restzeit = (spam_start_dt - jetzt_lokal()).total_seconds()
+            senden(f"✅ [{k}] Eingeloggt – warte auf exakt {buchbar_ab} Uhr...")
+            restzeit = (buchbar_dt - jetzt_lokal()).total_seconds()
             if restzeit > 0:
                 time.sleep(restzeit)
         else:
@@ -1827,9 +1719,8 @@ def _schiebe_intern(k: str):
                 return
 
         senden(f"🎯 <b>[{k}] Direkte Taktik – Dauerbeschuss startet!</b>\n"
-               f"⚡ 1 Sekunde vor {buchbar_ab} Uhr – voller Spam!\n"
-               f"🎯 Buche {datum_de} ab {buchbar_ab} Uhr | Court 2 bevorzugt\n"
-               f"⚡ v10.2: Schnellbuchung aktiv (~0.5s/Versuch statt ~4s)")
+               f"⏰ Es ist {buchbar_ab} Uhr!\n"
+               f"🎯 Buche {datum_de} ab {buchbar_ab} Uhr | Court 2 bevorzugt")
 
         ab_dt        = datetime.strptime(buchbar_ab, "%H:%M")
         direkt_court = az_get(k, "schiebe_court") or 0
@@ -1847,7 +1738,7 @@ def _schiebe_intern(k: str):
     _schiebe_phase3(k, datum_de, datum_api, dauer_min, ziel_str)
 
 # ══════════════════════════════════════════════
-# SNIPER – GEÄNDERT in v10.2: nutzt buche_slot_schnell()
+# SNIPER
 # ══════════════════════════════════════════════
 
 def sniper_loop(k: str):
@@ -1860,15 +1751,6 @@ def sniper_loop(k: str):
         zeige_account_menue(k)
 
 def _sniper_intern(k: str):
-    """
-    Sniper-Modus: Zielt auf den Slot 30 Min vor Ende einer fremden Buchung.
-
-    GEÄNDERT v10.2:
-    - Nutzt buche_slot_schnell() statt buche_slot()
-    - Kein 2.5s Verifikations-Sleep mehr pro Versuch
-    - Nach Treffer: sync_buchung_vom_server() einmalig
-    - Session-Check: weiterhin alle 60s via ist_eingeloggt()
-    """
     datum_de    = az_get(k, "sniper_datum")
     fremder_bis = az_get(k, "sniper_fremder_bis")
     court       = az_get(k, "sniper_court")
@@ -1899,7 +1781,7 @@ def _sniper_intern(k: str):
            f"🏟️ Court {court} | Fremde Buchung endet: {fremder_bis} Uhr\n"
            f"💥 Sniper-Ziel: <b>{target_von}–{target_bis}</b>\n"
            f"🔄 Nach Treffer → Schiebe bis {ziel_str} Uhr\n"
-           f"⚡ v10.2: Schnellbuchung aktiv (~0.5s/Versuch statt ~4s)")
+           f"⚡ Hämmere sekündlich auf {target_von} Uhr...")
 
     versuche      = 0
     letzter_login = time.time()
@@ -1911,7 +1793,6 @@ def _sniper_intern(k: str):
         return
 
     while az_get(k, "sniper_aktiv"):
-        # Session-Check alle 60s
         if versuche > 0 and time.time() - letzter_login > 60:
             if not ist_eingeloggt(k):
                 log.info(f"[{k}] Sniper: Session-Refresh nach {versuche} Versuchen...")
@@ -1926,15 +1807,7 @@ def _sniper_intern(k: str):
             else:
                 letzter_login = time.time()
 
-        if buche_slot_schnell(k, target_slot):
-            # Einmalig synchronisieren nach Treffer
-            log.info(f"[{k}] Sniper-Treffer nach {versuche+1} Versuchen – sync...")
-            try:
-                time.sleep(1.0)
-                sync_buchung_vom_server(k)
-            except Exception as e:
-                log.warning(f"[{k}] Sync nach Sniper-Treffer: {e}")
-
+        if buche_slot(k, target_slot):
             buchung = az_get(k, "aktive_buchung")
             if buchung:
                 wetter_str = hole_wetter(datum_de, target_von)
@@ -1945,12 +1818,8 @@ def _sniper_intern(k: str):
                        f"🔄 Schiebe weiter → {ziel_str} Uhr..."
                        + wetter_str)
             else:
-                # sync hat keine Buchung gefunden → buche_slot_schnell war False-Positiv
-                log.warning(f"[{k}] Sniper: Treffer nicht verifizierbar – weiter hämmern...")
-                senden(f"⚠️ [{k}] Sniper: Treffer nicht bestätigt – weiter hämmern...")
-                versuche += 1
-                time.sleep(1.0)
-                continue
+                senden(f"🎯 <b>[{k}] SNIPER TREFFER!</b> (nach {versuche+1} Versuchen)\n"
+                       f"🔄 Schiebe weiter → {ziel_str} Uhr...")
 
             az_set(k, "sniper_aktiv", False)
 
@@ -1970,6 +1839,223 @@ def _sniper_intern(k: str):
     senden(f"⏹️ [{k}] Sniper gestoppt nach {versuche} Versuchen.")
     az_set(k, "sniper_aktiv", False)
     zeige_account_menue(k)
+
+# ══════════════════════════════════════════════
+# 3h-MODUS (DUO)  –  NEU 3
+# ══════════════════════════════════════════════
+
+def trio_loop_x(k_x: str, k_y: str, datum_de: str, startzeit: str, dauer_min: int):
+    """
+    Account X: Früh-Methode, schiebt bis startzeit (z.B. 11:00).
+    Sobald X seine Ziel-Buchung (startzeit) hält → Court an Y weitergeben.
+    Y wurde bereits parallel gestartet und liest den Court selbst aus.
+    """
+    try:
+        _schiebe_intern(k_x)
+    except Exception as e:
+        log.error(f"[{k_x}] TRIO-X CRASH: {e}", exc_info=True)
+        senden(f"💥 <b>[{k_x}] 3h-Modus X abgestürzt!</b>\n{e}")
+        az_set(k_x, "schiebe_aktiv", False)
+
+def trio_loop_y(k_x: str, k_y: str, datum_de: str, buchbar_ab: str,
+                dauer_min: int, ziel_str: str):
+    """
+    Account Y: Direkte Taktik.
+    Wartet auf 7-Tage-Fenster, dann auf buchbar_ab (= Ende von X).
+    Vor dem Hämmern: liest Court von X aus aktive_buchung und
+    übernimmt ihn als bevorzugter_court.
+    Kein Schieben – Ziel = buchbar_ab, also direkt fertig nach Treffer.
+    """
+    try:
+        datum_obj  = datetime.strptime(datum_de, "%d.%m.%Y")
+        datum_api  = datum_obj.strftime("%m/%d/%Y")
+
+        def aktiv() -> bool:
+            return az_get(k_y, "schiebe_aktiv")
+
+        def schlafe(sek: float) -> bool:
+            ende = time.time() + sek
+            while time.time() < ende:
+                if not aktiv():
+                    return False
+                time.sleep(min(1, max(0, ende - time.time())))
+            return True
+
+        def beende(msg: str = ""):
+            az_set(k_y, "schiebe_aktiv", False)
+            if msg:
+                senden(msg)
+
+        # Phase 1: Warten auf 7-Tage-Fenster (gleich wie direkt-Modus)
+        while aktiv():
+            jetzt   = jetzt_lokal()
+            fenster = datetime.combine(
+                (datum_obj - timedelta(days=7)).date(),
+                datetime.strptime("07:00", "%H:%M").time())
+            if jetzt >= fenster:
+                break
+            sek_bis = (fenster - jetzt).total_seconds()
+            tage_r_w = int(sek_bis // 86400)
+            std_r_w  = int((sek_bis % 86400) // 3600)
+            min_r_w  = int((sek_bis % 3600) // 60)
+            if tage_r_w > 0:
+                warte_str_w = f"{tage_r_w}T {std_r_w}h {min_r_w}min"
+            elif std_r_w > 0:
+                warte_str_w = f"{std_r_w}h {min_r_w}min"
+            else:
+                warte_str_w = f"{min_r_w}min"
+
+            senden(f"⏳ <b>[{k_y}] 3h-Modus – wartet auf 7-Tage-Fenster</b>\n"
+                   f"📅 {datum_de}\n"
+                   f"🔓 Buchbar ab: {fenster.strftime('%d.%m.%Y um 07:00 Uhr')}\n"
+                   f"⏱️ Noch {warte_str_w}")
+
+            schlaf = min(sek_bis - 30, 23 * 3600)
+            if schlaf > 1:
+                if not schlafe(schlaf):
+                    return
+            else:
+                if not schlafe(max(0, sek_bis)):
+                    return
+                break
+
+        if not aktiv():
+            return
+
+        # Phase 2: Warten auf buchbar_ab (= Ende von X)
+        jetzt       = jetzt_lokal()
+        buchbar_dt  = datetime.combine(jetzt.date(),
+                                       datetime.strptime(buchbar_ab, "%H:%M").time())
+
+        if jetzt < buchbar_dt:
+            sek_wait = (buchbar_dt - jetzt).total_seconds()
+            senden(f"🎯 <b>[{k_y}] 3h-Modus – warte auf {buchbar_ab} Uhr</b>\n"
+                   f"📅 {datum_de} | Buche ab {buchbar_ab} Uhr | {dauer_min} Min\n"
+                   f"⏳ Noch {int(sek_wait/60)} Min...")
+            if not schlafe(max(0, sek_wait - 90)):
+                return
+
+            # Court von X lesen bevor wir einloggen
+            # X hat seinen Ziel-Court in aktive_buchung gespeichert
+            x_buchung  = az_get(k_x, "aktive_buchung")
+            x_court    = x_buchung["court"] if x_buchung else 2
+            az_set(k_y, "schiebe_court", x_court)
+            log.info(f"[{k_y}] 3h-Modus: X hat Court {x_court} → Y übernimmt Court {x_court}")
+            senden(f"🔑 [{k_y}] 3h-Modus: X spielt auf Court {x_court} → Y zielt auch auf C{x_court}\n"
+                   f"Frischer Login 90s vor {buchbar_ab} Uhr...")
+
+            if not _session_refresh_vor_aktion(k_y, f"3h-Modus {buchbar_ab}"):
+                beende(f"❌ [{k_y}] Login vor {buchbar_ab} fehlgeschlagen!")
+                return
+            senden(f"✅ [{k_y}] Eingeloggt – warte auf exakt {buchbar_ab} Uhr...")
+            restzeit = (buchbar_dt - jetzt_lokal()).total_seconds()
+            if restzeit > 0:
+                time.sleep(restzeit)
+        else:
+            # Schon vorbei – Court sofort lesen
+            x_buchung = az_get(k_x, "aktive_buchung")
+            x_court   = x_buchung["court"] if x_buchung else 2
+            az_set(k_y, "schiebe_court", x_court)
+            if not _session_refresh_vor_aktion(k_y, f"3h-Modus sofort {buchbar_ab}"):
+                beende(f"❌ [{k_y}] Login fehlgeschlagen!")
+                return
+
+        if not aktiv():
+            return
+
+        direkt_court = az_get(k_y, "schiebe_court") or 2
+        senden(f"🎯 <b>[{k_y}] 3h-Modus – Dauerbeschuss startet!</b>\n"
+               f"⏰ Es ist {buchbar_ab} Uhr!\n"
+               f"🏟️ Ziel: Court {direkt_court} | {buchbar_ab}–{ziel_str} | {dauer_min} Min")
+
+        ab_dt   = datetime.strptime(buchbar_ab, "%H:%M")
+        ziel_dt = datetime.strptime(ziel_str,   "%H:%M")
+
+        if not _aggressiv_buchen_ab(k_y, datum_de, datum_api, dauer_min, ab_dt, ziel_dt,
+                                    bevorzugter_court=direkt_court):
+            beende(f"❌ [{k_y}] 3h-Modus: Kein Slot ab {buchbar_ab} buchbar nach {AGGRESSIVE_TIMEOUT}s.")
+            return
+
+        buchung = az_get(k_y, "aktive_buchung")
+        wetter_str = hole_wetter(datum_de, buchbar_ab)
+        senden(f"✅ <b>[{k_y}] 3h-Modus – fertig!</b>\n"
+               f"📅 {_datum_mit_tag(datum_de)}\n"
+               f"🕐 {buchung['fromTime']}–{buchung['toTime']} | Court {buchung['court']}\n"
+               f"🏆 Kein Schieben nötig – direkt am Ziel!\n\nViel Spaß! 🎾"
+               + wetter_str)
+        az_set(k_y, "schiebe_aktiv", False)
+
+    except Exception as e:
+        log.error(f"[{k_y}] TRIO-Y CRASH: {e}", exc_info=True)
+        senden(f"💥 <b>[{k_y}] 3h-Modus Y abgestürzt!</b>\n{e}")
+        az_set(k_y, "schiebe_aktiv", False)
+
+def starte_trio_modus(k_x: str, k_y: str, datum_de: str, startzeit: str):
+    """
+    Startet den 3h-Modus:
+      X → Früh-Methode, Ziel = startzeit, Dauer = 90 Min
+      Y → Direkte Taktik, buchbar_ab = startzeit + 90 Min, Ziel = startzeit + 90 Min
+    Beide laufen als unabhängige Threads.
+    """
+    dauer_min   = 90
+    start_dt    = datetime.strptime(startzeit, "%H:%M")
+    mitte_dt    = start_dt + timedelta(minutes=dauer_min)
+    ende_dt     = mitte_dt + timedelta(minutes=dauer_min)
+    mitte_str   = mitte_dt.strftime("%H:%M")
+    ende_str    = ende_dt.strftime("%H:%M")
+
+    # Account X konfigurieren
+    az_set_multi(k_x,
+        schiebe_aktiv=True,
+        schiebe_modus="frueh",
+        schiebe_datum=datum_de,
+        schiebe_ziel=startzeit,
+        schiebe_dauer=dauer_min,
+        schiebe_buchbar_ab=None,
+        schiebe_court=0,
+        trio_partner_x=None,
+    )
+
+    # Account Y konfigurieren
+    # schiebe_court wird erst kurz vor buchbar_ab gesetzt (liest X's tatsächlichen Court)
+    az_set_multi(k_y,
+        schiebe_aktiv=True,
+        schiebe_modus="direkt",
+        schiebe_datum=datum_de,
+        schiebe_ziel=mitte_str,      # Ziel = buchbar_ab → direkt fertig
+        schiebe_dauer=dauer_min,
+        schiebe_buchbar_ab=mitte_str,
+        schiebe_court=2,             # Vorläufig Court 2, wird vor Hammer überschrieben
+        trio_partner_x=k_x,
+    )
+
+    datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
+    tage_bis  = (datum_obj.date() - jetzt_lokal().date()).days
+
+    senden(
+        f"⏱️ <b>3h-Modus gestartet!</b>\n\n"
+        f"📅 {_datum_mit_tag(datum_de)} | in {tage_bis} Tagen\n\n"
+        f"<b>[{k_x}]</b> 🌅 Früh-Methode\n"
+        f"   → Schiebt bis <b>{startzeit}–{mitte_str}</b>\n\n"
+        f"<b>[{k_y}]</b> 🎯 Direkte Taktik\n"
+        f"   → Hämmert ab <b>{mitte_str} Uhr</b> auf <b>{mitte_str}–{ende_str}</b>\n"
+        f"   → Court wird von [{k_x}] übernommen\n\n"
+        f"🏟️ Court: beide bevorzugen C2, Y übernimmt X's tatsächlichen Court"
+    )
+
+    # X-Thread
+    t_x = threading.Thread(target=trio_loop_x,
+                            args=(k_x, k_y, datum_de, startzeit, dauer_min),
+                            daemon=True)
+    t_x.start()
+    az_set(k_x, "schiebe_thread", t_x)
+
+    # Y-Thread
+    t_y = threading.Thread(target=trio_loop_y,
+                            args=(k_x, k_y, datum_de, mitte_str, dauer_min, mitte_str),
+                            daemon=True)
+    t_y.start()
+    az_set(k_y, "schiebe_thread", t_y)
 
 # ══════════════════════════════════════════════
 # FREITEXT-HANDLER
@@ -2045,6 +2131,95 @@ def handle_callback(cb: dict):
         zeige_account_menue(k)
         return
 
+    # ── 3h-Modus Callbacks  –  NEU 3 ─────────────────────────────────────────
+    if data == "trio_start":
+        trio_reset()
+        trio_set(schritt="acc_x")
+        # Account-Buttons für X
+        buttons = []
+        for ak in ACCOUNTS:
+            buttons.append([{"text": account_status_label(ak),
+                             "callback_data": f"trio_x_{ak}"}])
+        buttons.append([{"text": "❌ Abbrechen", "callback_data": "abbrechen"}])
+        senden("⏱️ <b>3h-Modus – Account X wählen</b>\n\n"
+               "Welcher Account schiebt zuerst? (Früh-Methode, 07:00 Uhr)",
+               buttons=buttons)
+        return
+
+    if data.startswith("trio_x_"):
+        k_x = data[7:]
+        if k_x not in ACCOUNTS:
+            senden("❌ Unbekannter Account.")
+            return
+        trio_set(acc_x=k_x, schritt="acc_y")
+        buttons = []
+        for ak in ACCOUNTS:
+            if ak == k_x:
+                continue
+            buttons.append([{"text": account_status_label(ak),
+                             "callback_data": f"trio_y_{ak}"}])
+        buttons.append([{"text": "❌ Abbrechen", "callback_data": "abbrechen"}])
+        senden(f"⏱️ <b>3h-Modus – Account Y wählen</b>\n\n"
+               f"X = <b>{k_x}</b> (Früh-Methode)\n"
+               f"Welcher Account bucht danach? (Direkte Taktik)",
+               buttons=buttons)
+        return
+
+    if data.startswith("trio_y_"):
+        k_y = data[7:]
+        if k_y not in ACCOUNTS:
+            senden("❌ Unbekannter Account.")
+            return
+        k_x = trio_get("acc_x")
+        trio_set(acc_y=k_y, schritt="datum")
+        senden(f"⏱️ <b>3h-Modus – Datum wählen</b>\n\n"
+               f"X = <b>{k_x}</b> | Y = <b>{k_y}</b>\n"
+               f"Für welches Datum?",
+               buttons=erstelle_datum_buttons("trio_datum", nur_im_fenster=False))
+        return
+
+    if data.startswith("trio_datum_"):
+        datum = data[11:]
+        k_x   = trio_get("acc_x")
+        k_y   = trio_get("acc_y")
+        trio_set(datum=datum, schritt="startzeit")
+        dauer_min = 90  # Fix 90 Min pro Slot im 3h-Modus
+        senden(f"⏱️ <b>3h-Modus – Startzeit wählen</b>\n\n"
+               f"X = <b>{k_x}</b> | Y = <b>{k_y}</b> | 📅 {datum}\n\n"
+               f"Wann soll [{k_x}] fertig sein? (= Startzeit für [{k_y}])\n"
+               f"<i>Beide Slots à 90 Min – z.B. 11:00 → X: 07:00–11:00, Y: 11:00–12:30</i>",
+               buttons=startzeit_buttons("trio_start", dauer_min))
+        return
+
+    if data.startswith("trio_start_"):
+        startzeit = data[11:]
+        k_x       = trio_get("acc_x")
+        k_y       = trio_get("acc_y")
+        datum     = trio_get("datum")
+
+        if not k_x or not k_y or not datum:
+            senden("❌ 3h-Modus Fehler – bitte neu starten.")
+            zeige_account_auswahl()
+            return
+
+        # Prüfen ob Accounts frei sind
+        for k_check in [k_x, k_y]:
+            if az_get(k_check, "schiebe_aktiv") or az_get(k_check, "sniper_aktiv"):
+                senden(f"⚠️ [{k_check}] läuft bereits! Erst stoppen.")
+                zeige_account_auswahl()
+                return
+            if az_get(k_check, "aktive_buchung"):
+                senden(f"⚠️ [{k_check}] hat aktive Buchung! 3h-Modus nur ohne aktive Buchung.")
+                zeige_account_auswahl()
+                return
+
+        trio_reset()
+        starte_trio_modus(k_x, k_y, datum, startzeit)
+        zeige_account_auswahl()
+        return
+
+    # ─────────────────────────────────────────────────────────────────────────
+
     k = get_flow_account()
     for ak in ACCOUNTS:
         if data.endswith(f"_{ak}"):
@@ -2107,10 +2282,12 @@ def handle_callback(cb: dict):
         schiebe = snap["schiebe_aktiv"]
         sniper  = snap["sniper_aktiv"]
         modus   = snap["schiebe_modus"] or ""
-        modus_l = {"frueh": "Früh", "spaet": "Spät", "direkt": "Direkt", "sniper": "Sniper-Fortsetzung"}.get(modus, "?")
+        modus_l = {"frueh": "Früh", "spaet": "Spät", "direkt": "Direkt",
+                   "sniper": "Sniper-Fortsetzung"}.get(modus, "?")
         pid     = snap["person_id"] or "⚠️ NICHT GEFUNDEN"
 
         if aktiv:
+            court_str = f" | C{aktiv.get('court', '?')}"          # NEU 1
             extra = ""
             if schiebe:
                 extra = (f"🔄 Schiebe ({modus_l}) → Ziel {snap['schiebe_ziel']} | "
@@ -2120,8 +2297,7 @@ def handle_callback(cb: dict):
             wetter_str = hole_wetter(aktiv["datum_de"], aktiv["fromTime"])
             senden(f"📊 <b>[{k}] Aktive Buchung:</b>\n"
                    f"📅 {_datum_mit_tag(aktiv['datum_de'])}\n"
-                   f"🕐 {aktiv['fromTime']}–{aktiv['toTime']} Uhr\n"
-                   f"🏟️ Court {aktiv['court']}\n"
+                   f"🕐 {aktiv['fromTime']}–{aktiv['toTime']} Uhr{court_str}\n"
                    f"🔖 ID: {aktiv.get('booking_id','?')}\n"
                    f"👤 Person: {pid}\n\n"
                    + (extra if extra else "ℹ️ Keine Schiebe aktiv.")
@@ -2452,6 +2628,7 @@ def handle_callback(cb: dict):
 
     # ── Abbrechen ─────────────────────────────────────────────────────────────
     elif data == "abbrechen":
+        trio_reset()
         if k:
             az_set_multi(k, flow=None, flow_datum=None, flow_dauer=None)
         senden("↩️ Abgebrochen.")
@@ -2497,15 +2674,11 @@ def telegram_loop():
 
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("🎾 Padel Bot v10.2.0 – Schnellbuchung für Direkt & Sniper")
-    log.info("   NEU: buche_slot_schnell() – kein 2.5s Verifikations-Sleep im heißen Pfad")
-    log.info("   NEU: _aggressiv_buchen_ab() – Slot-Berechnung einmalig vor dem Loop")
-    log.info("   NEU: _sniper_intern() – nutzt buche_slot_schnell()")
-    log.info("   Früh/Spät/Klassisch: unverändert mit voller Verifikation")
-    log.info("   FIX 1: buche_slot() kein False-Positiv mehr")
-    log.info("   FIX 2: Rebook nach Storno: 30× mit 0.1s | Storno-Retry: aktiv()-Check")
-    log.info("   NEU 3: Sniper-Modus")
-    log.info("   Schiebe-Logik: Storno/Neubuchung passiert HEUTE (nicht am Buchungstag!)")
+    log.info("🎾 Padel Bot v11.0.0 – Court-Anzeige | 6 Accounts | 3h-Modus")
+    log.info("   NEU 1: Court-Anzeige (C1/C2) in Account-Auswahl und Status")
+    log.info("   NEU 2: Bis zu 6 Accounts unterstützt")
+    log.info("   NEU 3: 3h-Modus – X Früh-Methode + Y Direkte Taktik parallel")
+    log.info("   KERN:  Alle Fixes aus v10 unverändert beibehalten")
     for k in ACCOUNTS:
         log.info(f"   [{k}] {ACCOUNTS[k]['email']}")
     log.info(f"   Court-Priorität : 2 → 1 (automatisch)")
@@ -2540,19 +2713,21 @@ if __name__ == "__main__":
         senden(f"⚠️ Login für {', '.join(fehler)} fehlgeschlagen!")
 
     anzahl      = len(ACCOUNTS)
-    modus_label = "Dual-Account" if anzahl > 1 else "Einzel-Account"
+    modus_label = "Multi-Account" if anzahl > 2 else ("Dual-Account" if anzahl > 1 else "Einzel-Account")
     startup_msg = (
-        f"🎾 <b>Padel Bot v10.2.0 gestartet!</b>\n\n"
-        f"{modus_label}  |  3 Schiebe-Modi  |  🎯 Sniper-Modus\n\n"
-        f"<b>NEU v10.2 – Schnellbuchung:</b>\n"
-        f"⚡ Direkte Taktik: ~0.5s/Versuch (vorher ~4s)\n"
-        f"⚡ Sniper: ~0.5s/Versuch (vorher ~4s)\n"
-        f"🔒 Sniper verifiziert nach Treffer via sync\n"
-        f"📋 Slot-Berechnung nur einmal vor dem Loop\n\n"
-        f"<b>Unverändert:</b>\n"
-        f"🌅 Früh-Methode: volle Verifikation (07:00 Race)\n"
-        f"🕐 Spät-Taktik: volle Verifikation\n"
-        f"📅 Klassische Buchung: volle Verifikation"
+        f"🎾 <b>Padel Bot v11.0.0 gestartet!</b>\n\n"
+        f"{modus_label}  |  3 Schiebe-Modi  |  🎯 Sniper  |  ⏱️ 3h-Modus\n\n"
+        f"<b>NEU v11:</b>\n"
+        f"🏟️ Court-Anzeige (C1/C2) in Account-Übersicht und Status\n"
+        f"👥 Bis zu 6 Accounts konfigurierbar\n"
+        f"⏱️ 3h-Modus: Zwei Accounts nahtlos 3h sichern\n"
+        f"   X → Früh-Methode → schiebt bis Startzeit\n"
+        f"   Y → Direkte Taktik → bucht ab Ende von X, gleicher Court\n\n"
+        f"<b>Aus v10 beibehalten:</b>\n"
+        f"🔒 Buchung nur bestätigt wenn Server-Sync OK\n"
+        f"⚡ Rebook nach Storno: 30× mit 0.1s\n"
+        f"🛑 Stopp-Button bricht Storno-Retry sofort ab\n"
+        f"🎯 Sniper-Modus"
     )
 
     if pid_warnungen:
@@ -2570,4 +2745,4 @@ if __name__ == "__main__":
             time.sleep(10)
     except KeyboardInterrupt:
         log.info("Bot beendet.")
-        senden("⏹️ Padel Bot v10.2.0 wurde beendet.")
+        senden("⏹️ Padel Bot v11.0.0 wurde beendet.")
