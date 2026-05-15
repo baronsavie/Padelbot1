@@ -171,36 +171,85 @@ log = logging.getLogger(__name__)
 def _lade_accounts() -> dict:
     accounts = {}
 
+    # Account 1 (Pflicht)
     email1 = _optional("account_1_email")
     pw1    = _optional("account_1_passwort")
+
     if not email1 or not pw1:
         raise SystemExit("❌ account_1_email / account_1_passwort fehlen in options.json!")
+
     label1 = _optional("account_1_label") or "ACC1"
     accounts[label1] = {"email": email1, "passwort": pw1}
 
+    # Account 2
     email2 = _optional("account_2_email")
     pw2    = _optional("account_2_passwort")
+
     if email2 and pw2:
         label2 = _optional("account_2_label") or "ACC2"
-        if label2 == label1:
-            label2 = label2 + "_2"
+
+        if label2 in accounts:
+            label2 += "_2"
+
         accounts[label2] = {"email": email2, "passwort": pw2}
 
+    # Account 3
     email3 = _optional("account_3_email")
     pw3    = _optional("account_3_passwort")
+
     if email3 and pw3:
         label3 = _optional("account_3_label") or "ACC3"
-        if label3 in (label1,) or (len(accounts) > 1 and label3 in accounts):
-            label3 = label3 + "_3"
+
+        if label3 in accounts:
+            label3 += "_3"
+
         accounts[label3] = {"email": email3, "passwort": pw3}
 
+    # Account 4
+    email4 = _optional("account_4_email")
+    pw4    = _optional("account_4_passwort")
+
+    if email4 and pw4:
+        label4 = _optional("account_4_label") or "ACC4"
+
+        if label4 in accounts:
+            label4 += "_4"
+
+        accounts[label4] = {"email": email4, "passwort": pw4}
+
+    # Account 5
+    email5 = _optional("account_5_email")
+    pw5    = _optional("account_5_passwort")
+
+    if email5 and pw5:
+        label5 = _optional("account_5_label") or "ACC5"
+
+        if label5 in accounts:
+            label5 += "_5"
+
+        accounts[label5] = {"email": email5, "passwort": pw5}
+
+    # Account 6
+    email6 = _optional("account_6_email")
+    pw6    = _optional("account_6_passwort")
+
+    if email6 and pw6:
+        label6 = _optional("account_6_label") or "ACC6"
+
+        if label6 in accounts:
+            label6 += "_6"
+
+        accounts[label6] = {"email": email6, "passwort": pw6}
+
     labels = list(accounts.keys())
+
     if len(labels) == 1:
         log.info(f"   Account geladen: {labels[0]} (Einzelmodus)")
     else:
         log.info(f"   Accounts geladen: {', '.join(labels)}")
 
     return accounts
+
 
 ACCOUNTS = _lade_accounts()
 
