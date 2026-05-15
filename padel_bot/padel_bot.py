@@ -146,7 +146,7 @@ R17) PARALLELE THREADS NUTZEN GETEILTE SESSION
      Accounts. OK für 2 Threads à 2 Requests, aber NICHT auf 5+ Threads
      skalieren ohne Session-Klon oder Lock – Connection-Pool blockiert.
 
-R18) MULTI-SHOT NACH FREISCHALTUNG (v10.3.3)
+R18) MULTI-SHOT NACH FREISCHALTUNG (v10.3.4)
      Bei verfehltem ersten Burst: bis zu MULTI_SHOT_COUNT weitere Bursts
      mit jeweils frischen Executions. Bursts mit MULTI_SHOT_GAP_MS
      Pause zwischen sich (Connection-Pool entlasten).
@@ -156,7 +156,7 @@ R18) MULTI-SHOT NACH FREISCHALTUNG (v10.3.3)
  SMART-SNIPER-REGELN
 ═══════════════════════════════════════════════════════════════════════════
 
-R20) SNIPER LAUER-FENSTER = LETZTE 30 MIN VOR FREMDER ENDZEIT (v10.3.3)
+R20) SNIPER LAUER-FENSTER = LETZTE 30 MIN VOR FREMDER ENDZEIT (v10.3.4)
      Beobachtung: Menschen die schieben (Storno + Rebook), tun das
      fast immer in den letzten 30 Min ihrer Buchung. Davor lauern ist
      Verschwendung.
@@ -211,7 +211,7 @@ R19) IMMER jetzt_lokal() VERWENDEN
   ❌ Phase 1 Sniper auf falschem Slot (muss = fromTime fremde, nicht fromTime+dauer) (R21)
 
 ═══════════════════════════════════════════════════════════════════════════
- Padel Bot v10.3.3
+ Padel Bot v10.3.4
 ═══════════════════════════════════════════════════════════════════════════
 
 ÄNDERUNGEN gegenüber v10.2.0:
@@ -374,10 +374,10 @@ ANLAGE_SCHLUSS      = "22:00"
 SCHIEBE_MINUTEN_VOR_MIN = 5
 SCHIEBE_MINUTEN_VOR_MAX = 20
 LOGIN_CHECK_COOLDOWN    = 30
-AGGRESSIVE_TIMEOUT      = 60    # v10.3.3: 60s statt 300s (Slot ist eh in Sek. weg)
+AGGRESSIVE_TIMEOUT      = 60    # v10.3.4: 60s statt 300s (Slot ist eh in Sek. weg)
 SNIPER_TIMEOUT          = 1200  # 20 min – Sniper darf lauern auf fremde Stornos
 
-# v10.3.3 NEU – Smart-Sniper-Konfiguration (siehe R20)
+# v10.3.4 NEU – Smart-Sniper-Konfiguration (siehe R20)
 SNIPER_PRE_END_MINUTES = 30     # Lauer-Fenster = letzte 30 Min vor fremder Endzeit
 SNIPER_LOGIN_BUFFER    = 5      # Login-Refresh X Min vor Lauer-Start
 AGGRESSIVE_INTERVAL     = 0.05  # v10.3: schnellere Retry-Frequenz (war 0.1)
@@ -387,7 +387,7 @@ FRUEH_EXKLUSIV_VERSUCHE = 8
 BLITZ_PREWARM_SECONDS = 10      # Wie viele Sek. vor Zielzeit r1 gefeuert wird
 BLITZ_FIRE_OFFSET_MS  = 0       # ms vor/nach Zielzeit zum Feuern (0 = exakt)
 
-# v10.3.3 NEU – Multi-Shot-Konfiguration (siehe R18)
+# v10.3.4 NEU – Multi-Shot-Konfiguration (siehe R18)
 MULTI_SHOT_COUNT  = 5           # Anzahl Bursts (1=alt-Verhalten, 5=Standard)
 MULTI_SHOT_GAP_MS = 50          # Pause zwischen Bursts in ms (Connection-Pool)
 
@@ -1418,126 +1418,184 @@ def sync_buchung_vom_server(k: str, expected_slot: dict = None,
     """
     Holt die aktuelle Buchung vom Server. Setzt aktive_buchung.
 
-    v10.3 NEU: Wenn expected_slot gegeben, wird NUR eine Buchung
-    akzeptiert die exakt diesem Slot entspricht (court+fromTime+toTime+datum).
-    Verhindert dass alte/falsche Buchungen als die gerade gemachte erkannt werden.
+    v10.3.4: Wieder v11.0-Logik mit 401-Retry und Paginierung.
+    Optional: expected_slot filtert auf exakten Match (nur für Blitz).
 
-    Returns: True wenn eine matching Buchung gefunden (und aktive_buchung gesetzt).
+    Returns: True wenn Buchung gefunden, False sonst.
     """
-    http = az_get(k, "http")
-    try:
-        r = http.get(f"{BASE_URL}/user/my-bookings/page",
-                     params={"page": "0", "size": "20",
-                             "sort": ["serviceDate,desc", "id,desc"]},
-                     headers={"accept": "text/html,*/*",
-                              "x-requested-with": "XMLHttpRequest"},
-                     timeout=10)
-        if r.status_code != 200:
-            return False
-        soup   = BeautifulSoup(r.text, "html.parser")
-        karten = soup.find_all("div", class_=lambda c: c and
-                               "col-12" in c and "col-sm-6" in c)
-        if not karten:
-            karten = [soup]
-
-        jetzt = jetzt_lokal()
-        gefundene = []
-        for karte in karten:
-            if karte.find(class_=lambda c: c and
-                          ("badge-danger" in c or "cancelled" in c or
-                           "storniert" in c)):
-                continue
-            text = karte.get_text(" ", strip=True)
-            dm = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
-            if not dm:
-                continue
-            datum_de  = dm.group(1)
-            try:
-                datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
-            except Exception:
-                continue
-            zm = re.search(
-                r"(?:von\s+)?(\d{1,2}:\d{2})\s*(?:Uhr\s+)?(?:bis|–|-)\s*(\d{1,2}:\d{2})",
-                text, re.I)
-            if not zm:
-                continue
-            from_str = zm.group(1).zfill(5)
-            to_str   = zm.group(2).zfill(5)
-            cm = re.search(r"[Cc]ourt\s*(\d+)", text)
-            if not cm:
-                continue
-            court = int(cm.group(1))
-
-            # Nur zukünftige Buchungen
-            try:
-                slot_end = datetime.combine(
-                    datum_obj.date(),
-                    datetime.strptime(to_str, "%H:%M").time())
-                if slot_end < jetzt:
-                    continue
-            except Exception:
-                pass
-
-            # v10.3: Filter auf expected_slot
-            if expected_slot:
-                if (datum_de != expected_slot.get("datum_de") or
-                        from_str  != expected_slot.get("fromTime") or
-                        to_str    != expected_slot.get("toTime")  or
-                        court     != int(expected_slot.get("court", -1))):
-                    continue
-
-            booking_id = None
-            for pa in ["data-target", "href", "data-url", "action"]:
-                for tag in karte.find_all(attrs={pa: re.compile(r"/bookings/\d+")}):
-                    m_bid = re.search(r"/bookings/(\d+)", tag.get(pa, ""))
-                    if m_bid:
-                        booking_id = int(m_bid.group(1))
-                        break
-                if booking_id:
-                    break
-
-            try:
-                dauer = int((datetime.strptime(to_str, "%H:%M") -
-                             datetime.strptime(from_str, "%H:%M")).total_seconds() // 60)
-            except Exception:
-                dauer = 60
-
-            gefundene.append({
-                "court": court, "fromTime": from_str, "toTime": to_str,
-                "datum_de": datum_de,
-                "datum_api": datum_obj.strftime("%m/%d/%Y"),
-                "dauer": dauer, "booking_id": booking_id,
-                "key": f"{datum_obj.strftime('%m/%d/%Y')}_{court}_{from_str}_{dauer}",
-                "_slot_start": datetime.combine(
-                    datum_obj.date(),
-                    datetime.strptime(from_str, "%H:%M").time()),
-            })
-
-        if not gefundene:
-            if expected_slot:
-                if debug_telegram:
-                    senden(f"⚠️ [{k}] Sync: keine matching Buchung gefunden "
-                           f"für {expected_slot.get('datum_de')} "
-                           f"{expected_slot.get('fromTime')}–{expected_slot.get('toTime')} "
-                           f"C{expected_slot.get('court')}")
-                return False
-            # Kein expected_slot und nichts gefunden → reset aktive_buchung
-            az_set(k, "aktive_buchung", None)
+    # Wenn Schiebe-Thread läuft und am Leben ist: skip (außer expected_slot)
+    if az_get(k, "schiebe_aktiv") and not expected_slot:
+        thread = acc[k].get("schiebe_thread")
+        if thread and not thread.is_alive():
+            log.warning(f"[{k}] Sync: Schiebe-Thread tot → schiebe_aktiv=False")
+            az_set(k, "schiebe_aktiv", False)
+        else:
             return False
 
-        # Nächste (zeitlich frühste) Buchung wählen
-        gefundene.sort(key=lambda b: b["_slot_start"])
-        winner = gefundene[0]
-        winner.pop("_slot_start", None)
-        az_set(k, "aktive_buchung", winner)
-        if debug_telegram:
-            senden(f"🔄 [{k}] Sync: Buchung {winner['datum_de']} "
-                   f"{winner['fromTime']}–{winner['toTime']} C{winner['court']} "
-                   f"(ID={winner['booking_id']})")
-        return True
-    except Exception as e:
-        log.warning(f"[{k}] Sync: {e}")
+    if az_get(k, "sniper_aktiv") and not expected_slot:
         return False
+
+    http_sess = acc[k]["http"]
+    csrf_t    = az_get(k, "csrf_token")
+    jetzt     = jetzt_lokal()
+    gefunden  = None
+
+    h = {"accept": "*/*", "x-ajax-call": "true", "x-csrf-token": csrf_t,
+         "x-requested-with": "XMLHttpRequest", "referer": f"{BASE_URL}/"}
+
+    sync_erfolgreich = False
+    total_pages      = 1
+
+    # 401-Retry: einmal neu einloggen wenn Session abgelaufen
+    for login_versuch in range(2):
+        try:
+            r_pages = http_sess.get(
+                f"{BASE_URL}/user/my-bookings/total-pages",
+                params={"size": "50", "sort": ["serviceDate,desc", "id,desc"]},
+                headers={**h, "accept": "application/json, text/javascript, */*; q=0.01"},
+                timeout=10)
+            if r_pages.status_code == 401:
+                log.warning(f"[{k}] Sync: 401 – logge neu ein...")
+                if einloggen(k):
+                    http_sess = acc[k]["http"]
+                    csrf_t    = az_get(k, "csrf_token")
+                    h["x-csrf-token"] = csrf_t
+                    continue
+                else:
+                    return False
+            try:
+                raw = r_pages.json()
+                if isinstance(raw, (int, float)):
+                    total_pages = int(raw)
+                elif isinstance(raw, str):
+                    total_pages = int(raw)
+                elif isinstance(raw, dict):
+                    for key in ("totalPages", "total_pages", "pages", "total"):
+                        if key in raw:
+                            val = raw[key]
+                            total_pages = int(val) if isinstance(val, (int, float, str)) else 1
+                            break
+            except Exception:
+                total_pages = 1
+            total_pages = max(1, min(total_pages, 5))
+            sync_erfolgreich = True
+            break
+        except Exception as e:
+            log.error(f"[{k}] Sync total-pages: {e}")
+            return False
+
+    if not sync_erfolgreich:
+        return False
+
+    try:
+        for page in range(total_pages):
+            if gefunden:
+                break
+            r_page = http_sess.get(
+                f"{BASE_URL}/user/my-bookings/page",
+                params={"page": str(page), "size": "50",
+                        "sort": ["serviceDate,desc", "id,desc"]},
+                headers=h, timeout=10)
+            if r_page.status_code != 200:
+                break
+
+            soup   = BeautifulSoup(r_page.text, "html.parser")
+            karten = soup.find_all("div", class_=lambda c: c and
+                                   "col-12" in c and "col-sm-6" in c)
+            if not karten:
+                karten = list({
+                    tag.find_parent("div") for tag in
+                    soup.find_all(attrs={"href": re.compile(r"/bookings/\d+")}) +
+                    soup.find_all(attrs={"data-target": re.compile(r"/bookings/\d+")})
+                    if tag.find_parent("div")
+                })
+            if not karten:
+                karten = [soup]
+
+            for karte in karten:
+                if karte.find(class_=lambda c: c and
+                              ("badge-danger" in c or "cancelled" in c or "storniert" in c)):
+                    continue
+                text        = karte.get_text(" ", strip=True)
+                datum_match = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
+                if not datum_match:
+                    continue
+                datum_de  = datum_match.group(1)
+                try:
+                    datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
+                except Exception:
+                    continue
+                if datum_obj.date() < jetzt.date():
+                    continue
+                zeit_match = re.search(
+                    r"(?:von\s+)?(\d{1,2}:\d{2})\s*(?:Uhr\s+)?(?:bis|–|-)\s*(\d{1,2}:\d{2})",
+                    text, re.I)
+                if not zeit_match:
+                    continue
+                from_str = zeit_match.group(1).zfill(5)
+                to_str   = zeit_match.group(2).zfill(5)
+                slot_dt  = datetime.combine(datum_obj.date(),
+                                            datetime.strptime(from_str, "%H:%M").time())
+                if slot_dt < jetzt:
+                    continue
+                court_match = re.search(r"[Cc]ourt\s*(\d+)", text)
+                court = int(court_match.group(1)) if court_match else 1
+
+                # Optional: expected_slot Filter (nur wenn ausdrücklich übergeben)
+                if expected_slot:
+                    if (datum_de != expected_slot.get("datum_de") or
+                            from_str  != expected_slot.get("fromTime") or
+                            to_str    != expected_slot.get("toTime")  or
+                            court     != int(expected_slot.get("court", -1))):
+                        continue
+
+                bid = None
+                for pa in ["data-target", "href", "data-url", "action"]:
+                    for tag in karte.find_all(attrs={pa: re.compile(r"/bookings/\d+")}):
+                        m2 = re.search(r"/bookings/(\d+)", tag.get(pa, ""))
+                        if m2:
+                            bid = int(m2.group(1))
+                            break
+                    if bid:
+                        break
+                datum_api_s = datum_obj.strftime("%m/%d/%Y")
+                gefunden = {
+                    "court":      court,
+                    "fromTime":   from_str,
+                    "toTime":     to_str,
+                    "datum_de":   datum_de,
+                    "datum_api":  datum_api_s,
+                    "dauer":      int((datetime.strptime(to_str, "%H:%M") -
+                                      datetime.strptime(from_str, "%H:%M")).seconds / 60),
+                    "booking_id": bid,
+                    "key":        f"{datum_api_s}_{court}_{from_str}",
+                }
+                log.info(f"[{k}] Sync OK: {datum_de} {from_str}–{to_str} Court {court} ID={bid}")
+                break
+    except Exception as e:
+        log.error(f"[{k}] Sync Fehler: {e}")
+
+    aktuell = az_get(k, "aktive_buchung")
+    if gefunden:
+        az_set(k, "aktive_buchung", gefunden)
+        if debug_telegram:
+            senden(f"🔄 [{k}] Sync: {gefunden['datum_de']} "
+                   f"{gefunden['fromTime']}–{gefunden['toTime']} C{gefunden['court']}")
+        return True
+    elif sync_erfolgreich:
+        # Nur leeren wenn Sync wirklich erfolgreich war (kein 401 etc.)
+        # UND wir nicht in Schiebe sind (sonst überschreiben wir den Schiebe-State)
+        if aktuell and not az_get(k, "schiebe_aktiv"):
+            log.info(f"[{k}] Keine aktive Buchung auf dem Server.")
+        if not az_get(k, "schiebe_aktiv"):
+            az_set(k, "aktive_buchung", None)
+        if expected_slot and debug_telegram:
+            senden(f"⚠️ [{k}] Sync: keine matching Buchung gefunden "
+                   f"für {expected_slot.get('datum_de')} "
+                   f"{expected_slot.get('fromTime')}–{expected_slot.get('toTime')}")
+        return False
+
+    return False
 
 
 
@@ -1681,7 +1739,7 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str,
     senden(f"⚡ [{k}] BLITZ-Buchung: {datum_de} {from_t}–{to_t}\n"
            f"   Pre-warm @ {prewarm_dt.strftime('%H:%M:%S')}\n"
            f"   Feuer @ {buchbar_dt.strftime('%H:%M:%S')}\n"
-           f"   v10.3.3: Pre-warm + Parallel + Multi-Shot")
+           f"   v10.3.4: Pre-warm + Parallel + Multi-Shot")
 
     while jetzt_lokal() < prewarm_dt:
         if not az_get(k, "schiebe_aktiv") and not az_get(k, "sniper_aktiv"):
@@ -1722,7 +1780,7 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str,
         else:
             break
 
-    # ─────────────── Phase 4: MULTI-SHOT FEUER (v10.3.3, R18) ───────────────
+    # ─────────────── Phase 4: MULTI-SHOT FEUER (v10.3.4, R18) ───────────────
     log.info(f"🔥 [{k}] BLITZ MULTI-SHOT START bei "
              f"{jetzt_lokal().strftime('%H:%M:%S.%f')[:-3]} "
              f"({MULTI_SHOT_COUNT} Bursts)")
@@ -1861,7 +1919,7 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
     """
     Phase 3: Schrittweise schieben bis Zielzeit.
 
-    Logik aus v11.0 übernommen (v10.3.3):
+    Logik aus v11.0 übernommen (v10.3.4):
       - schiebe_moment basiert auf ende_dt - random_offset (5-20 Min)
         → KRITISCH: combine mit jetzt.date(), nicht datum_obj.date()! (R7)
       - Detaillierte Telegram-Updates vor jeder Wartephase und Aktion
@@ -2069,7 +2127,7 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
 
 
 # ══════════════════════════════════════════════
-# SCHIEBE-INTERNAL – v10.3.3 (Blitz-Start beibehalten)
+# SCHIEBE-INTERNAL – v10.3.4 (Blitz-Start beibehalten)
 # ══════════════════════════════════════════════
 
 def _schiebe_intern(k: str):
@@ -2361,7 +2419,7 @@ def _schiebe_intern(k: str):
 
 def _sniper_intern(k: str):
     """
-    Sniper-Modus v10.3.3: SMART-LAUER.
+    Sniper-Modus v10.3.4: SMART-LAUER.
 
     Wartet bis zum letzten 30-Min-Fenster vor der fremden Endzeit
     und hämmert dann gezielt auf den freiwerdenden Slot. Falls
@@ -2459,7 +2517,7 @@ def _sniper_intern(k: str):
     }
 
     # ─── User informieren ───
-    senden(f"🎯 [{k}] SMART-SNIPER aktiv (v10.3.3)\n"
+    senden(f"🎯 [{k}] SMART-SNIPER aktiv (v10.3.4)\n"
            f"   📅 {_datum_mit_tag(datum_de)} Court {court}\n"
            f"   🎯 Fremde Endzeit: {fremder_bis}\n"
            f"   💤 Schlaf bis {login_dt.strftime('%H:%M')} (Login)\n"
@@ -2991,7 +3049,7 @@ def telegram_loop():
 
 if __name__ == "__main__":
     log.info("═" * 60)
-    log.info("🎾 Padel Bot v10.3.3 startet…")
+    log.info("🎾 Padel Bot v10.3.4 startet…")
     log.info("   ⚡ BLITZ-Modus: Pre-warm + Parallel-Courts + Multi-Shot")
     log.info("   🎯 SMART-SNIPER: Lauer letzte 30 Min vor fremder Endzeit")
     log.info("   🔍 Person-ID-Verifikation aktiv")
@@ -3010,14 +3068,14 @@ if __name__ == "__main__":
             log.exception(f"[{k}] Init: {e}")
 
     accs_str = ", ".join(ACCOUNTS.keys())
-    senden(f"🎾 <b>Padel Bot v10.3.3 online</b>\n\n"
+    senden(f"🎾 <b>Padel Bot v10.3.4 online</b>\n\n"
            f"⚡ BLITZ-Modus aktiv:\n"
            f"   • Pre-warm r1 bei T-10s\n"
            f"   • r2+r3 parallel auf Court 1 & 2\n"
            f"   • Multi-Shot ({MULTI_SHOT_COUNT} Bursts) bei Verfehlen\n"
            f"   • Person-ID-Check (kein fremdes Schieben)\n"
            f"   • Sync mit expected_slot\n\n"
-           f"🎯 SMART-SNIPER (NEU v10.3.3):\n"
+           f"🎯 SMART-SNIPER (NEU v10.3.4):\n"
            f"   • Lauer nur in letzten {SNIPER_PRE_END_MINUTES} Min "
                   f"vor fremder Endzeit\n"
            f"   • Phase 2: Blitz auf Folge-Slot wenn kein Storno\n\n"
