@@ -1,289 +1,36 @@
 #!/usr/bin/env python3
-"""
-╔══════════════════════════════════════════════════════════════════════════╗
-║  REGELN & INVARIANTEN – BITTE BEI ÄNDERUNGEN STRIKT EINHALTEN!           ║
-║  (Vor jedem Refactor lesen. "Mache keine Fehler!")                       ║
-╚══════════════════════════════════════════════════════════════════════════╝
+"""Padel Bot v10.0.0
 
-═══════════════════════════════════════════════════════════════════════════
- SERVER-REGELN (vom BSBB-Server erzwungen – können wir nicht umgehen)
-═══════════════════════════════════════════════════════════════════════════
+ÄNDERUNGEN gegenüber v9.0.0:
 
-R1) EINE BUCHUNG PRO ACCOUNT
-    Pro eingeloggtem Account ist immer nur EINE aktive (zukünftige) Buchung
-    erlaubt. Versuche eine zweite zu erstellen → Server-Reject.
+FIX 1: Buchungsbestätigung nur wenn wirklich gebucht.
+        buche_slot() hat Exception-Fallback `verifiziert = True` entfernt.
+        Bei Verifikations-Fehler: zweiter Versuch mit 1.5s Pause.
+        Falls immer noch nicht verifizierbar → False zurückgeben.
+        Kein Falsch-Positiv mehr "storniert und neugebucht" obwohl nur storniert.
 
-    Konsequenz für den Code:
-    • _aggressiv_buchen_ab() macht IMMER einen Pre-Check via
-      sync_buchung_vom_server(expected_slot=...) bevor er feuert.
-    • Parallele Court-Threads: bei Doppel-Treffer (Server-Race, theoretisch
-      sollte das nicht möglich sein, aber Versicherung) MUSS automatisch
-      der nicht-bevorzugte Court storniert werden.
-    • Fallback-Loop prüft vor jedem Retry per sync, ob wir den Slot
-      bereits haben → sofortiger Abbruch.
-    • Schiebe-Phase3 muss zwingend storno-vor-rebook fahren, niemals
-      rebook-vor-storno (würde am Server scheitern).
+FIX 2: Schiebe-Taktik robuster und schneller.
+        - Phase 3 in eigene Funktion _schiebe_phase3() ausgelagert.
+        - Storno-Retry prüft jetzt aktiv() → stoppt sofort bei "Stopp"-Button.
+        - Rebook nach Storno: 30 Versuche, 0.1s für erste 15, dann 0.5s.
+          Kein exponentieller Backoff mehr der Sekunden kostet.
+        - Nach erfolgreichem Rebook: aktive_buchung via az_get() geprüft,
+          bei None nochmal Server-Sync vor der Bestätigungsnachricht.
 
-R2) 7-TAGE-ROLLING-FENSTER (auf die Minute genau)
-    Zum Zeitpunkt T kann man Slots buchen die spätestens bei T + 7 Tage
-    starten. Beispiele:
-      • 14.05. 07:00 Uhr → buchbar: 21.05. 07:00 (und alles davor)
-      • 14.05. 13:00 Uhr → buchbar: 21.05. 13:00 (und alles davor)
-      • 14.05. 13:30 Uhr → buchbar: 21.05. 13:30 (und alles davor)
-    Slot 21.05. 14:00 ist am 14.05. erst um 14:00 buchbar.
+NEU 3: Sniper-Modus.
+        Jemand schiebt manuell → Bot zielt automatisch auf den nächsten Slot.
+        Ablauf:
+          1. User gibt an: Datum, Court, Endzeit der fremden Buchung, Dauer, Zielzeit
+          2. Bot berechnet: Ziel = fremdes Ende - 30 Min (z.B. 09:30 → 09:00)
+          3. Bot hämmert sekündlich auf diesen Slot
+          4. Treffer → Bot schickt Bestätigung
+          5. Danach: normaler Schiebe-Loop (_schiebe_phase3) bis Zielzeit
 
-    Konsequenz für den Code:
-    • berechne_freie_slots() filtert per `grenze = jetzt + timedelta(days=7)`
-      → NIEMALS auf `days=7` ohne Stundenkomponente reduzieren!
-    • Früh-Methode zielt deshalb exklusiv auf den 07:00-Slot am D+7-Tag
-      (nur DER ist um 07:00 freigeschaltet, 07:30 erst um 07:30).
-    • Direkte Taktik: feuert genau zur Uhrzeit T → erlaubt Slots ab T.
-    • Spät-Taktik kann nur Slots erwischen die bis "jetzt" freigeschaltet
-      wurden.
-
-R3) ANLAGEN-ÖFFNUNGSZEITEN
-    Court-Slots: 07:00 – 22:00 (ANLAGE_OEFFNUNG / ANLAGE_SCHLUSS).
-    Slot-Granularität: 30 Minuten (Start nur :00 oder :30).
-    Buchungsdauer: 60 oder 90 Minuten.
-    Letzter Buchungsstart = 22:00 – Dauer.
-
-R4) COURTS
-    Es gibt genau zwei Courts: Court 1 und Court 2.
-    Default-Präferenz (wenn user "Egal" wählt): Court 2 zuerst, dann Court 1.
-    Server-Konstanten: MODULE="4", BOOKING_TYPE="4". NICHT ÄNDERN.
-
-═══════════════════════════════════════════════════════════════════════════
- HTTP-FLOW (Spring Webflow Sequenz – Reihenfolge ist Pflicht)
-═══════════════════════════════════════════════════════════════════════════
-
-R5) BUCHUNGS-FLOW IST DREI-PHASIG
-    r1: GET  /court-single-booking-flow  →  liefert execution=eXs1
-    r2: POST execution=eXs1 &_eventId=next   →  Wizard auf s2, claimt Slot
-    r3: POST execution=eXs2 &_eventId=commit →  COMMIT, schreibt Buchung
-
-    Eine execution ist nach Verbrauch tot. r3 fehlgeschlagen → komplett
-    neue Sequenz starten, NICHT dieselbe execution wiederverwenden.
-    Pre-Warm darf NUR r1 vorab feuern (Token cachen), niemals r2!
-
-R6) STORNO-FLOW IST ZWEI-PHASIG
-    POST /bookings/{id}/cancel-flow                       → liefert execution
-    POST /bookings/{id}/cancel-flow ?execution=...&_eventId=confirm
-         + form: confirmKey={CONFIRM_KEY}&confirmValue=true
-    CONFIRM_KEY ist eine Server-Konstante. NICHT ändern.
-
-═══════════════════════════════════════════════════════════════════════════
- SCHIEBE-LOGIK (die Quelle vieler historischer Bugs)
-═══════════════════════════════════════════════════════════════════════════
-
-R7) SCHIEBE-MOMENT = HEUTE, NICHT BUCHUNGSTAG
-    In _schiebe_phase3():
-        schiebe_moment = datetime.combine(jetzt.date(), ...)   ✅ RICHTIG
-        schiebe_moment = datetime.combine(datum_obj.date(), ...) ❌ FALSCH
-    Das Schieben passiert HEUTE (z.B. 19.04), nicht am gebuchten Tag
-    (z.B. 26.04). Diese Zeile NIEMALS "vereinfachen".
-
-R8) SCHIEBE-INTERVALL IST ZUFÄLLIG
-    Zwischen Schiebe-Versuchen 5–20 Min Zufallspause
-    (SCHIEBE_MINUTEN_VOR_MIN / _MAX). NICHT auf festen Wert reduzieren –
-    Pattern-Detection vom Server möglich.
-
-R9) PHASE 3 IST STORNO → REBOOK, NIE UMGEKEHRT
-    Reihenfolge: alten Slot stornieren, sofort danach neuen Slot buchen.
-    Würde die Reihenfolge gedreht, scheitert das Rebook an R1
-    (Account hat schon eine aktive Buchung). Bei fehlgeschlagenem Rebook
-    MUSS der alte Slot zurückgewonnen werden (Recovery-Pfad in Phase3).
-
-═══════════════════════════════════════════════════════════════════════════
- IDENTITÄTS- & SESSION-REGELN
-═══════════════════════════════════════════════════════════════════════════
-
-R10) PERSON-ID-VERIFIKATION – MODUS-ABHÄNGIG (v10.3.6)
-     /padel?currentDate=... liefert ALLE Reservierungen auf den Courts,
-     auch fremde – jeweils mit personId-Feld. Verifikation verhindert dass
-     fremde Buchungen als eigene gemeldet werden.
-
-     STRIKT (verify_person_id=True): wirft Treffer weg wenn personId leer
-     oder fremd. Genutzt für:
-       • Sniper Phase 1 (Lauern auf fremde Storno) – Zeit ist da, kein Risiko
-       • Aggressiv-Fallback-Loop (seriell, ~50ms-Intervalle) – Zeit ist da
-
-     SPEED (verify_person_id=False): keine Verifikation in der Buchung selbst.
-     Genutzt für:
-       • Direkte Taktik Multi-Shot Bursts (5× parallel, ms-Bereich)
-       • Sniper Phase 2 (Blitz bei Endzeit, übergibt an _aggressiv_buchen_ab)
-
-     SICHERHEITSNETZ NACH BURSTS (v10.3.6):
-     Nach Multi-Shot-Bursts läuft IMMER ein sync_buchung_vom_server(expected_slot=...)
-     um false-positives zu erkennen. Treffer ohne my-bookings-Eintrag wird verworfen.
-
-R10a) NIEMALS "vertraue r3" bei verify_person_id=True (v10.3.6 Bugfix)
-      Wenn personId-Feld leer ist ODER Verifikation in Exception läuft:
-      MUSS (False, None) zurückgeben. Vorher: "vertraue r3" → False-Positive
-      bei Max der nicht storniert hat aber Server HTTP 200 zurückgibt.
-
-R11) /user/my-bookings IST DIE GROUND TRUTH FÜR EIGENE BUCHUNGEN
-     Nur dieser Endpoint zeigt zuverlässig die eigenen Buchungen.
-     /padel zeigt alle (auch fremde). Bei Unsicherheit: my-bookings.
-
-R12) SYNC MIT expected_slot FILTERN
-     sync_buchung_vom_server() ohne Filter holt die zeitlich nächste
-     Buchung – das kann eine ALTE zukünftige Buchung sein.
-     Nach einer frischen Buchung IMMER mit expected_slot syncen.
-
-R13) PRO ACCOUNT EIGENE Session, CSRF, person_id
-     Jeder Account hat eigenes requests.Session + Lock. Niemals Sessions
-     vermischen oder Cookies zwischen Accounts kopieren – führt zu R10-
-     Verstoß und falscher Buchungs-Zuordnung.
-
-R14) LOGIN-COOLDOWN 30s
-     ist_eingeloggt() checkt höchstens alle 30s (LOGIN_CHECK_COOLDOWN).
-     Vor zeitkritischen Aktionen (Direkt/Früh): bei T-90s frischer Login
-     via _session_refresh_vor_aktion(). Diese 90s-Marge NICHT verkürzen –
-     Login kann mal 5–10s dauern.
-
-═══════════════════════════════════════════════════════════════════════════
- TIMING-REGELN BLITZ-PFAD
-═══════════════════════════════════════════════════════════════════════════
-
-R15) PRE-WARM BEI T-10s, FEUER BEI T-0
-     BLITZ_PREWARM_SECONDS = 10 ist die getestete Marge.
-     Kleiner: Pre-Warm-Request läuft evtl. nicht rechtzeitig fertig.
-     Größer: execution-Token könnte stale werden (Spring Webflow killt
-     idle executions; ~30 min sind ok, aber bleibt konservativ).
-
-R16) FEUER NICHT VOR buchbar_dt
-     Wer r2 vor Freischaltung feuert → Server-Reject ("nicht möglich").
-     BLITZ_FIRE_OFFSET_MS = 0 (auf die Sekunde, eher minimal später als
-     früher). Niemals negativ setzen.
-
-R17) PARALLELE THREADS NUTZEN GETEILTE SESSION
-     Court-1- und Court-2-Thread teilen sich requests.Session des
-     Accounts. OK für 2 Threads à 2 Requests, aber NICHT auf 5+ Threads
-     skalieren ohne Session-Klon oder Lock – Connection-Pool blockiert.
-
-R18) MULTI-SHOT NACH FREISCHALTUNG (v10.3.6)
-     Bei verfehltem ersten Burst: bis zu MULTI_SHOT_COUNT weitere Bursts
-     mit jeweils frischen Executions. Bursts mit MULTI_SHOT_GAP_MS
-     Pause zwischen sich (Connection-Pool entlasten).
-     Niemals VOR buchbar_dt feuern (siehe R16).
-
-═══════════════════════════════════════════════════════════════════════════
- SMART-SNIPER-REGELN
-═══════════════════════════════════════════════════════════════════════════
-
-R20) SNIPER LAUER-FENSTER = LETZTE 30 MIN VOR FREMDER ENDZEIT (v10.3.6)
-     Beobachtung: Menschen die schieben (Storno + Rebook), tun das
-     fast immer in den letzten 30 Min ihrer Buchung. Davor lauern ist
-     Verschwendung.
-
-     Beispiel: Max hat 17:00–18:30 gebucht.
-       • Lauer-Start:  18:00  (= 18:30 - SNIPER_PRE_END_MINUTES)
-       • Lauer-Ende:   18:30  (= fremde Endzeit)
-       • Login-Refresh: 17:55 (= Lauer-Start - SNIPER_LOGIN_BUFFER)
-
-     User startet Sniper z.B. um 14:00 → Bot schläft bis 17:55, ohne
-     den Server zu belasten. Spart Resourcen und vermeidet
-     Pattern-Detection.
-
-R21) SNIPER ZIEL-SLOTS (beachte 7-Tage-Regel R2!)
-     Während Lauer-Fenster 18:00–18:30 (Beispiel):
-       Phase 1 (18:00 bis 18:30): Hämmere Slot der bei fremder
-         Startzeit beginnt (18:00–19:30) auf user-gewähltem Court.
-         Bei "Egal": nur den Court wo fremde Buchung läuft.
-         → Buchbar weil 7 Tage exakt erreicht
-         → Belegt durch Max → nur Treffer wenn Max storniert
-       Phase 2 (ab 18:30): Wechsel zu Multi-Shot Blitz auf
-         18:30–20:00 (= direkt anschließender Slot, jetzt
-         frisch freigeschaltet durch 7-Tage-Regel).
-         Bei "Egal": beide Courts parallel (wie Direkte Taktik).
-
-R22) SNIPER-TIMEOUT IST DEADLINE = FREMDE ENDZEIT + BLITZ-BUDGET
-     Sniper macht keinen Sinn nach Maxes Endzeit (= Slot-Start unserer
-     Buchung). Bot bricht spätestens 60s nach fremder Endzeit ab.
-     SNIPER_TIMEOUT (1200s = 20 min) bleibt als Hard-Cap erhalten falls
-     User außerhalb Lauer-Fenster manuell startet.
-
-R23) SNIPER PHASE 2 BLITZ – NUR EIN COURT (v10.3.6)
-     Wenn Sniper auf Max' Court (z.B. Court 2) lauert und Max nicht
-     storniert, blitzt Phase 2 NUR auf Max' Court – NICHT parallel auf
-     Court 1. Begründung: Court 1 könnte noch fremde Buchung haben die
-     den parallelen Thread ausbremst (Server muss Konflikt prüfen →
-     blockiert Connection-Pool).
-
-     Phase 2 ruft _aggressiv_buchen_ab(..., nur_ein_court=True) auf.
-
-     Direkte Taktik (im Schiebe-Menü) ruft OHNE nur_ein_court auf
-     → bleibt parallel auf beide Courts (kein fremder Konflikt).
-
-═══════════════════════════════════════════════════════════════════════════
- ZEITZONE
-═══════════════════════════════════════════════════════════════════════════
-
-R19) IMMER jetzt_lokal() VERWENDEN
-     Nie datetime.now() ohne Zeitzone. jetzt_lokal() liefert
-     naive datetime in Europe/Berlin. Server rechnet ebenfalls in
-     lokaler Zeit. Sommerzeit-Umstellung wird automatisch berücksichtigt.
-
-  ❌ schiebe_moment-Zeile in _schiebe_phase3 (R7)
-  ❌ Reihenfolge r1→r2→r3 oder execution-Wiederverwendung (R5)
-  ❌ CONFIRM_KEY-Wert (R6)
-  ❌ MODULE / BOOKING_TYPE (R4)
-  ❌ Person-ID-Check abschalten (R10)
-  ❌ expected_slot-Filter in Sync für frische Buchungen weglassen (R12)
-  ❌ Parallele Court-Threads ohne Doppel-Treffer-Dedup (R1)
-  ❌ Storno-vor-Rebook-Reihenfolge in Phase 3 umdrehen (R9)
-  ❌ 90s-Login-Marge oder 10s-Pre-Warm-Marge stark verkürzen (R14/R15)
-  ❌ Feuern vor buchbar_dt (R16)
-  ❌ Sniper lauert außerhalb des 30-Min-Fensters vor fremder Endzeit (R20)
-  ❌ Phase 1 Sniper auf falschem Slot (muss = fromTime fremde, nicht fromTime+dauer) (R21)
-
-═══════════════════════════════════════════════════════════════════════════
- Padel Bot v10.3.6
-═══════════════════════════════════════════════════════════════════════════
-
-ÄNDERUNGEN gegenüber v10.2.0:
-
-NEU: prewarm_execution()
-     Feuert r1 EINMALIG vorab und gibt das execution-Token + frisches CSRF zurück.
-     Wird ~10s vor Zielzeit aufgerufen, damit zur Zielzeit nur noch r2+r3
-     gefeuert werden müssen.
-
-NEU: buche_slot_blitz()
-     Ersetzt buche_slot_schnell() vollständig.
-     - Wenn prewarm_exec gegeben: skippt r1 (nur 2 HTTP-Requests im heißen Pfad)
-     - Sonst: voller r1+r2+r3 Flow (Fallback)
-     - Person-ID-Verifikation via /padel: erkennt fremde Buchungen
-     - Setzt aktive_buchung NICHT direkt (Caller entscheidet → thread-safe für Parallel)
-
-GEÄNDERT: _aggressiv_buchen_ab() – PARALLEL-MODUS
-     1. T-10s: Pre-warm r1 für Court 2 UND Court 1 parallel
-     2. T-0:   Feuere r2+r3 auf BEIDEN Courts gleichzeitig in 2 Threads
-     3. Bei 1 Treffer: fertig
-     4. Bei 2 Treffern: behalte bevorzugten Court, storniere automatisch den anderen
-     5. Bei 0 Treffern: serielles Fallback-Hämmern mit buche_slot_blitz
-     Ergebnis: ~200ms statt ~500ms im heißen Pfad – kein Mensch mehr schneller.
-
-GEÄNDERT: _sniper_intern()
-     - Nutzt buche_slot_blitz() mit Person-ID-Verifikation
-     - sync_buchung_vom_server() mit expected_slot-Parameter
-     - Kein falscher Schiebe-Start mehr durch alte Buchungen
-
-GEÄNDERT: sync_buchung_vom_server(expected_slot=...)
-     Wenn expected_slot übergeben: matcht NUR den erwarteten Slot.
-     Verhindert dass alte Buchungen als gerade gemachte erkannt werden.
-
-GEÄNDERT: _schiebe_intern() Direkt-Branch
-     Gibt die Wartelogik komplett an _aggressiv_buchen_ab ab.
-     Kein "spam_start_dt = buchbar_dt - 1s"-Sleep mehr.
-     Pre-warm + parallel-Feuer übernimmt das Timing.
-
-ENTFERNT: buche_slot_schnell()
-     Vollständig ersetzt durch buche_slot_blitz().
-
-UNVERÄNDERT:
-     buche_slot()              → Früh-Methode, Spät-Taktik, klassische Buchung
-     _aggressiv_buchen_07()    → Früh-Methode (07:00 Dauerbeschuss)
-     _schiebe_phase3()         → Schiebe-Loop (Storno + Rebook)
+BEIBEHALTEN (alle Fixes aus v9.x):
+  FIX 4: Login exakt 90s VOR 07:00 (also 06:58:30).
+  FIX 5: Storno-Retry sendet KEINE Telegram-Nachrichten während der Retries.
+  FIX 6: schiebe_moment verwendet jetzt.date() (nicht datum_obj.date()).
+  FIX 7: Neubuchung nach Storno versucht zuerst gleichen Court.
 
 ══════════════════════════════════════════════════════════════════════
 SCHIEBE-LOGIK – BITTE NIEMALS ÄNDERN!
@@ -401,22 +148,9 @@ ANLAGE_SCHLUSS      = "22:00"
 SCHIEBE_MINUTEN_VOR_MIN = 5
 SCHIEBE_MINUTEN_VOR_MAX = 20
 LOGIN_CHECK_COOLDOWN    = 30
-AGGRESSIVE_TIMEOUT      = 60    # v10.3.6: 60s statt 300s (Slot ist eh in Sek. weg)
-SNIPER_TIMEOUT          = 1200  # 20 min – Sniper darf lauern auf fremde Stornos
-
-# v10.3.6 NEU – Smart-Sniper-Konfiguration (siehe R20)
-SNIPER_PRE_END_MINUTES = 30     # Lauer-Fenster = letzte 30 Min vor fremder Endzeit
-SNIPER_LOGIN_BUFFER    = 5      # Login-Refresh X Min vor Lauer-Start
-AGGRESSIVE_INTERVAL     = 0.05  # v10.3: schnellere Retry-Frequenz (war 0.1)
+AGGRESSIVE_TIMEOUT      = 300
+AGGRESSIVE_INTERVAL     = 0.3
 FRUEH_EXKLUSIV_VERSUCHE = 8
-
-# v10.3 NEU – Blitz-Konfiguration
-BLITZ_PREWARM_SECONDS = 10      # Wie viele Sek. vor Zielzeit r1 gefeuert wird
-BLITZ_FIRE_OFFSET_MS  = 0       # ms vor/nach Zielzeit zum Feuern (0 = exakt)
-
-# v10.3.6 NEU – Multi-Shot-Konfiguration (siehe R18)
-MULTI_SHOT_COUNT  = 5           # Anzahl Bursts (1=alt-Verhalten, 5=Standard)
-MULTI_SHOT_GAP_MS = 50          # Pause zwischen Bursts in ms (Connection-Pool)
 
 # ─────────────────────────────────────────────
 # KONSTANTEN
@@ -460,30 +194,6 @@ def _lade_accounts() -> dict:
             label3 = label3 + "_3"
         accounts[label3] = {"email": email3, "passwort": pw3}
 
-    email4 = _optional("account_4_email")
-    pw4    = _optional("account_4_passwort")
-    if email4 and pw4:
-        label4 = _optional("account_4_label") or "ACC4"
-        if label4 in accounts:
-            label4 = label4 + "_4"
-        accounts[label4] = {"email": email4, "passwort": pw4}
-
-    email5 = _optional("account_5_email")
-    pw5    = _optional("account_5_passwort")
-    if email5 and pw5:
-        label5 = _optional("account_5_label") or "ACC5"
-        if label5 in accounts:
-            label5 = label5 + "_5"
-        accounts[label5] = {"email": email5, "passwort": pw5}
-
-    email6 = _optional("account_6_email")
-    pw6    = _optional("account_6_passwort")
-    if email6 and pw6:
-        label6 = _optional("account_6_label") or "ACC6"
-        if label6 in accounts:
-            label6 = label6 + "_6"
-        accounts[label6] = {"email": email6, "passwort": pw6}
-
     labels = list(accounts.keys())
     if len(labels) == 1:
         log.info(f"   Account geladen: {labels[0]} (Einzelmodus)")
@@ -525,11 +235,11 @@ def neuer_account_zustand(kuerzel: str) -> dict:
         "schiebe_buchbar_ab": None,
         "schiebe_court":      None,
         "schiebe_thread":     None,
-        # Sniper
+        # Sniper (NEU)
         "sniper_aktiv":       False,
         "sniper_datum":       None,
         "sniper_court":       None,
-        "sniper_fremder_bis": None,
+        "sniper_fremder_bis": None,   # Endzeit der fremden Buchung (z.B. "09:30")
         "sniper_dauer":       None,
         "sniper_ziel":        None,
         "sniper_thread":      None,
@@ -633,9 +343,8 @@ def account_status_label(k: str) -> str:
 
     if aktiv:
         datum_str = _datum_mit_tag(aktiv.get("datum_de", "?"))
-        court_str = aktiv.get("court", "?")
         return (f"🔴 {k} – {datum_str} "
-                f"{aktiv.get('fromTime','?')}–{aktiv.get('toTime','?')} C{court_str}")
+                f"{aktiv.get('fromTime','?')}–{aktiv.get('toTime','?')}")
     elif schiebe:
         datum_str = _datum_mit_tag(snap["schiebe_datum"] or "?")
         return f"🟡 {k} – Schiebe {datum_str}"
@@ -727,14 +436,13 @@ def zeige_schiebe_modus_auswahl(k: str):
         f"🕐 <b>Spät-Taktik:</b>\n07:00 verpasst → Bot bucht sofort den spätesten "
         f"freien Slot und schiebt weiter zur Wunschzeit.\n\n"
         f"🎯 <b>Direkte Taktik:</b>\nDu weißt ab wann buchbar (z.B. 17:30 heute). "
-        f"Bot wartet bis 17:30, bucht dann und schiebt zur Wunschzeit.\n"
-        f"<i>v10.3: Pre-warm + parallele Courts → ~200ms statt ~500ms im heißen Pfad</i>",
+        f"Bot wartet bis 17:30, bucht dann und schiebt zur Wunschzeit.",
         buttons=[
             [{"text": "🌅 Früh-Methode  (07:00 Dauerbeschuss + Fallback)",
               "callback_data": f"schiebe_modus_frueh_{k}"}],
             [{"text": "🕐 Spät-Taktik  (spätester freier Slot jetzt)",
               "callback_data": f"schiebe_modus_spaet_{k}"}],
-            [{"text": "🎯 Direkte Taktik  ⚡ BLITZ  (bekannte Startzeit)",
+            [{"text": "🎯 Direkte Taktik  (bekannte Startzeit)",
               "callback_data": f"schiebe_modus_direkt_{k}"}],
             [{"text": "↩️ Zurück", "callback_data": f"acc_{k}"}],
         ])
@@ -1002,7 +710,7 @@ def berechne_freie_slots(k: str, datum_de: str, dauer_min: int,
     return freie
 
 # ══════════════════════════════════════════════
-# BUCHUNG (mit Verifikation) – unverändert für Früh/Spät/Klassisch
+# BUCHUNG  –  FIX 1: Kein verifiziert=True Fallback mehr!
 # ══════════════════════════════════════════════
 
 def buche_slot(k: str, slot: dict) -> bool:
@@ -1080,123 +788,42 @@ def buche_slot(k: str, slot: dict) -> bool:
                 booking_id = int(mid.group(1))
                 break
 
+        # ── FIX 1: Verifizierung ohne Exception-Fallback ──────────────────────
+        # Erster Versuch nach 1s
         time.sleep(1.0)
         verifiziert = False
-
-        def _verifiziere_via_my_bookings() -> bool:
-            nonlocal booking_id
-            try:
-                r_pages = http.get(
-                    f"{BASE_URL}/user/my-bookings/total-pages",
-                    params={"size": "20", "sort": ["serviceDate,desc", "id,desc"]},
-                    headers={**h, "accept": "application/json, text/javascript, */*; q=0.01"},
-                    timeout=10)
-                if r_pages.status_code != 200:
-                    return False
-                total_pages = 1
-                try:
-                    raw = r_pages.json()
-                    total_pages = int(raw) if isinstance(raw, (int, float, str)) else 1
-                except Exception:
-                    total_pages = 1
-                total_pages = max(1, min(total_pages, 3))
-
-                datum_obj_v = datetime.strptime(datum_de, "%d.%m.%Y")
-                for page in range(total_pages):
-                    r_page = http.get(
-                        f"{BASE_URL}/user/my-bookings/page",
-                        params={"page": str(page), "size": "20",
-                                "sort": ["serviceDate,desc", "id,desc"]},
-                        headers={**h, "accept": "text/html,*/*"},
-                        timeout=10)
-                    if r_page.status_code != 200:
+        try:
+            server_res = hole_reservierungen(k, datum_api)
+            for res in server_res:
+                if (res["court"] == int(court) and
+                        res["fromTime"] == from_t and res["toTime"] == to_t):
+                    res_bid = res.get("booking") or res.get("bookingOrBlockingId")
+                    if booking_id and res_bid and res_bid == booking_id:
+                        verifiziert = True
                         break
-                    soup  = BeautifulSoup(r_page.text, "html.parser")
-                    karten = soup.find_all("div", class_=lambda c: c and
-                                           "col-12" in c and "col-sm-6" in c)
-                    if not karten:
-                        karten = list({
-                            tag.find_parent("div") for tag in
-                            soup.find_all(attrs={"href": re.compile(r"/bookings/\d+")}) +
-                            soup.find_all(attrs={"data-target": re.compile(r"/bookings/\d+")})
-                            if tag.find_parent("div")
-                        })
-                    if not karten:
-                        karten = [soup]
-                    for karte in karten:
-                        if karte.find(class_=lambda c: c and
-                                      ("badge-danger" in c or "cancelled" in c or
-                                       "storniert" in c)):
-                            continue
-                        text = karte.get_text(" ", strip=True)
-                        dm = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
-                        if not dm or dm.group(1) != datum_de:
-                            continue
-                        zm = re.search(
-                            r"(?:von\s+)?(\d{1,2}:\d{2})\s*(?:Uhr\s+)?(?:bis|–|-)\s*(\d{1,2}:\d{2})",
-                            text, re.I)
-                        if not zm:
-                            continue
-                        f_str = zm.group(1).zfill(5)
-                        t_str = zm.group(2).zfill(5)
-                        if f_str != from_t or t_str != to_t:
-                            continue
-                        cm = re.search(r"[Cc]ourt\s*(\d+)", text)
-                        if not cm or int(cm.group(1)) != int(court):
-                            continue
-                        for pa in ["data-target", "href", "data-url", "action"]:
-                            for tag in karte.find_all(attrs={pa: re.compile(r"/bookings/\d+")}):
-                                m_bid = re.search(r"/bookings/(\d+)", tag.get(pa, ""))
-                                if m_bid:
-                                    booking_id = int(m_bid.group(1))
-                                    break
-                            if booking_id:
-                                break
-                        log.info(f"[{k}] Verifikation via my-bookings OK: "
-                                 f"{datum_de} {from_t}–{to_t} Court {court} ID={booking_id}")
-                        return True
-            except Exception as ve:
-                log.warning(f"[{k}] my-bookings Verifikation Fehler: {ve}")
-            return False
+                    elif not booking_id and res_bid:
+                        booking_id  = res_bid
+                        verifiziert = True
+                        break
+        except Exception as ve1:
+            log.warning(f"[{k}] Verifikations-Versuch 1 fehlgeschlagen: {ve1}")
 
-        def _verifiziere_via_padel() -> bool:
-            nonlocal booking_id
-            try:
-                pid = az_get(k, "person_id")
-                server_res = hole_reservierungen(k, datum_api)
-                for res in server_res:
-                    if (res["court"] == int(court) and
-                            res["fromTime"] == from_t and res["toTime"] == to_t):
-                        res_bid = res.get("booking") or res.get("bookingOrBlockingId")
-                        res_pid = str(res.get("personId", res.get("person_id", "")))
-                        if pid and res_pid and res_pid != str(pid):
-                            log.warning(f"[{k}] /padel: Slot belegt, aber andere Person-ID "
-                                        f"({res_pid} != {pid}) – jemand war schneller!")
-                            return False
-                        if booking_id and res_bid and res_bid == booking_id:
-                            log.info(f"[{k}] Verifikation via /padel OK (booking_id Match)")
-                            return True
-                        elif not booking_id and res_bid:
-                            booking_id = res_bid
-                            log.info(f"[{k}] Verifikation via /padel OK (ID aus Server)")
-                            return True
-                        elif not res_bid:
-                            log.info(f"[{k}] Verifikation via /padel OK (kein bid-Feld)")
-                            return True
-            except Exception as ve:
-                log.warning(f"[{k}] /padel Verifikation Fehler: {ve}")
-            return False
-
-        verifiziert = _verifiziere_via_my_bookings()
-
+        # Zweiter Versuch falls erster fehlgeschlagen (1.5s später)
         if not verifiziert:
             try:
                 time.sleep(1.5)
-                verifiziert = _verifiziere_via_my_bookings()
-                if not verifiziert:
-                    verifiziert = _verifiziere_via_padel()
+                server_res2 = hole_reservierungen(k, datum_api)
+                for res in server_res2:
+                    if (res["court"] == int(court) and
+                            res["fromTime"] == from_t and res["toTime"] == to_t):
+                        res_bid = res.get("booking") or res.get("bookingOrBlockingId")
+                        if res_bid:
+                            booking_id  = res_bid
+                        verifiziert = True
+                        break
             except Exception as ve2:
                 log.warning(f"[{k}] Verifikations-Versuch 2 fehlgeschlagen: {ve2}")
+                # KEIN Fallback auf True mehr! Nur False zurückgeben.
 
         if not verifiziert:
             log.warning(f"[{k}] ⚠️ Buchung NICHT verifiziert – möglicherweise zwischengebucht!")
@@ -1210,265 +837,48 @@ def buche_slot(k: str, slot: dict) -> bool:
         log.error(f"[{k}] Buchungsfehler: {e}")
         return False
 
-
-
-# ══════════════════════════════════════════════
-# NEU v10.3: prewarm_execution
-# ══════════════════════════════════════════════
-
-def prewarm_execution(k: str, slot: dict):
-    """
-    Feuert r1 (GET /court-single-booking-flow) EINMALIG und liefert
-    (execution_id, csrf_token) für die spätere r2+r3-Sequenz zurück.
-
-    Wird ~10s vor Zielzeit aufgerufen, damit zur Zielzeit nur noch
-    r2+r3 gefeuert werden müssen → ~200ms statt ~500ms im heißen Pfad.
-
-    Returns: (execution_id: str|None, csrf_token: str|None)
-    """
-    court     = str(slot["court"])
-    from_t    = slot["fromTime"]
-    to_t      = slot["toTime"]
-    datum_api = slot["datum_api"]
-    http      = az_get(k, "http")
-    csrf_t    = az_get(k, "csrf_token")
-
-    h = {"accept": "*/*", "x-ajax-call": "true", "x-csrf-token": csrf_t,
-         "x-requested-with": "XMLHttpRequest",
-         "referer": f"{BASE_URL}/padel?currentDate={datum_api}"}
-    try:
-        r1 = http.get(f"{BASE_URL}/court-single-booking-flow", headers=h,
-                      params={"module": MODULE, "court": court, "courts": "1,2",
-                              "fromTime": from_t, "toTime": to_t, "date": datum_api},
-                      timeout=10)
-        if r1.status_code != 200:
-            log.warning(f"[{k}] Pre-warm Court {court}: HTTP {r1.status_code}")
-            return (None, None)
-        m = re.search(r"execution=(e\d+s\d+)", r1.text)
-        if not m:
-            log.warning(f"[{k}] Pre-warm Court {court}: kein execution-Token gefunden")
-            return (None, None)
-        execution = m.group(1)
-        fresh_csrf = hole_csrf(r1.text) or csrf_t
-        log.info(f"⚡ [{k}] Pre-warm Court {court} OK: execution={execution}")
-        return (execution, fresh_csrf)
-    except Exception as e:
-        log.warning(f"[{k}] Pre-warm Court {court}: {e}")
-        return (None, None)
-
-
-# ══════════════════════════════════════════════
-# NEU v10.3: buche_slot_blitz
-# ══════════════════════════════════════════════
-
-def buche_slot_blitz(k: str, slot: dict,
-                     prewarm_exec: str = None, prewarm_csrf: str = None,
-                     verify_person_id: bool = True) -> tuple:
-    """
-    Hyper-schnelle Buchung mit optionaler Pre-warm-Optimierung.
-
-    Wenn prewarm_exec gegeben: NUR r2+r3 (heißer Pfad, ~200ms).
-    Sonst: voller r1+r2+r3 Flow (~500ms).
-
-    Optional: Person-ID-Verifikation gegen /padel → erkennt fremde Buchungen.
-
-    WICHTIG: Setzt aktive_buchung NICHT direkt → Caller entscheidet!
-             (Thread-Safety bei parallelen Court-Threads.)
-
-    Returns: (success: bool, info: dict|None)
-        info = {"court": int, "datum_de": str, "fromTime": str,
-                "toTime": str, "datum_api": str, "booking_id": int|None}
-    """
-    court     = str(slot["court"])
-    from_t    = slot["fromTime"]
-    to_t      = slot["toTime"]
-    datum_de  = slot["datum_de"]
-    datum_api = slot["datum_api"]
-    snap      = az_snap(k, "csrf_token", "person_id", "http")
-    csrf_t    = prewarm_csrf or snap["csrf_token"]
-    person_id = snap["person_id"]
-    http      = snap["http"]
-
-    if not person_id:
-        log.error(f"[{k}] Blitz: Person-ID fehlt – Buchung abgebrochen!")
-        return (False, None)
-
-    h  = {"accept": "*/*", "x-ajax-call": "true", "x-csrf-token": csrf_t,
-          "x-requested-with": "XMLHttpRequest",
-          "referer": f"{BASE_URL}/padel?currentDate={datum_api}"}
-    hp = {**h, "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-          "origin": BASE_URL}
-
-    try:
-        # Phase 1: r1 nur wenn KEIN pre-warm vorhanden
-        if prewarm_exec:
-            execution = prewarm_exec
-        else:
-            r1 = http.get(f"{BASE_URL}/court-single-booking-flow", headers=h,
-                          params={"module": MODULE, "court": court, "courts": "1,2",
-                                  "fromTime": from_t, "toTime": to_t,
-                                  "date": datum_api},
-                          timeout=10)
-            m = re.search(r"execution=(e\d+s\d+)", r1.text)
-            execution = m.group(1) if m else "e1s1"
-
-        # Phase 2: r2 (advance to s2 mit Buchungsdetails)
-        r2 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
-                       params={"execution": execution, "_eventId": "next"},
-                       data=(f"purchaseTemplate.repetition.date={datum_de}"
-                             f"&purchaseTemplate.repetition.fromTime={from_t.replace(':', '%3A')}"
-                             f"&purchaseTemplate.repetition.toTime={to_t.replace(':', '%3A')}"
-                             f"&bookingModel.courts%5B0%5D={court}"
-                             f"&purchaseTemplate.court={court}"
-                             f"&purchaseTemplate.person={person_id}"
-                             f"&purchaseTemplate.bookingType={BOOKING_TYPE}"
-                             f"&_csrf={csrf_t}"),
-                       timeout=10)
-        if r2.status_code not in [200, 302]:
-            return (False, None)
-        m2 = re.search(r"execution=(e\d+s\d+)", r2.text)
-        exec2 = m2.group(1) if m2 else execution.replace("s1", "s2")
-
-        # Phase 3: r3 (commit)
-        r3 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
-                       params={"execution": exec2, "_eventId": "commit"},
-                       data=f"purchaseTemplate.comment=&_csrf={csrf_t}",
-                       timeout=10)
-        if r3.status_code not in [200, 302]:
-            return (False, None)
-        if any(w in r3.text.lower() for w in ["fehler", "error", "nicht möglich"]):
-            return (False, None)
-
-        # booking_id extrahieren (best effort)
-        booking_id = None
-        for pat in [r'"bookingId"\s*:\s*(\d+)', r'/bookings/(\d+)', r'booking[=_](\d+)']:
-            mid = re.search(pat, r3.text)
-            if mid:
-                booking_id = int(mid.group(1))
-                break
-
-        info = {"court": int(court), "datum_de": datum_de, "fromTime": from_t,
-                "toTime": to_t, "datum_api": datum_api, "booking_id": booking_id,
-                "dauer": slot.get("dauer"), "key": slot.get("key")}
-
-        # Person-ID Verifikation (erkennt fremde Buchung!)
-        if verify_person_id:
-            try:
-                server_res = hole_reservierungen(k, datum_api)
-                gefunden = False
-                for res in server_res:
-                    if (res["court"] == int(court) and
-                            res["fromTime"] == from_t and res["toTime"] == to_t):
-                        res_pid = str(res.get("personId", res.get("person_id", "")))
-                        if res_pid and str(res_pid) != str(person_id):
-                            log.warning(f"❌ [{k}] Blitz Court {court}: "
-                                        f"FREMDE Person-ID ({res_pid} != {person_id}) – "
-                                        f"Jemand war schneller!")
-                            return (False, None)
-                        if not res_pid:
-                            # v10.3.6 FIX: personId-Feld leer → KEIN Treffer melden!
-                            # Vorher: "vertraue r3" → False-Positive-Bug
-                            log.warning(f"❌ [{k}] Blitz Court {court}: Slot in Reservierungen "
-                                        f"aber personId leer – kein eindeutiger Treffer")
-                            return (False, None)
-                        res_bid = res.get("booking") or res.get("bookingOrBlockingId")
-                        if res_bid and not booking_id:
-                            info["booking_id"] = res_bid
-                        gefunden = True
-                        break
-                if not gefunden:
-                    log.warning(f"⚠️ [{k}] Blitz Court {court}: r3 OK aber Slot nicht "
-                                f"in Reservierungen – möglicher false positive")
-                    return (False, None)
-            except Exception as ve:
-                # v10.3.6 FIX: Bei Exception NICHT mehr "vertraue r3" → kein Treffer melden
-                log.warning(f"❌ [{k}] Blitz-Verifikation Exception: {ve} – kein Treffer")
-                return (False, None)
-
-        log.info(f"⚡ [{k}] Blitz-Treffer Court {court}: {datum_de} {from_t}–{to_t} "
-                 f"ID={info['booking_id']}")
-        return (True, info)
-    except Exception as e:
-        log.error(f"[{k}] Blitz Court {court}: {e}")
-        return (False, None)
-
-
-
 # ══════════════════════════════════════════════
 # STORNIERUNG
 # ══════════════════════════════════════════════
 
-def storniere_buchung(k: str, booking_id: int = None) -> bool:
-    if booking_id is None:
-        aktiv = az_get(k, "aktive_buchung")
-        if not aktiv or not aktiv.get("booking_id"):
-            log.warning(f"[{k}] Stornierung: keine booking_id verfügbar")
-            return False
-        booking_id = aktiv["booking_id"]
-
+def storniere_buchung(k: str, booking_id: int, datum_api: str) -> bool:
+    log.info(f"🗑️ [{k}] Storniere ID {booking_id}")
     snap   = az_snap(k, "csrf_token", "http")
     csrf_t = snap["csrf_token"]
     http   = snap["http"]
-
-    h  = {"accept": "*/*", "x-ajax-call": "true", "x-csrf-token": csrf_t,
-          "x-requested-with": "XMLHttpRequest",
-          "referer": f"{BASE_URL}/user/my-bookings"}
-    hp = {**h, "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-          "origin": BASE_URL}
-
-    log.info(f"🗑️ [{k}] Storniere Buchung {booking_id}")
+    h = {"accept": "text/html, */*; q=0.01", "x-ajax-call": "true",
+         "x-csrf-token": csrf_t, "x-requested-with": "XMLHttpRequest",
+         "referer": f"{BASE_URL}/padel?currentDate={datum_api}"}
     try:
-        r = http.post(f"{BASE_URL}/bookings/{booking_id}/cancel-flow",
-                      headers=hp, data=f"_csrf={csrf_t}", timeout=10)
-        execution = "e1s1"
-        m = re.search(r"execution=(e\d+s\d+)", r.text)
-        if m:
-            execution = m.group(1)
-
-        r2 = http.post(f"{BASE_URL}/bookings/{booking_id}/cancel-flow",
-                       headers=hp,
-                       params={"execution": execution, "_eventId": "confirm"},
-                       data=(f"confirmKey={CONFIRM_KEY}"
-                             f"&confirmValue=true&_csrf={csrf_t}"),
-                       timeout=10)
+        http.get(f"{BASE_URL}/court-module/{MODULE}/bookings/{booking_id}/cancel",
+                 headers=h, timeout=10)
+        r2 = http.get(f"{BASE_URL}/court-module/{MODULE}/bookings/{booking_id}/cancel",
+                      params={"button_confirm": CONFIRM_KEY},
+                      headers={**h, "accept": "*/*"}, timeout=10)
         if r2.status_code in [200, 302]:
-            log.info(f"✅ [{k}] Storno OK: {booking_id}")
-            aktiv = az_get(k, "aktive_buchung")
-            if aktiv and aktiv.get("booking_id") == booking_id:
-                az_set(k, "aktive_buchung", None)
+            az_set(k, "aktive_buchung", None)
+            log.info(f"✅ [{k}] Stornierung OK")
             return True
-        log.error(f"[{k}] Storno: HTTP {r2.status_code}")
         return False
     except Exception as e:
-        log.error(f"[{k}] Storno: {e}")
+        log.error(f"[{k}] Stornierung: {e}")
         return False
 
-
 # ══════════════════════════════════════════════
-# SYNC – v10.3 MIT expected_slot
+# SERVER-SYNC
 # ══════════════════════════════════════════════
 
-def sync_buchung_vom_server(k: str, expected_slot: dict = None,
-                            debug_telegram: bool = False) -> bool:
-    """
-    Holt die aktuelle Buchung vom Server. Setzt aktive_buchung.
-
-    v10.3.6: Wieder v11.0-Logik mit 401-Retry und Paginierung.
-    Optional: expected_slot filtert auf exakten Match (nur für Blitz).
-
-    Returns: True wenn Buchung gefunden, False sonst.
-    """
-    # Wenn Schiebe-Thread läuft und am Leben ist: skip (außer expected_slot)
-    if az_get(k, "schiebe_aktiv") and not expected_slot:
+def sync_buchung_vom_server(k: str, debug_telegram: bool = False):
+    if az_get(k, "schiebe_aktiv"):
         thread = acc[k].get("schiebe_thread")
         if thread and not thread.is_alive():
             log.warning(f"[{k}] Sync: Schiebe-Thread tot → schiebe_aktiv=False")
             az_set(k, "schiebe_aktiv", False)
         else:
-            return False
+            return
 
-    if az_get(k, "sniper_aktiv") and not expected_slot:
-        return False
+    if az_get(k, "sniper_aktiv"):
+        return
 
     http_sess = acc[k]["http"]
     csrf_t    = az_get(k, "csrf_token")
@@ -1479,9 +889,7 @@ def sync_buchung_vom_server(k: str, expected_slot: dict = None,
          "x-requested-with": "XMLHttpRequest", "referer": f"{BASE_URL}/"}
 
     sync_erfolgreich = False
-    total_pages      = 1
 
-    # 401-Retry: einmal neu einloggen wenn Session abgelaufen
     for login_versuch in range(2):
         try:
             r_pages = http_sess.get(
@@ -1497,7 +905,8 @@ def sync_buchung_vom_server(k: str, expected_slot: dict = None,
                     h["x-csrf-token"] = csrf_t
                     continue
                 else:
-                    return False
+                    return
+            total_pages = 1
             try:
                 raw = r_pages.json()
                 if isinstance(raw, (int, float)):
@@ -1517,10 +926,10 @@ def sync_buchung_vom_server(k: str, expected_slot: dict = None,
             break
         except Exception as e:
             log.error(f"[{k}] Sync total-pages: {e}")
-            return False
+            return
 
     if not sync_erfolgreich:
-        return False
+        return
 
     try:
         for page in range(total_pages):
@@ -1556,10 +965,7 @@ def sync_buchung_vom_server(k: str, expected_slot: dict = None,
                 if not datum_match:
                     continue
                 datum_de  = datum_match.group(1)
-                try:
-                    datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
-                except Exception:
-                    continue
+                datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
                 if datum_obj.date() < jetzt.date():
                     continue
                 zeit_match = re.search(
@@ -1575,16 +981,7 @@ def sync_buchung_vom_server(k: str, expected_slot: dict = None,
                     continue
                 court_match = re.search(r"[Cc]ourt\s*(\d+)", text)
                 court = int(court_match.group(1)) if court_match else 1
-
-                # Optional: expected_slot Filter (nur wenn ausdrücklich übergeben)
-                if expected_slot:
-                    if (datum_de != expected_slot.get("datum_de") or
-                            from_str  != expected_slot.get("fromTime") or
-                            to_str    != expected_slot.get("toTime")  or
-                            court     != int(expected_slot.get("court", -1))):
-                        continue
-
-                bid = None
+                bid   = None
                 for pa in ["data-target", "href", "data-url", "action"]:
                     for tag in karte.find_all(attrs={pa: re.compile(r"/bookings/\d+")}):
                         m2 = re.search(r"/bookings/(\d+)", tag.get(pa, ""))
@@ -1613,388 +1010,116 @@ def sync_buchung_vom_server(k: str, expected_slot: dict = None,
     aktuell = az_get(k, "aktive_buchung")
     if gefunden:
         az_set(k, "aktive_buchung", gefunden)
-        if debug_telegram:
-            senden(f"🔄 [{k}] Sync: {gefunden['datum_de']} "
-                   f"{gefunden['fromTime']}–{gefunden['toTime']} C{gefunden['court']}")
-        return True
     elif sync_erfolgreich:
-        # Nur leeren wenn Sync wirklich erfolgreich war (kein 401 etc.)
-        # UND wir nicht in Schiebe sind (sonst überschreiben wir den Schiebe-State)
         if aktuell and not az_get(k, "schiebe_aktiv"):
             log.info(f"[{k}] Keine aktive Buchung auf dem Server.")
-        if not az_get(k, "schiebe_aktiv"):
-            az_set(k, "aktive_buchung", None)
-        if expected_slot and debug_telegram:
-            senden(f"⚠️ [{k}] Sync: keine matching Buchung gefunden "
-                   f"für {expected_slot.get('datum_de')} "
-                   f"{expected_slot.get('fromTime')}–{expected_slot.get('toTime')}")
-        return False
-
-    return False
-
-
+        az_set(k, "aktive_buchung", None)
 
 # ══════════════════════════════════════════════
-# AGGRESSIV BUCHEN 07:00 (Früh-Methode) – unverändert
+# AGGRESSIVE BUCHUNG
 # ══════════════════════════════════════════════
 
-def _aggressiv_buchen_07(k: str, datum_de: str, datum_api: str,
-                          dauer_min: int, bevorzugter_court: int = 0) -> bool:
-    """
-    Bucht exklusiv den 07:00-Slot am 7-Tage-Tag mit ~2s Dauerbeschuss.
-    Fallback: berechne_freie_slots → frühester freier Slot.
-    """
-    log.info(f"🌅 [{k}] Früh-Methode: 07:00 Exklusiv-Beschuss")
-    senden(f"🌅 [{k}] 07:00 Dauerbeschuss läuft…")
-
-    # Reihenfolge der Courts
-    if bevorzugter_court == 1:
-        courts = [1, 2]
-    else:
-        courts = [2, 1]
-
-    deadline = time.time() + 2.5
-    versuche = 0
-    while time.time() < deadline and versuche < FRUEH_EXKLUSIV_VERSUCHE:
-        for court in courts:
-            slot = {
-                "court": court, "fromTime": "07:00", "toTime":
-                    (datetime.strptime("07:00", "%H:%M") +
-                     timedelta(minutes=dauer_min)).strftime("%H:%M"),
-                "datum_de": datum_de, "datum_api": datum_api,
-                "dauer": dauer_min,
-                "key": f"{datum_api}_{court}_07:00_{dauer_min}",
-            }
-            if buche_slot(k, slot):
-                log.info(f"🎯 [{k}] Früh-Treffer 07:00 Court {court}")
-                senden(f"🎯 [{k}] 07:00 GEBUCHT Court {court}!")
-                return True
-        versuche += 1
-        time.sleep(0.05)
-
-    # Fallback: frühester freier Slot
-    log.info(f"[{k}] 07:00 verpasst – Fallback frühester Slot")
-    freie = berechne_freie_slots(k, datum_de, dauer_min)
-    if not freie:
-        log.warning(f"[{k}] Keine freien Slots im Fallback!")
-        return False
-
-    # Sortiere nach Uhrzeit, bevorzuge angegeben Court
-    def _sort_key(s):
-        court_pref = 0 if s["court"] == (bevorzugter_court or 2) else 1
-        return (s["fromTime"], court_pref)
-    freie.sort(key=_sort_key)
-
-    for slot in freie[:5]:
-        if buche_slot(k, slot):
-            log.info(f"✅ [{k}] Fallback-Treffer {slot['fromTime']} Court {slot['court']}")
-            senden(f"✅ [{k}] Fallback gebucht: {slot['fromTime']} Court {slot['court']}")
-            return True
-
-    return False
-
-
-# ══════════════════════════════════════════════
-# AGGRESSIV BUCHEN AB ZEIT – v10.3 BLITZ + PARALLEL
-# ══════════════════════════════════════════════
-
-def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str,
-                          dauer_min: int, ab_dt: datetime,
-                          bis_dt: datetime = None,
-                          bevorzugter_court: int = 0,
-                          nur_ein_court: bool = False) -> bool:
-    """
-    v10.3 BLITZ: Bucht ab gegebener Zeit – mit Pre-warm + parallelen Courts.
-
-    Ablauf:
-      1. Pre-check: hat Account schon eine matching Buchung? → fertig
-      2. T-10s: Pre-warm r1 für Court 2 UND Court 1 parallel
-      3. T-0:   Feuere r2+r3 auf BEIDEN Courts gleichzeitig in 2 Threads
-      4. 1 Treffer → fertig
-      5. 2 Treffer → behalte bevorzugten Court, storniere automatisch den anderen
-                     (one-per-account constraint!)
-      6. 0 Treffer → serielles Fallback-Hämmern (max AGGRESSIVE_TIMEOUT)
-
-    ab_dt enthält das volle datetime (Datum + Uhrzeit ab wann buchbar).
-
-    v10.3.6: nur_ein_court=True → NUR der bevorzugte Court wird angefasst,
-    kein paralleles Feuern. Verhindert dass eine fremde Buchung auf dem
-    anderen Court die Session blockiert (Sniper Phase 2 Use-Case).
-    """
-    # Berechne das Ziel-Datetime (volles datum + ab_dt time)
-    jetzt = jetzt_lokal()
-    if ab_dt.year < 2000:
-        # Nur Uhrzeit-Component – an heute anhängen
-        buchbar_dt = datetime.combine(jetzt.date(), ab_dt.time())
-        if buchbar_dt < jetzt:
-            buchbar_dt += timedelta(days=1)
-    else:
-        buchbar_dt = ab_dt
-
-    # Ziel-Zeitfenster berechnen
-    schluss       = datetime.strptime(ANLAGE_SCHLUSS, "%H:%M")
-    target_from   = floor_to_30min(buchbar_dt)
-    target_to_dt  = target_from + timedelta(minutes=dauer_min)
-    if target_to_dt.time() > schluss.time():
-        log.warning(f"[{k}] Slot übersteigt Anlagen-Schluss – abbruch")
-        senden(f"❌ [{k}] Slot {target_from.strftime('%H:%M')} +{dauer_min}m über {ANLAGE_SCHLUSS}!")
-        return False
-
-    from_t = target_from.strftime("%H:%M")
-    to_t   = target_to_dt.strftime("%H:%M")
-
-    # Court-Reihenfolge
-    if nur_ein_court and bevorzugter_court in (1, 2):
-        # v10.3.6: Sniper-Modus → nur EIN Court, kein paralleles Feuern
-        courts_order = [bevorzugter_court]
-        log.info(f"[{k}] Blitz NUR-EIN-COURT-Modus: Court {bevorzugter_court}")
-    elif bevorzugter_court == 1:
-        courts_order = [1, 2]
-    else:
-        courts_order = [2, 1]
-
-    # Slot-Objekte für beide Courts
-    slots = {}
-    for court in courts_order:
-        slots[court] = {
-            "court": court, "fromTime": from_t, "toTime": to_t,
-            "datum_de": datum_de, "datum_api": datum_api,
-            "dauer": dauer_min,
-            "key": f"{datum_api}_{court}_{from_t}_{dauer_min}",
-        }
-
-    # ─────────────── Pre-Check (one-per-account) ───────────────
-    try:
-        for cc in courts_order:
-            if sync_buchung_vom_server(k, expected_slot=slots[cc]):
-                log.info(f"✅ [{k}] Slot (Court {cc}) bereits gebucht – nichts zu tun")
-                return True
-    except Exception:
-        pass
-
-    # ─────────────── Phase 1: Warte bis T-10s ───────────────
-    prewarm_dt = buchbar_dt - timedelta(seconds=BLITZ_PREWARM_SECONDS)
-    log.info(f"⚡ [{k}] BLITZ Ziel={buchbar_dt.strftime('%H:%M:%S')} "
-             f"Pre-warm bei {prewarm_dt.strftime('%H:%M:%S')} "
-             f"Slot {from_t}–{to_t}")
-    senden(f"⚡ [{k}] BLITZ-Buchung: {datum_de} {from_t}–{to_t}\n"
-           f"   Pre-warm @ {prewarm_dt.strftime('%H:%M:%S')}\n"
-           f"   Feuer @ {buchbar_dt.strftime('%H:%M:%S')}\n"
-           f"   v10.3.6: Pre-warm + Parallel + Multi-Shot")
-
-    while jetzt_lokal() < prewarm_dt:
-        if not az_get(k, "schiebe_aktiv") and not az_get(k, "sniper_aktiv"):
-            # Direkt-Modus startet nur via _schiebe_intern – beide Flags prüfen
-            # Falls user manuell stoppt:
-            pass
-        rest = (prewarm_dt - jetzt_lokal()).total_seconds()
-        time.sleep(min(rest, 1.0) if rest > 1.0 else max(rest, 0.0))
-        if rest <= 0:
-            break
-
-    # ─────────────── Phase 2: Pre-warm BEIDE Courts parallel ───────────────
-    prewarm_results = {}
-    prewarm_lock    = threading.Lock()
-
-    def _do_prewarm(court):
-        ex, csrf = prewarm_execution(k, slots[court])
-        with prewarm_lock:
-            prewarm_results[court] = (ex, csrf)
-
-    pw_threads = [threading.Thread(target=_do_prewarm, args=(c,), daemon=True)
-                  for c in courts_order]
-    for t in pw_threads:
-        t.start()
-    for t in pw_threads:
-        t.join(timeout=8)
-
-    # ─────────────── Phase 3: Warte präzise bis T-0 ───────────────
-    fire_dt = buchbar_dt + timedelta(milliseconds=BLITZ_FIRE_OFFSET_MS)
-    while jetzt_lokal() < fire_dt:
-        rest = (fire_dt - jetzt_lokal()).total_seconds()
-        if rest > 0.5:
-            time.sleep(0.1)
-        elif rest > 0.05:
-            time.sleep(0.01)
-        elif rest > 0:
-            time.sleep(0.001)
-        else:
-            break
-
-    # ─────────────── Phase 4: MULTI-SHOT FEUER (v10.3.6, R18) ───────────────
-    log.info(f"🔥 [{k}] BLITZ MULTI-SHOT START bei "
-             f"{jetzt_lokal().strftime('%H:%M:%S.%f')[:-3]} "
-             f"({MULTI_SHOT_COUNT} Bursts)")
-
-    def _fire_burst(burst_idx: int, pw_per_court: dict) -> dict:
-        """Feuert eine Burst (parallele r2+r3 auf alle Courts).
-        pw_per_court: {court: (exec, csrf)} oder leeres dict für fresh r1+r2+r3.
-        Returns: {court: (ok, info)}"""
-        results = {}
-        lock = threading.Lock()
-
-        def _do_blitz(court):
-            pw_ex, pw_csrf = pw_per_court.get(court, (None, None))
-            # v10.3.6: Bei Blitz verify_person_id=False für maximale Speed.
-            # Verifikation passiert NACH allen Bursts via sync_buchung_vom_server.
-            ok, info = buche_slot_blitz(k, slots[court],
-                                         prewarm_exec=pw_ex,
-                                         prewarm_csrf=pw_csrf,
-                                         verify_person_id=False)
-            with lock:
-                results[court] = (ok, info)
-
-        threads = [threading.Thread(target=_do_blitz, args=(c,), daemon=True)
-                   for c in courts_order]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=15)
-        return results
-
-    blitz_results = {}
-    treffer = []
-    for burst in range(MULTI_SHOT_COUNT):
-        # Stopp-Signal prüfen
-        if not az_get(k, "schiebe_aktiv") and not az_get(k, "sniper_aktiv"):
-            break
-
-        # Burst 0 nutzt Pre-warm-Token; danach jeder Burst macht fresh r1+r2+r3
-        pw_for_burst = prewarm_results if burst == 0 else {}
-
-        burst_start = jetzt_lokal()
-        log.info(f"🔥 [{k}] Burst {burst+1}/{MULTI_SHOT_COUNT} "
-                 f"@ {burst_start.strftime('%H:%M:%S.%f')[:-3]}"
-                 f"{' (pre-warmed)' if burst == 0 else ''}")
-
-        blitz_results = _fire_burst(burst, pw_for_burst)
-        treffer = [(c, info) for c, (ok, info) in blitz_results.items()
-                   if ok and info]
-
-        if treffer:
-            # Treffer! → raus aus dem Burst-Loop
-            break
-
-        # Verfehlt – kurze Pause, dann nächster Burst
-        if burst < MULTI_SHOT_COUNT - 1:
-            log.info(f"[{k}] Burst {burst+1} verfehlt – warte "
-                     f"{MULTI_SHOT_GAP_MS}ms")
-            time.sleep(MULTI_SHOT_GAP_MS / 1000.0)
-
-    # ─────────────── Phase 5: Auswertung mit Sync-Verifikation ───────────────
-    # v10.3.6: Da Bursts mit verify=False liefen (für Speed), MÜSSEN wir
-    # jetzt via Sync prüfen ob die Buchung wirklich uns gehört.
-    if treffer:
-        # Kurz warten damit Server-State konsistent ist
-        time.sleep(0.5)
-        # Pro Treffer-Court: prüfe via sync mit expected_slot
-        verified_treffer = []
-        for court, info in treffer:
-            expected = {
-                "court": court,
-                "fromTime": info["fromTime"],
-                "toTime": info["toTime"],
-                "datum_de": info["datum_de"],
-            }
-            # sync mit expected_slot prüft my-bookings → garantiert eigene Buchung
-            if sync_buchung_vom_server(k, expected_slot=expected):
-                # Sync hat aktive_buchung gesetzt, info aktualisieren
-                aktuell = az_get(k, "aktive_buchung")
-                if aktuell:
-                    verified_treffer.append((court, aktuell))
-                    log.info(f"✅ [{k}] Burst-Treffer Court {court} via Sync verifiziert")
-            else:
-                log.warning(f"❌ [{k}] Burst-Treffer Court {court} NICHT in my-bookings "
-                            f"– false positive, verwerfe")
-        treffer = verified_treffer
-
-    if len(treffer) == 1:
-        court, info = treffer[0]
-        az_set(k, "aktive_buchung", info)
-        log.info(f"🎯 [{k}] BLITZ-Treffer Court {court}: {from_t}–{to_t}")
-        senden(f"🎯 [{k}] BLITZ-Treffer!\n   Court {court} | {from_t}–{to_t}")
-        return True
-
-    if len(treffer) >= 2:
-        # one-per-account (R1): Server SOLLTE das verhindern. Falls doch
-        # beide durchkommen (Server-Race), ist das hier das Sicherheitsnetz.
-        treffer.sort(key=lambda x: 0 if x[0] == (bevorzugter_court or 2) else 1)
-        keep_court, keep_info = treffer[0]
-        az_set(k, "aktive_buchung", keep_info)
-        log.warning(f"⚠️ [{k}] DOPPEL-TREFFER (Server-Race)! Behalte Court {keep_court}")
-        senden(f"⚠️ [{k}] DOPPEL-TREFFER (sehr selten – Server-Race)!\n"
-               f"   Behalte Court {keep_court}\n"
-               f"   Storniere zweite Buchung…")
-        for court, info in treffer[1:]:
-            if info.get("booking_id"):
-                try:
-                    storniere_buchung(k, info["booking_id"])
-                except Exception as e:
-                    log.error(f"[{k}] Auto-Storno Court {court}: {e}")
-        # aktive_buchung könnte vom storno gelöscht worden sein → wieder setzen
-        az_set(k, "aktive_buchung", keep_info)
-        return True
-
-    # ─────────────── Phase 6: Fallback – serielles Hämmern ───────────────
-    log.warning(f"[{k}] Blitz verfehlt – Fallback serielles Hämmern")
-    senden(f"⚠️ [{k}] Blitz verfehlt – Fallback läuft…")
-
+def _aggressiv_buchen_07(k: str, datum_de: str, datum_api: str, dauer_min: int) -> bool:
+    oeffnung = datetime.strptime(ANLAGE_OEFFNUNG, "%H:%M")
+    slot_07  = {
+        "fromTime":  "07:00",
+        "toTime":    (oeffnung + timedelta(minutes=dauer_min)).strftime("%H:%M"),
+        "dauer":     dauer_min,
+        "datum_api": datum_api,
+        "datum_de":  datum_de,
+    }
     deadline = time.time() + AGGRESSIVE_TIMEOUT
-    versuche = 0
+    versuch  = 0
+
     while time.time() < deadline:
-        if not az_get(k, "schiebe_aktiv") and not az_get(k, "sniper_aktiv"):
-            log.info(f"[{k}] Fallback abgebrochen (Stopp-Signal)")
+        if not az_get(k, "schiebe_aktiv"):
             return False
 
-        # Pre-check: haben wir schon einen Treffer durch parallele Race?
-        for court in courts_order:
-            if sync_buchung_vom_server(k, expected_slot=slots[court]):
-                log.info(f"✅ [{k}] Fallback erkennt bereits gebuchten Slot")
+        if versuch > 0 and versuch % 50 == 0:
+            if not ist_eingeloggt(k):
+                log.warning(f"[{k}] Dauerbeschuss: Session abgelaufen bei Versuch {versuch}")
+                senden(f"🔑 [{k}] Session im Dauerbeschuss abgelaufen – logge neu ein...")
+                if not einloggen(k):
+                    senden(f"❌ [{k}] Neu-Login fehlgeschlagen!")
+                    return False
+                senden(f"✅ [{k}] Neu eingeloggt – Dauerbeschuss läuft weiter...")
+
+        if versuch < FRUEH_EXKLUSIV_VERSUCHE:
+            court_v = [2, 1][versuch % 2]
+            slot    = {**slot_07, "court": court_v,
+                       "key": f"{datum_api}_{court_v}_07:00_{dauer_min}"}
+            if buche_slot(k, slot):
+                log.info(f"[{k}] 07:00 nach {versuch+1} Versuchen gebucht (Court {court_v})")
+                return True
+            versuch += 1
+            time.sleep(AGGRESSIVE_INTERVAL)
+            continue
+
+        if versuch == FRUEH_EXKLUSIV_VERSUCHE:
+            senden(f"⚠️ [{k}] 07:00 Uhr nicht buchbar nach ~2s.\n"
+                   f"🔄 Wechsle auf frühesten freien Slot...")
+
+        freie = berechne_freie_slots(k, datum_de, dauer_min)
+        if freie:
+            fallback = freie[0]
+            log.info(f"[{k}] Fallback: {fallback['fromTime']} Court {fallback['court']}")
+            if buche_slot(k, fallback):
+                senden(f"✅ [{k}] Fallback-Slot gebucht: "
+                       f"{fallback['fromTime']} Uhr Court {fallback['court']}")
                 return True
 
-        # Re-Login alle 50 Versuche
-        if versuche > 0 and versuche % 50 == 0:
-            if not _session_refresh_vor_aktion(k, "Aggressiv-Fallback"):
-                senden(f"❌ [{k}] Fallback abgebrochen (Login-Fehler)")
-                return False
-
-        for court in courts_order:
-            ok, info = buche_slot_blitz(k, slots[court],
-                                         prewarm_exec=None, prewarm_csrf=None,
-                                         verify_person_id=True)
-            if ok and info:
-                az_set(k, "aktive_buchung", info)
-                log.info(f"✅ [{k}] Fallback-Treffer Court {court}")
-                senden(f"✅ [{k}] Fallback gebucht: Court {court} {from_t}–{to_t}")
-                return True
-
-        versuche += 1
+        versuch += 1
         time.sleep(AGGRESSIVE_INTERVAL)
 
-    log.error(f"[{k}] Aggressiv-Timeout ({AGGRESSIVE_TIMEOUT}s) – nichts gebucht")
-    senden(f"❌ [{k}] Timeout: Slot {from_t}–{to_t} nicht ergattert")
     return False
 
+def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str, dauer_min: int,
+                         ab_dt: datetime, bis_dt: datetime,
+                         bevorzugter_court: int = 0) -> bool:
+    schluss  = datetime.strptime(ANLAGE_SCHLUSS, "%H:%M")
+    deadline = time.time() + AGGRESSIVE_TIMEOUT
+    versuch  = 0
 
+    while time.time() < deadline:
+        if not az_get(k, "schiebe_aktiv"):
+            return False
+
+        if versuch > 0 and versuch % 50 == 0:
+            if not ist_eingeloggt(k):
+                senden(f"🔑 [{k}] Session im Dauerbeschuss abgelaufen – logge neu ein...")
+                if not einloggen(k):
+                    senden(f"❌ [{k}] Neu-Login fehlgeschlagen!")
+                    return False
+                senden(f"✅ [{k}] Neu eingeloggt – Dauerbeschuss läuft weiter...")
+
+        freie      = berechne_freie_slots(k, datum_de, dauer_min)
+        kandidaten = [s for s in freie
+                      if datetime.strptime(s["fromTime"], "%H:%M") >= ab_dt
+                      and datetime.strptime(s["fromTime"], "%H:%M") < bis_dt
+                      and datetime.strptime(s["toTime"], "%H:%M") <= schluss]
+        if bevorzugter_court in (1, 2):
+            prio     = [s for s in kandidaten if s["court"] == bevorzugter_court]
+            fallback = [s for s in kandidaten if s["court"] != bevorzugter_court]
+            kandidaten = prio + fallback
+        if kandidaten and buche_slot(k, kandidaten[0]):
+            return True
+
+        versuch += 1
+        time.sleep(AGGRESSIVE_INTERVAL)
+    return False
 
 # ══════════════════════════════════════════════
-# SCHIEBE PHASE 3 (Storno + Rebook) – UNVERÄNDERT
-# ──────────────────────────────────────────────
-# WICHTIG: schiebe_moment = datetime.combine(jetzt.date(), ...)
-#          ← jetzt.date() = HEUTE, NICHT datum_obj.date()!
+# SCHIEBE PHASE 3 – ausgelagert für Sniper-Wiederverwendung
 # ══════════════════════════════════════════════
 
 def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_str: str):
     """
     Phase 3: Schrittweise schieben bis Zielzeit.
+    Wird sowohl von _schiebe_intern als auch vom Sniper nach Treffer aufgerufen.
 
-    Logik aus v11.0 übernommen (v10.3.6):
-      - schiebe_moment basiert auf ende_dt - random_offset (5-20 Min)
-        → KRITISCH: combine mit jetzt.date(), nicht datum_obj.date()! (R7)
-      - Detaillierte Telegram-Updates vor jeder Wartephase und Aktion
-      - Storno-Retry: 6× × 10s
-      - Rebook-Loop: 30× × 0.1s mit alternierendem Court
-      - Stunden-Session-Check während langer Wartephasen
+    FIX 2a: aktiv()-Check im Storno-Retry → stoppt sofort bei "Stopp".
+    FIX 2b: Rebook nach Storno: 30 Versuche, 0.1s für erste 15, dann 0.5s.
+    FIX 2c: Bestätigung nur nach verifiziertem aktive_buchung.
     """
     datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
     ziel_dt   = datetime.strptime(ziel_str, "%H:%M")
@@ -2037,13 +1162,12 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
                    + wetter_str)
             return
 
+        # Schiebe-Zeitpunkt: HEUTE um (Slot-Ende - RANDOM Minuten)
         jetzt = jetzt_lokal()
         random_offset  = random.randint(SCHIEBE_MINUTEN_VOR_MIN, SCHIEBE_MINUTEN_VOR_MAX)
-        # ════════ KRITISCH R7: jetzt.date() – NICHT datum_obj.date()! ════════
         schiebe_moment = datetime.combine(
-            jetzt.date(),
+            jetzt.date(),                                  # ← HEUTE, nicht datum_obj!
             (ende_dt - timedelta(minutes=random_offset)).time())
-        # ════════════════════════════════════════════════════════════════════
 
         sek = (schiebe_moment - jetzt).total_seconds()
 
@@ -2111,6 +1235,7 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
                f"🗑️ {aktive_b['fromTime']}–{aktive_b['toTime']} "
                f"→ {naechster_von}–{naechster_bis}")
 
+        # Erzwungener Session-Refresh VOR Stornierung
         log.info(f"[{k}] Erzwungener Login vor Stornierung (Schiebe-Loop)...")
         if not _session_refresh_vor_aktion(k, f"Stornierung {aktive_b['fromTime']}"):
             senden(f"❌ [{k}] Session vor Stornierung fehlgeschlagen – retry in 10s.")
@@ -2118,12 +1243,12 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
                 return
             continue
 
-        # R9: STORNO VOR REBOOK!
+        # FIX 2a: Storno-Retry prüft jetzt aktiv() → Sofort-Stopp möglich
         storno_ok = False
         for storno_versuch in range(6):
             if not aktiv():
-                return
-            if storniere_buchung(k, booking_id):
+                return                              # ← NEU: sofortiger Abbruch
+            if storniere_buchung(k, booking_id, datum_api):
                 storno_ok = True
                 break
             log.warning(f"[{k}] Storno-Retry {storno_versuch+1}/6 (kein Telegram-Spam)")
@@ -2136,7 +1261,7 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
                 return
             continue
 
-        # Sofort-Rebook nach Storno (30× × 0.1s, alternierender Court)
+        # FIX 2b: Sofort-Rebook nach Storno – 30 Versuche, 0.1s für erste 15
         neuer_slot    = {
             "fromTime":  naechster_von,
             "toTime":    naechster_bis,
@@ -2157,13 +1282,16 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
             if buche_slot(k, slot_v):
                 ok = True
                 break
+            # Erste 15 Versuche: 0.1s – danach 0.5s
             time.sleep(0.1 if versuch < 15 else 0.5)
 
         letzter_session_check = time.time()
 
         if ok:
+            # FIX 2c: Bestätigung nur nach verifiziertem aktive_buchung
             gebuchter = az_get(k, "aktive_buchung")
             if not gebuchter:
+                # Fallback: expliziter Sync
                 try:
                     sync_buchung_vom_server(k)
                     gebuchter = az_get(k, "aktive_buchung")
@@ -2193,36 +1321,26 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
 
     zeige_account_menue(k)
 
-
-
 # ══════════════════════════════════════════════
-# SCHIEBE-INTERNAL – v10.3.6 (Blitz-Start beibehalten)
+# SCHIEBE-TAKTIK
 # ══════════════════════════════════════════════
+
+def schiebe_loop(k: str):
+    try:
+        _schiebe_intern(k)
+    except Exception as e:
+        log.error(f"[{k}] SCHIEBE CRASH: {e}", exc_info=True)
+        senden(f"💥 <b>[{k}] Schiebe-Taktik abgestürzt!</b>\n{e}")
+        az_set(k, "schiebe_aktiv", False)
+        zeige_account_menue(k)
 
 def _schiebe_intern(k: str):
-    """
-    Hauptlogik der Schiebe-Taktik.
-
-    Direkt-Branch (v10.3.x):
-      - KEIN spam_start_dt = buchbar_dt - 1s mehr.
-      - Login bei T-90s, dann _aggressiv_buchen_ab() → Blitz Multi-Shot.
-      - Nach Treffer: _schiebe_phase3() mit detaillierten Status-Updates.
-
-    Phase 3 nutzt das alte ende_dt - random_offset System (v11.0).
-    """
     log.info(f"🔄 [{k}] Schiebe-Loop gestartet")
     datum_de   = az_get(k, "schiebe_datum")
     ziel_str   = az_get(k, "schiebe_ziel")
     dauer_min  = az_get(k, "schiebe_dauer") or 90
     modus      = az_get(k, "schiebe_modus") or "frueh"
     buchbar_ab = az_get(k, "schiebe_buchbar_ab")
-    court      = az_get(k, "schiebe_court") or 0
-
-    if not all([modus, datum_de, ziel_str, dauer_min]):
-        log.error(f"[{k}] Schiebe: unvollständige Parameter")
-        senden(f"❌ [{k}] Schiebe abgebrochen (Parameter fehlen)")
-        az_set(k, "schiebe_aktiv", False)
-        return
 
     datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
     datum_api = datum_obj.strftime("%m/%d/%Y")
@@ -2246,7 +1364,7 @@ def _schiebe_intern(k: str):
             senden(msg)
         zeige_account_menue(k)
 
-    # ── Phase 1: Warten auf 7-Tage-Fenster (frueh/direkt) ────────────────────
+    # ── Phase 1: Warten auf 7-Tage-Fenster ───────────────────────────────────
     if modus in ("frueh", "direkt"):
         while aktiv():
             jetzt   = jetzt_lokal()
@@ -2285,8 +1403,6 @@ def _schiebe_intern(k: str):
         return
 
     # ── Phase 2: Ersten Slot buchen ───────────────────────────────────────────
-    erfolg = False
-
     if modus == "frueh":
         jetzt       = jetzt_lokal()
         fenster_tag = (datum_obj - timedelta(days=7)).date()
@@ -2328,9 +1444,7 @@ def _schiebe_intern(k: str):
                f"📅 {datum_de} | 07:00 Uhr | {dauer_min} Min\n"
                f"🔫 ~2s exklusiv Court 2→1 auf 07:00, dann Fallback auf frühesten freien Slot")
 
-        erfolg = _aggressiv_buchen_07(k, datum_de, datum_api, dauer_min, court)
-
-        if not erfolg:
+        if not _aggressiv_buchen_07(k, datum_de, datum_api, dauer_min):
             beende(f"❌ [{k}] Kein Slot buchbar nach {AGGRESSIVE_TIMEOUT}s.")
             return
 
@@ -2345,11 +1459,11 @@ def _schiebe_intern(k: str):
             return
         senden(f"🕐 <b>[{k}] Spät-Taktik – analysiere bestehende Belegung...</b>\n"
                f"📅 {datum_de} | Ziel: {ziel_str} Uhr | {dauer_min} Min")
-
+        ok = False
         for versuch in range(30):
             if not aktiv():
                 return
-            datum_api_z    = datum_obj.strftime("%m/%d/%Y")
+            datum_api_z    = datetime.strptime(datum_de, "%d.%m.%Y").strftime("%m/%d/%Y")
             reservierungen = hole_reservierungen(k, datum_api_z)
 
             aktive_b_now = az_get(k, "aktive_buchung")
@@ -2412,17 +1526,15 @@ def _schiebe_intern(k: str):
                        f"🕐 {buchung['fromTime']}–{buchung['toTime']} | Court {buchung['court']}\n"
                        f"📌 Eingestiegen: {start_info}\n"
                        f"🔄 Schiebe Richtung {ziel_str} Uhr...")
-                erfolg = True
+                ok = True
                 break
             if not schlafe(3):
                 return
-
-        if not erfolg:
+        if not ok:
             beende(f"❌ [{k}] Kein buchbarer Slot gefunden.")
             return
 
     elif modus == "direkt":
-        # v10.3.x: Blitz-Start via _aggressiv_buchen_ab (Pre-warm + Multi-Shot)
         if not buchbar_ab:
             beende(f"❌ [{k}] Keine Startzeit angegeben.")
             return
@@ -2430,8 +1542,6 @@ def _schiebe_intern(k: str):
         jetzt        = jetzt_lokal()
         buchbar_zeit = datetime.strptime(buchbar_ab, "%H:%M").time()
         buchbar_dt   = datetime.combine(jetzt.date(), buchbar_zeit)
-        if buchbar_dt < jetzt:
-            buchbar_dt += timedelta(days=1)
 
         if jetzt < buchbar_dt:
             sek_wait = (buchbar_dt - jetzt).total_seconds()
@@ -2445,739 +1555,745 @@ def _schiebe_intern(k: str):
             if not _session_refresh_vor_aktion(k, f"Direkt {buchbar_ab}"):
                 beende(f"❌ [{k}] Login vor {buchbar_ab} fehlgeschlagen!")
                 return
-            senden(f"✅ [{k}] Eingeloggt – warte auf Blitz-Feuer @ {buchbar_ab} Uhr "
-                   f"(Pre-warm + Parallel + Multi-Shot)")
+            senden(f"✅ [{k}] Eingeloggt – warte auf exakt {buchbar_ab} Uhr...")
+            restzeit = (buchbar_dt - jetzt_lokal()).total_seconds()
+            if restzeit > 0:
+                time.sleep(restzeit)
         else:
             if not _session_refresh_vor_aktion(k, f"Direkt sofort ab {buchbar_ab}"):
                 beende(f"❌ [{k}] Login fehlgeschlagen!")
                 return
 
-        # _aggressiv_buchen_ab macht das Pre-warm + Multi-Shot intern
-        erfolg = _aggressiv_buchen_ab(k, datum_de, datum_api, dauer_min,
-                                       buchbar_dt, None, court)
+        senden(f"🎯 <b>[{k}] Direkte Taktik – Dauerbeschuss startet!</b>\n"
+               f"⏰ Es ist {buchbar_ab} Uhr!\n"
+               f"🎯 Buche {datum_de} ab {buchbar_ab} Uhr | Court 2 bevorzugt")
 
-        if not erfolg:
-            beende(f"❌ [{k}] Kein Slot ab {buchbar_ab} Uhr buchbar nach Blitz+Fallback.")
+        ab_dt        = datetime.strptime(buchbar_ab, "%H:%M")
+        direkt_court = az_get(k, "schiebe_court") or 0
+        if not _aggressiv_buchen_ab(k, datum_de, datum_api, dauer_min, ab_dt, ziel_dt,
+                                    bevorzugter_court=direkt_court):
+            beende(f"❌ [{k}] Kein Slot ab {buchbar_ab} Uhr buchbar nach {AGGRESSIVE_TIMEOUT}s.")
             return
 
         buchung = az_get(k, "aktive_buchung")
         senden(f"✅ <b>[{k}] Direkt-Slot gebucht!</b>\n"
-               f"📅 {_datum_mit_tag(datum_de)}\n"
                f"🕐 {buchung['fromTime']}–{buchung['toTime']} | Court {buchung['court']}\n"
-               f"🎯 Schiebe-Ziel: {ziel_str} Uhr\n"
                f"🔄 Schiebe Richtung {ziel_str} Uhr...")
 
-    elif modus == "sniper":
-        # Sniper-Fortsetzung: aktive_buchung sollte gesetzt sein
-        if not az_get(k, "aktive_buchung"):
-            beende(f"❌ [{k}] Sniper-Schiebe: keine aktive Buchung")
-            return
-        erfolg = True
-
     # ── Phase 3: Schrittweise schieben ───────────────────────────────────────
-    if erfolg:
-        _schiebe_phase3(k, datum_de, datum_api, dauer_min, ziel_str)
-
-    az_set(k, "schiebe_aktiv", False)
-    log.info(f"[{k}] Schiebe-Thread beendet")
-
+    _schiebe_phase3(k, datum_de, datum_api, dauer_min, ziel_str)
 
 # ══════════════════════════════════════════════
-# SNIPER-INTERNAL – v10.3 (buche_slot_blitz statt _schnell)
+# SNIPER  –  NEU in v10.0.0
 # ══════════════════════════════════════════════
-
-def _sniper_intern(k: str):
-    """
-    Sniper-Modus v10.3.6: SMART-LAUER.
-
-    Wartet bis zum letzten 30-Min-Fenster vor der fremden Endzeit
-    und hämmert dann gezielt auf den freiwerdenden Slot. Falls
-    fremder NICHT storniert: bei genau fremder Endzeit Wechsel zu
-    Multi-Shot-Blitz auf den nachfolgenden Slot (R20, R21).
-
-    Beispiel: Max hat 21.05. 17:00–18:30 Court 2 gebucht.
-        User-Eingabe: fremder_bis=18:30, dauer=90, court=2, ziel=18:30
-
-      14:00 → User startet Sniper → Bot schläft 😴
-      17:55 → Login-Refresh (5 Min vor Lauer-Start)
-      18:00 → Lauer-Start. Hämmere "21.05. 18:00–19:30 Court 2"
-              (= Maxes Slot; nur Treffer wenn Max storniert)
-      18:15 → Max storniert → Bot trifft Slot 18:00–19:30 ✅
-      ODER
-      18:30 → Lauer-Ende, Max hat nicht storniert
-              → Multi-Shot-Blitz auf "21.05. 18:30–20:00"
-              (= jetzt frisch freigeschaltet durch 7-Tage-Regel R2)
-    """
-    snap         = az_snap(k, "sniper_datum", "sniper_court", "sniper_fremder_bis",
-                           "sniper_dauer", "sniper_ziel")
-    datum_de     = snap["sniper_datum"]
-    court        = snap["sniper_court"]
-    fremder_bis  = snap["sniper_fremder_bis"]
-    dauer        = snap["sniper_dauer"]
-    ziel         = snap["sniper_ziel"]
-
-    if not all([datum_de, court, fremder_bis, dauer]):
-        senden(f"❌ [{k}] Sniper: Parameter fehlen")
-        az_set(k, "sniper_aktiv", False)
-        return
-
-    # ─── Berechne Zeitpunkte (R20, R21) ───
-    datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
-    datum_api = datum_obj.strftime("%m/%d/%Y")
-
-    # Fremde Endzeit als volles datetime (Buchungstag + Endzeit)
-    fremder_bis_time = datetime.strptime(fremder_bis, "%H:%M").time()
-    fremde_endzeit_dt = datetime.combine(datum_obj.date(), fremder_bis_time)
-    # → 7-Tage-Regel: heute zur gleichen Zeit ist der Slot ab fremder Endzeit
-    #   buchbar. Lauer-Zeitpunkte beziehen sich also auf HEUTE, nicht
-    #   auf den Buchungstag (analog R7 Schiebe-Logik).
-    jetzt = jetzt_lokal()
-    fremde_endzeit_heute = datetime.combine(jetzt.date(), fremder_bis_time)
-    # Falls Zeit schon vorbei: morgen
-    if fremde_endzeit_heute < jetzt:
-        fremde_endzeit_heute += timedelta(days=1)
-
-    lauer_start_dt = fremde_endzeit_heute - timedelta(minutes=SNIPER_PRE_END_MINUTES)
-    login_dt       = lauer_start_dt - timedelta(minutes=SNIPER_LOGIN_BUFFER)
-    blitz_dt       = fremde_endzeit_heute  # Wechsel zu Multi-Shot-Blitz
-
-    # ─── Slot-Definitionen ───
-    # Phase 1: Slot der bei fremder STARTZEIT beginnt – das ist Maxes Slot.
-    # ABER: Wir wissen nicht wann Max angefangen hat, nur seine Endzeit.
-    # → Slot ist (endzeit - dauer) bis endzeit. ABER das stimmt nur wenn
-    #   wir gleiche Dauer wie Max wollen.
-    # Korrektur: User wählt dauer für SEINE Buchung. Bei Treffer bekommen
-    # wir IMMER unsere gewählte dauer. Slot start = (endzeit - dauer).
-    # Falls also Max von 17:00–18:30 (90min) und wir wollen 90 Min:
-    #   → Slot 17:00–18:30 (Maxes Slot)
-    # Falls Max von 17:00–18:30 (90min) und wir wollen 60 Min:
-    #   → Slot 17:30–18:30 (passt in Maxes belegtes Fenster, würde frei
-    #     wenn er storniert)
-    phase1_from_dt = fremde_endzeit_dt - timedelta(minutes=dauer)
-    phase1_from    = phase1_from_dt.strftime("%H:%M")
-    phase1_to      = fremder_bis
-
-    # Phase 2: Slot direkt NACH fremder Endzeit (regulär freigeschaltet
-    # ab fremde_endzeit_heute durch 7-Tage-Regel)
-    phase2_from    = fremder_bis
-    phase2_to      = (datetime.strptime(fremder_bis, "%H:%M") +
-                       timedelta(minutes=dauer)).strftime("%H:%M")
-
-    # Anlagen-Schluss prüfen (R3)
-    schluss_time = datetime.strptime(ANLAGE_SCHLUSS, "%H:%M").time()
-    if datetime.strptime(phase2_to, "%H:%M").time() > schluss_time:
-        senden(f"⚠️ [{k}] Sniper: Phase-2-Slot ({phase2_from}–{phase2_to}) "
-               f"übersteigt {ANLAGE_SCHLUSS} – nur Phase 1 läuft")
-        phase2_aktiv = False
-    else:
-        phase2_aktiv = True
-
-    # Phase-1-Slot (wir lauern auf fremde Stornierung)
-    phase1_slot = {
-        "court": court, "fromTime": phase1_from, "toTime": phase1_to,
-        "datum_de": datum_de, "datum_api": datum_api, "dauer": dauer,
-        "key": f"{datum_api}_{court}_{phase1_from}_{dauer}",
-    }
-    # Phase-2-Slot (regulärer Folge-Slot)
-    phase2_slot = {
-        "court": court, "fromTime": phase2_from, "toTime": phase2_to,
-        "datum_de": datum_de, "datum_api": datum_api, "dauer": dauer,
-        "key": f"{datum_api}_{court}_{phase2_from}_{dauer}",
-    }
-
-    # ─── User informieren ───
-    senden(f"🎯 [{k}] SMART-SNIPER aktiv (v10.3.6)\n"
-           f"   📅 {_datum_mit_tag(datum_de)} Court {court}\n"
-           f"   🎯 Fremde Endzeit: {fremder_bis}\n"
-           f"   💤 Schlaf bis {login_dt.strftime('%H:%M')} (Login)\n"
-           f"   👁 Lauer: {lauer_start_dt.strftime('%H:%M')} – "
-                          f"{blitz_dt.strftime('%H:%M')}\n"
-           f"      → Phase 1: Slot {phase1_from}–{phase1_to} (fremde Storno)\n"
-           f"   ⚡ Bei {blitz_dt.strftime('%H:%M')} Blitz-Phase 2:\n"
-           f"      → Slot {phase2_from}–{phase2_to}"
-           f"{' (NICHT verfügbar)' if not phase2_aktiv else ''}")
-
-    log.info(f"[{k}] Sniper geplant: Lauer {lauer_start_dt} – {blitz_dt}, "
-             f"Phase1={phase1_from}-{phase1_to}, Phase2={phase2_from}-{phase2_to}")
-
-    # ═══════════════════════════════════════
-    # SCHLAF bis Login-Zeitpunkt
-    # ═══════════════════════════════════════
-    while jetzt_lokal() < login_dt and az_get(k, "sniper_aktiv"):
-        rest = (login_dt - jetzt_lokal()).total_seconds()
-        time.sleep(min(rest, 5.0) if rest > 5 else max(rest, 0))
-
-    if not az_get(k, "sniper_aktiv"):
-        log.info(f"[{k}] Sniper abgebrochen (vor Login)")
-        return
-
-    # ═══════════════════════════════════════
-    # LOGIN bei T-5 Min
-    # ═══════════════════════════════════════
-    if not _session_refresh_vor_aktion(k, "Smart-Sniper-Login"):
-        senden(f"❌ [{k}] Sniper abgebrochen (Login-Fehler)")
-        az_set(k, "sniper_aktiv", False)
-        return
-
-    # ═══════════════════════════════════════
-    # SCHLAF bis Lauer-Start
-    # ═══════════════════════════════════════
-    while jetzt_lokal() < lauer_start_dt and az_get(k, "sniper_aktiv"):
-        rest = (lauer_start_dt - jetzt_lokal()).total_seconds()
-        time.sleep(min(rest, 1.0) if rest > 1.0 else max(rest, 0))
-
-    if not az_get(k, "sniper_aktiv"):
-        log.info(f"[{k}] Sniper abgebrochen (vor Lauer-Start)")
-        return
-
-    senden(f"👁 [{k}] Lauer-Fenster GESTARTET – hämmere "
-           f"Slot {phase1_from}–{phase1_to} Court {court}")
-
-    # ═══════════════════════════════════════
-    # PHASE 1: LAUERN (lauer_start_dt bis blitz_dt)
-    # ═══════════════════════════════════════
-    versuche      = 0
-    letzter_log   = time.time()
-    letzter_login = time.time()
-
-    while az_get(k, "sniper_aktiv") and jetzt_lokal() < blitz_dt:
-        # Re-Login alle 30s
-        if time.time() - letzter_login > 30:
-            if not _session_refresh_vor_aktion(k, "Sniper-Refresh"):
-                senden(f"❌ [{k}] Sniper abgebrochen (Re-Login-Fehler)")
-                az_set(k, "sniper_aktiv", False)
-                return
-            letzter_login = time.time()
-
-        # Status-Log alle 30s
-        if time.time() - letzter_log > 30:
-            rest_min = (blitz_dt - jetzt_lokal()).total_seconds() / 60.0
-            log.info(f"[{k}] Phase 1: {versuche} Versuche, "
-                     f"noch {rest_min:.1f} Min bis Blitz-Phase")
-            letzter_log = time.time()
-
-        # Lauer-Versuch auf Maxes Slot (Phase 1)
-        ok, info = buche_slot_blitz(k, phase1_slot,
-                                     prewarm_exec=None, prewarm_csrf=None,
-                                     verify_person_id=True)
-        if ok and info:
-            az_set(k, "aktive_buchung", info)
-            log.info(f"🎯 [{k}] PHASE-1-TREFFER (fremde Storno erkannt)!")
-
-            # Sicherheits-Sync mit my-bookings (R10 strikt)
-            time.sleep(0.5)
-            sync_ok = sync_buchung_vom_server(k, expected_slot=phase1_slot)
-            aktuelle = az_get(k, "aktive_buchung")
-            if not sync_ok or not aktuelle:
-                log.warning(f"❌ [{k}] Phase-1-Treffer NICHT in my-bookings – false positive!")
-                # Treffer verwerfen, weiter lauern
-                az_set(k, "aktive_buchung", None)
-                versuche += 1
-                time.sleep(0.2)
-                continue
-
-            wetter_str = hole_wetter(datum_de, aktuelle["fromTime"])
-
-            # Treffer-Message: was gebucht, nächstes Schieben, Ziel
-            if ziel and ziel != aktuelle["fromTime"]:
-                senden(f"🎯 <b>[{k}] SNIPER-TREFFER (Phase 1)!</b>\n"
-                       f"Fremder hat storniert!\n"
-                       f"📅 {_datum_mit_tag(datum_de)}\n"
-                       f"🕐 {aktuelle['fromTime']}–{aktuelle['toTime']} | "
-                       f"Court {aktuelle['court']}\n"
-                       f"🎯 Schiebe-Ziel: {ziel} Uhr\n"
-                       f"🔄 Schiebe Richtung {ziel} Uhr…"
-                       + wetter_str)
-                az_set_multi(k,
-                              schiebe_aktiv=True,
-                              schiebe_modus="sniper",
-                              schiebe_datum=datum_de,
-                              schiebe_ziel=ziel,
-                              schiebe_dauer=dauer,
-                              schiebe_court=court)
-                # _schiebe_phase3 schickt automatisch "⏳ Nächstes Schieben um..."
-                _schiebe_phase3(k, datum_de, datum_api, dauer, ziel)
-                az_set(k, "schiebe_aktiv", False)
-            else:
-                # Kein Schieben nötig – Ziel = aktueller Slot
-                senden(f"🎯 <b>[{k}] SNIPER-TREFFER (Phase 1)!</b>\n"
-                       f"Fremder hat storniert!\n"
-                       f"📅 {_datum_mit_tag(datum_de)}\n"
-                       f"🕐 {aktuelle['fromTime']}–{aktuelle['toTime']} | "
-                       f"Court {aktuelle['court']}\n"
-                       f"🏁 Ziel direkt erreicht!"
-                       + wetter_str)
-
-            az_set(k, "sniper_aktiv", False)
-            return
-
-        versuche += 1
-        time.sleep(0.2)  # 5 Versuche/Sek
-
-    if not az_get(k, "sniper_aktiv"):
-        log.info(f"[{k}] Sniper-Phase-1 abgebrochen")
-        return
-
-    log.info(f"[{k}] Phase 1 zu Ende ({versuche} Versuche) – "
-             f"fremder hat NICHT storniert. Wechsel zu Phase 2 (Blitz).")
-
-    # ═══════════════════════════════════════
-    # PHASE 2: MULTI-SHOT-BLITZ (ab blitz_dt = fremde Endzeit)
-    # ═══════════════════════════════════════
-    if not phase2_aktiv:
-        senden(f"⌛ [{k}] Sniper: Fremder hat nicht storniert UND Phase-2 "
-               f"übersteigt Anlagen-Schluss. Kein Treffer.")
-        az_set(k, "sniper_aktiv", False)
-        return
-
-    senden(f"⚡ [{k}] Fremder hat nicht storniert – BLITZ auf "
-           f"{phase2_from}–{phase2_to}")
-
-    # Übergabe an _aggressiv_buchen_ab mit fremder Endzeit als ab_dt
-    # v10.3.6: nur_ein_court=True → blockt nicht durch fremde Buchung auf
-    # dem anderen Court (Court 1 evtl. noch belegt während wir auf Court 2 zielen)
-    erfolg = _aggressiv_buchen_ab(k, datum_de, datum_api, dauer,
-                                   blitz_dt, None, court, nur_ein_court=True)
-
-    if erfolg:
-        # Sniper-spezifisches Schiebe-Ziel ggf. anwenden
-        if ziel and ziel != phase2_from:
-            az_set_multi(k,
-                          schiebe_aktiv=True,
-                          schiebe_modus="sniper",
-                          schiebe_datum=datum_de,
-                          schiebe_ziel=ziel,
-                          schiebe_dauer=dauer,
-                          schiebe_court=court)
-            senden(f"🔄 [{k}] Sniper-Phase 2 erfolgreich → Schiebe zu {ziel}…")
-            _schiebe_phase3(k, datum_de, datum_api, dauer, ziel)
-            az_set(k, "schiebe_aktiv", False)
-    else:
-        senden(f"⌛ [{k}] Sniper: kein Treffer in Phase 1 noch Phase 2")
-
-    az_set(k, "sniper_aktiv", False)
-    log.info(f"[{k}] Sniper-Thread beendet")
-
-
-
-# ══════════════════════════════════════════════
-# THREAD-WRAPPER
-# ══════════════════════════════════════════════
-
-def schiebe_loop(k: str):
-    try:
-        _schiebe_intern(k)
-    except Exception as e:
-        log.exception(f"[{k}] Schiebe-Loop crash: {e}")
-        senden(f"💥 [{k}] Schiebe-Loop Crash: {e}")
-    finally:
-        az_set(k, "schiebe_aktiv", False)
-
 
 def sniper_loop(k: str):
     try:
         _sniper_intern(k)
     except Exception as e:
-        log.exception(f"[{k}] Sniper-Loop crash: {e}")
-        senden(f"💥 [{k}] Sniper-Loop Crash: {e}")
-    finally:
+        log.error(f"[{k}] SNIPER CRASH: {e}", exc_info=True)
+        senden(f"💥 <b>[{k}] Sniper abgestürzt!</b>\n{e}")
         az_set(k, "sniper_aktiv", False)
+        zeige_account_menue(k)
 
+def _sniper_intern(k: str):
+    """
+    Sniper-Modus: Zielt auf den Slot 30 Min vor Ende einer fremden Buchung.
+    Hämmert sekündlich – sobald der Fremde storniert, schlägt der Bot zu.
+    Danach: normaler Schiebe-Loop (_schiebe_phase3) bis zur Zielzeit.
 
-# ══════════════════════════════════════════════
-# TELEGRAM HANDLER
-# ══════════════════════════════════════════════
+    Beispiel:
+      Fremder hat Court 2 | 08:00–09:30
+      Sniper zielt auf:   Court 2 | 09:00–10:30  (= fremdes Ende - 30 Min)
+      Nach Treffer:       Schiebe weiter bis 18:00 Uhr
+    """
+    datum_de    = az_get(k, "sniper_datum")
+    fremder_bis = az_get(k, "sniper_fremder_bis")   # z.B. "09:30"
+    court       = az_get(k, "sniper_court")          # Court des Fremden
+    dauer_min   = az_get(k, "sniper_dauer")
+    ziel_str    = az_get(k, "sniper_ziel")
 
-def handle_text(msg: dict):
-    text = msg.get("text", "").strip()
-    chat = str(msg.get("chat", {}).get("id", ""))
-    if chat != str(TELEGRAM_CHAT_ID):
+    datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
+    datum_api = datum_obj.strftime("%m/%d/%Y")
+
+    fremder_bis_dt = datetime.strptime(fremder_bis, "%H:%M")
+    target_von_dt  = fremder_bis_dt - timedelta(minutes=30)
+    target_bis_dt  = target_von_dt + timedelta(minutes=dauer_min)
+    target_von     = target_von_dt.strftime("%H:%M")
+    target_bis     = target_bis_dt.strftime("%H:%M")
+
+    target_slot = {
+        "court":     court,
+        "fromTime":  target_von,
+        "toTime":    target_bis,
+        "dauer":     dauer_min,
+        "datum_api": datum_api,
+        "datum_de":  datum_de,
+        "key":       f"{datum_api}_{court}_{target_von}_{dauer_min}",
+    }
+
+    senden(f"🎯 <b>[{k}] Sniper gestartet!</b>\n"
+           f"📅 {_datum_mit_tag(datum_de)}\n"
+           f"🏟️ Court {court} | Fremde Buchung endet: {fremder_bis} Uhr\n"
+           f"💥 Sniper-Ziel: <b>{target_von}–{target_bis}</b>\n"
+           f"🔄 Nach Treffer → Schiebe bis {ziel_str} Uhr\n"
+           f"⚡ Hämmere sekündlich auf {target_von} Uhr...")
+
+    versuche      = 0
+    letzter_login = time.time()
+
+    if not _session_refresh_vor_aktion(k, f"Sniper start"):
+        az_set(k, "sniper_aktiv", False)
+        senden(f"❌ [{k}] Sniper: Login fehlgeschlagen!")
+        zeige_account_menue(k)
         return
 
-    if text in ("/start", "/menu", "start", "menu"):
-        zeige_account_auswahl()
-        return
+    while az_get(k, "sniper_aktiv"):
+        # Session-Refresh alle 60 Sekunden
+        if versuche > 0 and time.time() - letzter_login > 60:
+            if not ist_eingeloggt(k):
+                log.info(f"[{k}] Sniper: Session-Refresh nach {versuche} Versuchen...")
+                if einloggen(k):
+                    letzter_login = time.time()
+                    log.info(f"[{k}] Sniper: Neu eingeloggt.")
+                else:
+                    senden(f"❌ [{k}] Sniper: Login fehlgeschlagen – stoppe.")
+                    az_set(k, "sniper_aktiv", False)
+                    zeige_account_menue(k)
+                    return
+            else:
+                letzter_login = time.time()
 
-    if text.lower() in ("/status", "status"):
-        for k in ACCOUNTS:
-            sync_buchung_vom_server(k)
-        zeige_account_auswahl()
-        return
+        if buche_slot(k, target_slot):
+            buchung = az_get(k, "aktive_buchung")
+            if buchung:
+                wetter_str = hole_wetter(datum_de, target_von)
+                senden(f"🎯 <b>[{k}] SNIPER TREFFER!</b>\n"
+                       f"📅 {_datum_mit_tag(datum_de)}\n"
+                       f"🕐 {buchung['fromTime']}–{buchung['toTime']} | Court {buchung['court']}\n"
+                       f"🏆 Nach {versuche+1} Versuchen!\n"
+                       f"🔄 Schiebe weiter → {ziel_str} Uhr..."
+                       + wetter_str)
+            else:
+                senden(f"🎯 <b>[{k}] SNIPER TREFFER!</b> (nach {versuche+1} Versuchen)\n"
+                       f"🔄 Schiebe weiter → {ziel_str} Uhr...")
 
-    if text.lower() in ("/stop", "stop"):
-        for k in ACCOUNTS:
-            az_set(k, "schiebe_aktiv", False)
             az_set(k, "sniper_aktiv", False)
-        senden("⏹️ Alle Schiebe/Sniper-Prozesse gestoppt")
-        return
 
-    # Direkt-Eingabe in einem Flow (z.B. Uhrzeit für direkte Taktik)
-    k_flow = get_flow_account()
-    if k_flow:
-        flow = az_get(k_flow, "flow")
-        if flow == "warte_buchbar_zeit":
-            # Parse Uhrzeit aus Text
-            m = re.match(r"^(\d{1,2}):(\d{2})$", text)
-            if not m:
-                senden("⚠️ Bitte Uhrzeit im Format HH:MM senden (z.B. 17:30)")
-                return
-            try:
-                buchbar = datetime.strptime(text, "%H:%M").strftime("%H:%M")
-            except Exception:
-                senden("⚠️ Ungültige Uhrzeit")
-                return
-            az_set_multi(k_flow,
-                          schiebe_buchbar_ab=buchbar,
-                          flow=None)
-            # Starte Schiebe-Thread
-            t = threading.Thread(target=schiebe_loop, args=(k_flow,), daemon=True)
-            az_set_multi(k_flow, schiebe_aktiv=True, schiebe_thread=t)
-            t.start()
-            senden(f"⚡ [{k_flow}] Direkte Taktik startet – buchbar ab {buchbar}")
-            set_flow_account(None)
+            # Schiebe-Zustand setzen und Phase 3 starten
+            az_set_multi(k,
+                schiebe_aktiv=True,
+                schiebe_datum=datum_de,
+                schiebe_ziel=ziel_str,
+                schiebe_dauer=dauer_min,
+                schiebe_modus="sniper",
+            )
+            _schiebe_phase3(k, datum_de, datum_api, dauer_min, ziel_str)
             return
 
-    senden("Tippe /menu für das Hauptmenü.")
+        versuche += 1
+        # 1 Sekunde zwischen Versuchen – schnell genug um den Slot zu erwischen
+        time.sleep(1.0)
 
+    senden(f"⏹️ [{k}] Sniper gestoppt nach {versuche} Versuchen.")
+    az_set(k, "sniper_aktiv", False)
+    zeige_account_menue(k)
+
+# ══════════════════════════════════════════════
+# FREITEXT-HANDLER
+# ══════════════════════════════════════════════
+
+def handle_text(k: str, text: str):
+    flow = az_get(k, "flow") if k else None
+    if flow != "direkte_startzeit":
+        zeige_account_auswahl()
+        return
+
+    m = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
+    if not m:
+        senden("❌ Ungültiges Format. Bitte als <b>HH:MM</b> eingeben, z.B. <b>13:00</b>")
+        return
+
+    stunde, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= stunde <= 21 and minute in [0, 30]):
+        senden("❌ Zeit muss auf 30-Min-Raster liegen (z.B. 13:00 oder 13:30)")
+        return
+
+    buchbar_ab = f"{stunde:02d}:{minute:02d}"
+    az_set_multi(k, schiebe_buchbar_ab=buchbar_ab, schiebe_aktiv=True, flow=None)
+
+    datum     = az_get(k, "schiebe_datum")
+    dauer     = az_get(k, "schiebe_dauer")
+    ziel      = az_get(k, "schiebe_ziel")
+    datum_obj = datetime.strptime(datum, "%d.%m.%Y")
+    tage_bis  = (datum_obj.date() - jetzt_lokal().date()).days
+    jetzt     = jetzt_lokal()
+    buchbar_dt = datetime.combine(jetzt.date(), datetime.strptime(buchbar_ab, "%H:%M").time())
+    min_bis   = int((buchbar_dt - jetzt).total_seconds() / 60) if buchbar_dt > jetzt else 0
+
+    senden(f"🎯 <b>[{k}] Direkte Taktik konfiguriert!</b>\n"
+           f"📅 {datum}\n"
+           f"⏰ Buchbar ab heute: {buchbar_ab} Uhr "
+           f"{'(in ' + str(min_bis) + ' Min)' if min_bis > 0 else '(sofort)'}\n"
+           f"🎯 Ziel: {ziel} Uhr ({dauer} Min)\n"
+           f"📆 Datum in {tage_bis} Tagen\n\n"
+           + (f"⏳ Warte noch {tage_bis-7} Tag(e) bis 7-Tage-Fenster, "
+              f"dann auf {buchbar_ab} Uhr..." if tage_bis > 7
+              else f"🚀 Warte auf {buchbar_ab} Uhr heute..."))
+
+    t = threading.Thread(target=schiebe_loop, args=(k,), daemon=True)
+    t.start()
+    az_set(k, "schiebe_thread", t)
+    zeige_account_auswahl()
+
+# ══════════════════════════════════════════════
+# TELEGRAM CALLBACKS
+# ══════════════════════════════════════════════
 
 def handle_callback(cb: dict):
     cid  = cb["id"]
     data = cb.get("data", "")
-    chat = str(cb.get("message", {}).get("chat", {}).get("id", ""))
-    if chat != str(TELEGRAM_CHAT_ID):
-        beantworte_callback(cid, "unauth")
-        return
-
     beantworte_callback(cid)
+    log.info(f"Callback: {data}")
 
-    # Universelle Buttons
-    if data == "abbrechen":
-        set_flow_account(None)
-        zeige_account_auswahl()
-        return
-    if data == "refresh_accounts" or data == "zurueck_accounts":
+    if data in ("zurueck_accounts", "refresh_accounts"):
         zeige_account_auswahl()
         return
 
-    # Account-Auswahl
     if data.startswith("acc_"):
         k = data[4:]
-        if k in ACCOUNTS:
-            set_flow_account(k)
-            zeige_account_menue(k)
-        return
-
-    # Menü-Ebene
-    if data.startswith("menu_"):
-        rest = data[5:]
-        # Form: <aktion>_<kuerzel>
-        aktion, _, k = rest.partition("_")
-        if k not in ACCOUNTS:
-            senden(f"⚠️ Unbekannter Account: {k}")
+        if k not in acc:
+            senden("❌ Unbekannter Account.")
             return
         set_flow_account(k)
-
-        if aktion == "slots":
-            # Klassisch buchen → Datum-Buttons
-            az_set(k, "flow", "klassisch_datum")
-            senden(f"📅 [{k}] Datum wählen:",
-                   buttons=erstelle_datum_buttons(f"kdatum_{k}", nur_im_fenster=True))
-            return
-        if aktion == "schiebe":
-            zeige_schiebe_modus_auswahl(k)
-            return
-        if aktion == "sniper":
-            az_set(k, "flow", "sniper_datum")
-            senden(f"🎯 [{k}] Sniper – Datum der fremden Buchung:",
-                   buttons=erstelle_datum_buttons(f"sdatum_{k}"))
-            return
-        if aktion == "status":
+        try:
             sync_buchung_vom_server(k)
-            zeige_account_menue(k)
-            return
-        if aktion == "stopp":
-            az_set(k, "schiebe_aktiv", False)
-            az_set(k, "sniper_aktiv", False)
-            senden(f"⏹️ [{k}] Schiebe/Sniper gestoppt")
-            zeige_account_menue(k)
-            return
-        if aktion == "storno":
-            aktiv = az_get(k, "aktive_buchung")
-            if not aktiv or not aktiv.get("booking_id"):
-                senden(f"⚠️ [{k}] Keine aktive Buchung")
-                return
-            if storniere_buchung(k, aktiv["booking_id"]):
-                senden(f"🗑️ [{k}] Storniert: {aktiv['datum_de']} "
-                       f"{aktiv['fromTime']} Court {aktiv['court']}")
-            else:
-                senden(f"❌ [{k}] Storno fehlgeschlagen")
-            zeige_account_menue(k)
-            return
-
-    # Schiebe-Modus-Auswahl
-    if data.startswith("schiebe_modus_"):
-        rest = data[len("schiebe_modus_"):]
-        modus, _, k = rest.partition("_")
-        if k not in ACCOUNTS:
-            return
-        set_flow_account(k)
-        az_set(k, "schiebe_modus", modus)
-        # Datum
-        az_set(k, "flow", f"schiebe_{modus}_datum")
-        nur_fenster = (modus in ("frueh",))
-        senden(f"📅 [{k}] Schiebe-{modus} – Datum:",
-               buttons=erstelle_datum_buttons(f"shdatum_{modus}_{k}",
-                                               nur_im_fenster=nur_fenster))
-        return
-
-    # Klassisch-Buchung Flow
-    if data.startswith("kdatum_"):
-        # kdatum_<k>_<datum>
-        rest = data[len("kdatum_"):]
-        # k bis _<datum>
-        m = re.match(r"^(.+?)_(\d{2}\.\d{2}\.\d{4})$", rest)
-        if not m:
-            return
-        k, datum_de = m.group(1), m.group(2)
-        if k not in ACCOUNTS:
-            return
-        set_flow_account(k)
-        az_set_multi(k, flow_datum=datum_de, flow="klassisch_dauer")
-        senden(f"⏱ [{k}] Dauer wählen:",
-               buttons=dauer_buttons(f"kdauer_{k}"))
-        return
-
-    if data.startswith("kdauer_"):
-        rest = data[len("kdauer_"):]
-        m = re.match(r"^(.+?)_(\d+)$", rest)
-        if not m: return
-        k, dauer = m.group(1), int(m.group(2))
-        if k not in ACCOUNTS: return
-        az_set_multi(k, flow_dauer=dauer, flow="klassisch_slot")
-        datum_de = az_get(k, "flow_datum")
-        if not _session_refresh_vor_aktion(k, "Klassisch-Buchung"):
-            return
-        freie = berechne_freie_slots(k, datum_de, dauer)
-        if not freie:
-            senden(f"❌ [{k}] Keine freien Slots am {datum_de}")
-            return
-        # Slot-Buttons
-        btns = []
-        for slot in freie[:30]:
-            btns.append([{
-                "text": f"C{slot['court']} {slot['fromTime']}–{slot['toTime']}",
-                "callback_data": f"kslot_{k}_{slot['key']}",
-            }])
-        btns.append([{"text": "❌ Abbrechen", "callback_data": "abbrechen"}])
-        senden(f"🎾 [{k}] {datum_de} ({dauer} Min) – Slot wählen:", buttons=btns)
-        # Cache slots
-        az_set(k, "_klassisch_slots", {s["key"]: s for s in freie})
-        return
-
-    if data.startswith("kslot_"):
-        rest = data[len("kslot_"):]
-        # kslot_<k>_<key>
-        # key: <datum_api>_<court>_<from>_<dauer>
-        parts = rest.split("_", 1)
-        if len(parts) < 2: return
-        k = parts[0]
-        slot_key = parts[1]
-        if k not in ACCOUNTS: return
-        cache = az_get(k, "_klassisch_slots") or {}
-        slot = cache.get(slot_key)
-        if not slot:
-            senden(f"⚠️ [{k}] Slot nicht mehr verfügbar")
-            return
-        if buche_slot(k, slot):
-            senden(f"✅ [{k}] Gebucht: {slot['datum_de']} "
-                   f"{slot['fromTime']}–{slot['toTime']} Court {slot['court']}")
-        else:
-            senden(f"❌ [{k}] Buchung fehlgeschlagen")
-        az_set(k, "flow", None)
+        except Exception as e:
+            log.warning(f"[{k}] Sync: {e}")
         zeige_account_menue(k)
         return
 
-    # Schiebe-Datum-Auswahl
-    if data.startswith("shdatum_"):
-        rest = data[len("shdatum_"):]
-        m = re.match(r"^(frueh|spaet|direkt)_(.+?)_(\d{2}\.\d{2}\.\d{4})$", rest)
-        if not m: return
-        modus, k, datum_de = m.group(1), m.group(2), m.group(3)
-        if k not in ACCOUNTS: return
-        set_flow_account(k)
-        az_set_multi(k, schiebe_datum=datum_de, flow=f"schiebe_{modus}_dauer")
-        senden(f"⏱ [{k}] Schiebe-{modus} – Dauer:",
-               buttons=dauer_buttons(f"shdauer_{modus}_{k}"))
+    k = get_flow_account()
+    for ak in ACCOUNTS:
+        if data.endswith(f"_{ak}"):
+            k    = ak
+            data = data[:-(len(ak) + 1)]
+            break
+
+    if not k:
+        senden("❓ Bitte zuerst einen Account wählen.")
+        zeige_account_auswahl()
         return
 
-    if data.startswith("shdauer_"):
-        rest = data[len("shdauer_"):]
-        m = re.match(r"^(frueh|spaet|direkt)_(.+?)_(\d+)$", rest)
-        if not m: return
-        modus, k, dauer = m.group(1), m.group(2), int(m.group(3))
-        if k not in ACCOUNTS: return
-        az_set_multi(k, schiebe_dauer=dauer, flow=f"schiebe_{modus}_court")
-        senden(f"🏟️ [{k}] Court-Präferenz:",
-               buttons=court_buttons(f"shcourt_{modus}_{k}"))
-        return
+    # ── Klassische Buchung ────────────────────────────────────────────────────
+    if data == "menu_slots":
+        az_set(k, "flow", "slots_anfrage")
+        senden(f"📅 <b>[{k}] Klassisch buchen</b>\nWelches Datum?",
+               buttons=erstelle_datum_buttons("slots_datum"))
 
-    if data.startswith("shcourt_"):
-        rest = data[len("shcourt_"):]
-        m = re.match(r"^(frueh|spaet|direkt)_(.+?)_(\d+)$", rest)
-        if not m: return
-        modus, k, court_v = m.group(1), m.group(2), int(m.group(3))
-        if k not in ACCOUNTS: return
-        az_set_multi(k, schiebe_court=court_v, flow=f"schiebe_{modus}_ziel")
+    # ── Schiebe-Taktik ────────────────────────────────────────────────────────
+    elif data == "menu_schiebe":
+        if az_get(k, "schiebe_aktiv") or az_get(k, "sniper_aktiv"):
+            senden(f"⚠️ [{k}] Prozess läuft bereits! Erst stoppen.")
+            zeige_account_menue(k)
+            return
+        if az_get(k, "aktive_buchung"):
+            senden(f"⚠️ [{k}] Aktive Buchung vorhanden.\nSchiebe nur ohne aktive Buchung.")
+            zeige_account_menue(k)
+            return
+        zeige_schiebe_modus_auswahl(k)
+
+    # ── Sniper-Modus (NEU) ────────────────────────────────────────────────────
+    elif data == "menu_sniper":
+        if az_get(k, "schiebe_aktiv") or az_get(k, "sniper_aktiv"):
+            senden(f"⚠️ [{k}] Prozess läuft bereits! Erst stoppen.")
+            zeige_account_menue(k)
+            return
+        if az_get(k, "aktive_buchung"):
+            senden(f"⚠️ [{k}] Aktive Buchung vorhanden.\nSniper nur ohne aktive Buchung.")
+            zeige_account_menue(k)
+            return
+        az_set(k, "flow", "sniper_datum")
+        senden(
+            f"🎯 <b>[{k}] Sniper-Modus</b>\n\n"
+            f"Jemand schiebt manuell und du willst dazwischenfunken.\n\n"
+            f"<b>Beispiel:</b>\n"
+            f"Fremder hat Court 2 | 08:00–09:30\n"
+            f"→ Sniper zielt auf Court 2 | 09:00–10:30\n"
+            f"→ Hämmert sekündlich bis der Fremde storniert\n"
+            f"→ Danach: Schiebe bis Zielzeit\n\n"
+            f"📅 <b>Für welches Datum?</b>",
+            buttons=erstelle_datum_buttons("sniper_datum", nur_im_fenster=True))
+
+    elif data == "menu_status":
+        snap    = az_snap(k, "aktive_buchung", "schiebe_aktiv", "schiebe_ziel",
+                          "schiebe_datum", "schiebe_dauer", "schiebe_modus",
+                          "schiebe_buchbar_ab", "person_id",
+                          "sniper_aktiv", "sniper_datum", "sniper_ziel",
+                          "sniper_fremder_bis", "sniper_court")
+        aktiv   = snap["aktive_buchung"]
+        schiebe = snap["schiebe_aktiv"]
+        sniper  = snap["sniper_aktiv"]
+        modus   = snap["schiebe_modus"] or ""
+        modus_l = {"frueh": "Früh", "spaet": "Spät", "direkt": "Direkt", "sniper": "Sniper-Fortsetzung"}.get(modus, "?")
+        pid     = snap["person_id"] or "⚠️ NICHT GEFUNDEN"
+
+        if aktiv:
+            extra = ""
+            if schiebe:
+                extra = (f"🔄 Schiebe ({modus_l}) → Ziel {snap['schiebe_ziel']} | "
+                         f"{snap['schiebe_dauer']} Min"
+                         + (f"\n⏰ Buchbar ab: {snap['schiebe_buchbar_ab']}"
+                            if modus == "direkt" else ""))
+            wetter_str = hole_wetter(aktiv["datum_de"], aktiv["fromTime"])
+            senden(f"📊 <b>[{k}] Aktive Buchung:</b>\n"
+                   f"📅 {_datum_mit_tag(aktiv['datum_de'])}\n"
+                   f"🕐 {aktiv['fromTime']}–{aktiv['toTime']} Uhr\n"
+                   f"🏟️ Court {aktiv['court']}\n"
+                   f"🔖 ID: {aktiv.get('booking_id','?')}\n"
+                   f"👤 Person: {pid}\n\n"
+                   + (extra if extra else "ℹ️ Keine Schiebe aktiv.")
+                   + wetter_str)
+        elif sniper:
+            senden(f"📊 <b>[{k}] Sniper aktiv:</b>\n"
+                   f"📅 {_datum_mit_tag(snap['sniper_datum'] or '?')}\n"
+                   f"🏟️ Court {snap['sniper_court']} | Fremdes Ende: {snap['sniper_fremder_bis']}\n"
+                   f"🎯 Ziel nach Treffer: {snap['sniper_ziel']} Uhr\n"
+                   f"👤 Person: {pid}")
+        else:
+            senden(f"📊 <b>[{k}] Keine Buchung.</b>\n"
+                   f"👤 Person: {pid}\n"
+                   + (f"🔄 Schiebe ({modus_l}) läuft..." if schiebe else "Bot wartet."))
+        zeige_account_menue(k)
+
+    elif data == "menu_stopp":
+        stopped = []
+        if az_get(k, "schiebe_aktiv"):
+            az_set(k, "schiebe_aktiv", False)
+            stopped.append("Schiebe")
+        if az_get(k, "sniper_aktiv"):
+            az_set(k, "sniper_aktiv", False)
+            stopped.append("Sniper")
+        if stopped:
+            senden(f"⏹️ [{k}] {' & '.join(stopped)} gestoppt.")
+        else:
+            senden("ℹ️ Kein aktiver Prozess.")
+        zeige_account_menue(k)
+
+    elif data == "menu_storno":
+        aktiv = az_get(k, "aktive_buchung")
+        if not aktiv:
+            senden(f"🗑️ [{k}] Keine Buchung vorhanden.")
+            zeige_account_menue(k)
+            return
+        bid = aktiv.get("booking_id")
+        senden(f"❓ <b>[{k}] Buchung wirklich stornieren?</b>\n\n"
+               f"📅 {aktiv['datum_de']}\n"
+               f"🕐 {aktiv['fromTime']}–{aktiv['toTime']} Uhr\n"
+               f"🏟️ Court {aktiv['court']}\n"
+               f"🔖 ID: {bid or '?'}\n\n"
+               f"⚠️ Nicht rückgängig machbar!",
+               buttons=[[
+                   {"text": "✅ Ja, stornieren!",
+                    "callback_data": f"storno_bestaetigt_{k}"},
+                   {"text": "❌ Abbrechen", "callback_data": "abbrechen"},
+               ]])
+
+    elif data == "storno_bestaetigt":
+        aktiv = az_get(k, "aktive_buchung")
+        if not aktiv:
+            senden(f"🗑️ [{k}] Keine Buchung mehr.")
+            zeige_account_menue(k)
+            return
+        bid       = aktiv.get("booking_id")
+        datum_api = aktiv.get("datum_api")
+        if not bid:
+            senden(f"❌ Keine ID – manuell: {BASE_URL}/padel")
+            zeige_account_menue(k)
+            return
+        if az_get(k, "schiebe_aktiv"):
+            az_set(k, "schiebe_aktiv", False)
+            senden("⏹️ Schiebe ebenfalls gestoppt.")
+        if az_get(k, "sniper_aktiv"):
+            az_set(k, "sniper_aktiv", False)
+            senden("⏹️ Sniper ebenfalls gestoppt.")
+        if not stelle_session_sicher(k):
+            return
+        senden("⏳ Storniere...")
+        ok = storniere_buchung(k, bid, datum_api)
+        if ok:
+            senden(f"✅ <b>[{k}] Storniert!</b>\n"
+                   f"📅 {aktiv['datum_de']}\n"
+                   f"🕐 {aktiv['fromTime']}–{aktiv['toTime']} | Court {aktiv['court']}")
+        else:
+            senden(f"❌ Stornierung fehlgeschlagen!\nManuell: {BASE_URL}/padel")
+        zeige_account_auswahl()
+
+    # ── Slot-Buchung Callbacks ────────────────────────────────────────────────
+    elif data.startswith("slots_datum_"):
+        datum = data.replace("slots_datum_", "")
+        az_set_multi(k, flow_datum=datum, flow="slots_dauer")
+        senden(f"📅 [{k}] {datum}\nWie lange möchtest du spielen?",
+               buttons=dauer_buttons("slots_dauer"))
+
+    elif data.startswith("slots_dauer_"):
+        dauer = int(data.replace("slots_dauer_", ""))
+        datum = az_get(k, "flow_datum")
+        if not datum:
+            senden("❌ Fehler – nochmal starten.")
+            zeige_account_menue(k)
+            return
+        az_set_multi(k, flow_dauer=dauer, flow=None)
+        if not stelle_session_sicher(k):
+            zeige_account_menue(k)
+            return
+        slots = berechne_freie_slots(k, datum, dauer)
+        if not slots:
+            senden(f"😔 [{k}] Keine freien {dauer}-Min-Slots am {datum}.")
+            zeige_account_menue(k)
+            return
+        gesamt       = len(slots)
+        slot_buttons = []
+        for s in slots[:10]:
+            label = f"🏟️ Court {s['court']} | {s['fromTime']}–{s['toTime']}"
+            key   = (f"buch_{s['datum_api'].replace('/', '-')}_"
+                     f"{s['court']}_{s['fromTime']}_{dauer}")
+            slot_buttons.append([{"text": label, "callback_data": key}])
+        slot_buttons.append([{"text": "❌ Abbrechen", "callback_data": "abbrechen"}])
+        extra = f"\n<i>(+{gesamt-10} weitere)</i>" if gesamt > 10 else ""
+        senden(f"✅ [{k}] Freie {dauer}-Min-Slots am {datum}:{extra}\n"
+               f"<i>Court 2 zuerst angezeigt</i>",
+               buttons=slot_buttons)
+
+    elif data.startswith("buch_"):
+        parts = data.split("_")
+        try:
+            datum_api = parts[1].replace("-", "/")
+            court     = int(parts[2])
+            from_t    = parts[3]
+            dauer     = int(parts[4])
+            datum_obj = datetime.strptime(datum_api, "%m/%d/%Y")
+            datum_de  = datum_obj.strftime("%d.%m.%Y")
+            to_t      = (datetime.strptime(from_t, "%H:%M") +
+                         timedelta(minutes=dauer)).strftime("%H:%M")
+        except Exception as e:
+            log.error(f"buch_ parse: {e} | {data}")
+            senden("❌ Fehler – nochmal versuchen.")
+            return
+        senden(f"❓ <b>[{k}] Buchung bestätigen?</b>\n"
+               f"📅 {datum_de}\n"
+               f"🕐 {from_t}–{to_t} Uhr ({dauer} Min)\n"
+               f"🏟️ Court {court}",
+               buttons=[[
+                   {"text": "✅ Ja, buchen!", "callback_data": f"confirm_{data}"},
+                   {"text": "❌ Nein",        "callback_data": "abbrechen"},
+               ]])
+
+    elif data.startswith("confirm_buch_"):
+        original = data.replace("confirm_", "")
+        parts    = original.split("_")
+        try:
+            datum_api = parts[1].replace("-", "/")
+            court     = int(parts[2])
+            from_t    = parts[3]
+            dauer     = int(parts[4])
+            datum_obj = datetime.strptime(datum_api, "%m/%d/%Y")
+            datum_de  = datum_obj.strftime("%d.%m.%Y")
+            to_t      = (datetime.strptime(from_t, "%H:%M") +
+                         timedelta(minutes=dauer)).strftime("%H:%M")
+        except Exception as e:
+            log.error(f"confirm_ parse: {e}")
+            senden("❌ Fehler – nochmal.")
+            return
+        slot = {"court": court, "fromTime": from_t, "toTime": to_t,
+                "dauer": dauer, "datum_api": datum_api, "datum_de": datum_de,
+                "key": f"{datum_api}_{court}_{from_t}_{dauer}"}
+        if not stelle_session_sicher(k):
+            senden(f"❌ [{k}] Session-Fehler.")
+            zeige_account_menue(k)
+            return
+        senden("⏳ Buche...")
+        ok = buche_slot(k, slot)
+        if ok:
+            wetter_str = hole_wetter(datum_de, from_t)
+            senden(f"✅ <b>[{k}] Gebucht!</b>\n"
+                   f"📅 {_datum_mit_tag(datum_de)}\n"
+                   f"🕐 {from_t}–{to_t} Uhr ({dauer} Min)\n"
+                   f"🏟️ Court {court}\n\nViel Spaß! 🎾"
+                   + wetter_str)
+        else:
+            senden(f"❌ [{k}] Buchung fehlgeschlagen.",
+                   buttons=[[
+                       {"text": "🔄 Nochmal",   "callback_data": original},
+                       {"text": "↩️ Abbrechen", "callback_data": "abbrechen"},
+                   ]])
+        zeige_account_auswahl()
+
+    # ── Schiebe-Setup Callbacks ───────────────────────────────────────────────
+    elif data.startswith("schiebe_modus_"):
+        modus = data.replace("schiebe_modus_", "")
+        az_set_multi(k, schiebe_modus=modus, flow="schiebe_setup_datum",
+                     schiebe_buchbar_ab=None)
+        modus_name  = {"frueh": "Früh-Methode", "spaet": "Spät-Taktik",
+                       "direkt": "Direkte Taktik"}.get(modus, modus)
+        nur_fenster = (modus == "spaet")
+        senden(f"🔄 [{k}] <b>{modus_name}</b>\nFür welches Datum?",
+               buttons=erstelle_datum_buttons("schiebe_datum", nur_im_fenster=nur_fenster))
+
+    elif data.startswith("schiebe_datum_"):
+        datum = data.replace("schiebe_datum_", "")
+        az_set_multi(k, schiebe_datum=datum, flow="schiebe_setup_dauer")
+        senden(f"📅 [{k}] {datum}\nWie lange möchtest du spielen?",
+               buttons=dauer_buttons("schiebe_dauer"))
+
+    elif data.startswith("schiebe_dauer_"):
+        dauer = int(data.replace("schiebe_dauer_", ""))
+        az_set_multi(k, schiebe_dauer=dauer, flow="schiebe_setup_ziel")
+        senden(f"🕒 [{k}] Welche <b>Wunschzeit</b>? ({dauer} Min)\n"
+               f"<i>Bis hierhin soll geschoben werden</i>",
+               buttons=zielzeit_buttons("schiebe_ziel", dauer))
+
+    elif data.startswith("schiebe_court_"):
+        court_val = data.replace("schiebe_court_", "")
+        try:
+            court_int = int(court_val)
+        except ValueError:
+            court_int = 0
+        az_set_multi(k, schiebe_court=court_int, flow="direkte_startzeit")
+        datum = az_get(k, "schiebe_datum")
         dauer = az_get(k, "schiebe_dauer")
-        senden(f"🎯 [{k}] Schiebe-{modus} – Ziel-Uhrzeit:",
-               buttons=zielzeit_buttons(f"shziel_{modus}_{k}", dauer))
-        return
+        ziel  = az_get(k, "schiebe_ziel")
+        court_label = {0: "Court 2 bevorzugt", 1: "Court 1", 2: "Court 2"}.get(court_int, "?")
+        senden(f"🎯 <b>[{k}] Direkte Taktik</b>\n"
+               f"📅 {datum} | {dauer} Min | Ziel: {ziel} Uhr | 🏟️ {court_label}\n\n"
+               f"⏰ <b>Ab wann ist der Slot buchbar?</b>\n"
+               f"Bitte Uhrzeit tippen (30-Min-Raster, z.B. <b>17:30</b>):\n\n"
+               f"<i>Bot wartet bis heute {court_label} frei wird, bucht dann und schiebt.</i>")
 
-    if data.startswith("shziel_"):
-        rest = data[len("shziel_"):]
-        m = re.match(r"^(frueh|spaet|direkt)_(.+?)_(\d{1,2}:\d{2})$", rest)
-        if not m: return
-        modus, k, ziel = m.group(1), m.group(2), m.group(3)
-        if k not in ACCOUNTS: return
+    elif data.startswith("schiebe_ziel_"):
+        ziel  = data.replace("schiebe_ziel_", "")
+        modus = az_get(k, "schiebe_modus") or "frueh"
         az_set(k, "schiebe_ziel", ziel)
 
         if modus == "direkt":
-            # Frage nach Buchbar-Zeit
-            az_set(k, "flow", "warte_buchbar_zeit")
-            senden(f"⏰ [{k}] Ab wann ist der Slot buchbar?\n"
-                   f"   Sende die Uhrzeit im Format HH:MM (z.B. 17:30)")
+            az_set(k, "flow", "direkte_court")
+            datum = az_get(k, "schiebe_datum")
+            dauer = az_get(k, "schiebe_dauer")
+            senden(f"🎯 <b>[{k}] Direkte Taktik</b>\n"
+                   f"📅 {datum} | {dauer} Min | Ziel: {ziel} Uhr\n\n"
+                   f"🏟️ <b>Welchen Court möchtest du?</b>",
+                   buttons=court_buttons("schiebe_court"))
         else:
-            # frueh/spaet: starte sofort
-            az_set(k, "flow", None)
+            az_set_multi(k, schiebe_aktiv=True, flow=None)
+            datum     = az_get(k, "schiebe_datum")
+            dauer     = az_get(k, "schiebe_dauer")
+            datum_obj = datetime.strptime(datum, "%d.%m.%Y")
+            tage_bis  = (datum_obj.date() - jetzt_lokal().date()).days
+            modus_name = "🌅 Früh-Methode" if modus == "frueh" else "🕐 Spät-Taktik"
+            senden(f"🔄 <b>[{k}] {modus_name} konfiguriert!</b>\n"
+                   f"📅 {datum}\n"
+                   f"🎯 Ziel: {ziel} Uhr ({dauer} Min)\n"
+                   f"📆 Datum in {tage_bis} Tagen\n\n"
+                   + (f"⏳ Warte noch {tage_bis-7} Tag(e) bis 7-Tage-Fenster..."
+                      if tage_bis > 7 else "🚀 Starte jetzt!"))
             t = threading.Thread(target=schiebe_loop, args=(k,), daemon=True)
-            az_set_multi(k, schiebe_aktiv=True, schiebe_thread=t)
             t.start()
-            senden(f"🚀 [{k}] Schiebe-{modus} gestartet → Ziel {ziel}")
-            set_flow_account(None)
-        return
+            az_set(k, "schiebe_thread", t)
+            zeige_account_auswahl()
 
-    # Sniper Flow
-    if data.startswith("sdatum_"):
-        rest = data[len("sdatum_"):]
-        m = re.match(r"^(.+?)_(\d{2}\.\d{2}\.\d{4})$", rest)
-        if not m: return
-        k, datum_de = m.group(1), m.group(2)
-        if k not in ACCOUNTS: return
-        set_flow_account(k)
-        az_set_multi(k, sniper_datum=datum_de, flow="sniper_court")
-        senden(f"🏟️ [{k}] Sniper – welcher Court?",
-               buttons=court_buttons(f"scourt_{k}"))
-        return
+    # ── Sniper-Setup Callbacks (NEU) ──────────────────────────────────────────
+    elif data.startswith("sniper_datum_"):
+        datum = data.replace("sniper_datum_", "")
+        az_set_multi(k, sniper_datum=datum, flow="sniper_dauer")
+        senden(f"📅 [{k}] Sniper | {datum}\nWie lang soll deine Buchung sein?",
+               buttons=dauer_buttons("sniper_dauer"))
 
-    if data.startswith("scourt_"):
-        rest = data[len("scourt_"):]
-        m = re.match(r"^(.+?)_(\d+)$", rest)
-        if not m: return
-        k, court_v = m.group(1), int(m.group(2))
-        if k not in ACCOUNTS: return
-        # Sniper braucht spezifischen Court (0 = beide nicht sinnvoll → default 2)
-        if court_v == 0:
-            court_v = 2
-        az_set_multi(k, sniper_court=court_v, flow="sniper_dauer")
-        senden(f"⏱ [{k}] Sniper – Dauer der Buchung:",
-               buttons=dauer_buttons(f"sdauer_{k}"))
-        return
+    elif data.startswith("sniper_dauer_"):
+        dauer = int(data.replace("sniper_dauer_", ""))
+        az_set_multi(k, sniper_dauer=dauer, flow="sniper_court")
+        senden(f"🏟️ [{k}] Auf welchem <b>Court</b> spielt die fremde Person?",
+               buttons=[[
+                   {"text": "🏟️ Court 1", "callback_data": f"sniper_court_1"},
+                   {"text": "🏟️ Court 2", "callback_data": f"sniper_court_2"},
+               ]])
 
-    if data.startswith("sdauer_"):
-        rest = data[len("sdauer_"):]
-        m = re.match(r"^(.+?)_(\d+)$", rest)
-        if not m: return
-        k, dauer = m.group(1), int(m.group(2))
-        if k not in ACCOUNTS: return
-        az_set_multi(k, sniper_dauer=dauer, flow="sniper_bis")
-        senden(f"🕐 [{k}] Sniper – Endzeit der FREMDEN Buchung (=Start unserer):",
-               buttons=sniper_endzeit_buttons(f"sbis_{k}"))
-        return
-
-    if data.startswith("sbis_"):
-        rest = data[len("sbis_"):]
-        m = re.match(r"^(.+?)_(\d{1,2}:\d{2})$", rest)
-        if not m: return
-        k, bis_t = m.group(1), m.group(2)
-        if k not in ACCOUNTS: return
-        az_set_multi(k, sniper_fremder_bis=bis_t, flow="sniper_ziel")
-        dauer = az_get(k, "sniper_dauer")
-        senden(f"🎯 [{k}] Sniper – Schiebe-Ziel-Uhrzeit (= unser End-Slot, "
-               f"oder gleich {bis_t} für 'kein Schieben'):",
-               buttons=zielzeit_buttons(f"sziel_{k}", dauer))
-        return
-
-    if data.startswith("sziel_"):
-        rest = data[len("sziel_"):]
-        m = re.match(r"^(.+?)_(\d{1,2}:\d{2})$", rest)
-        if not m: return
-        k, ziel = m.group(1), m.group(2)
-        if k not in ACCOUNTS: return
-        az_set_multi(k, sniper_ziel=ziel, flow=None)
-        t = threading.Thread(target=sniper_loop, args=(k,), daemon=True)
-        az_set_multi(k, sniper_aktiv=True, sniper_thread=t)
-        t.start()
-        senden(f"🎯 [{k}] Sniper gestartet – Ziel {ziel}")
-        set_flow_account(None)
-        return
-
-
-def telegram_loop():
-    log.info("📱 Telegram-Loop gestartet")
-    while True:
+    elif data.startswith("sniper_court_"):
+        court_val = data.replace("sniper_court_", "")
         try:
-            updates = hole_updates()
-            for upd in updates:
-                if "message" in upd:
-                    handle_text(upd["message"])
-                elif "callback_query" in upd:
-                    handle_callback(upd["callback_query"])
-        except Exception as e:
-            log.exception(f"Telegram-Loop: {e}")
-        time.sleep(0.5)
+            court_int = int(court_val)
+        except ValueError:
+            court_int = 2
+        az_set_multi(k, sniper_court=court_int, flow="sniper_fremder_end")
+        dauer = az_get(k, "sniper_dauer")
+        senden(
+            f"⏰ [{k}] Court {court_int} | {dauer} Min\n\n"
+            f"🕐 <b>Wann endet die fremde Buchung?</b>\n"
+            f"<i>Beispiel: Fremder hat 08:00–09:30 → wähle 09:30</i>\n"
+            f"Bot zielt dann auf: <b>{dauer} Min ab 30 Min vor dieser Zeit</b>",
+            buttons=sniper_endzeit_buttons("sniper_end"))
 
+    elif data.startswith("sniper_end_"):
+        fremder_bis = data.replace("sniper_end_", "")
+        az_set_multi(k, sniper_fremder_bis=fremder_bis, flow="sniper_ziel")
+        dauer  = az_get(k, "sniper_dauer")
+        court  = az_get(k, "sniper_court")
+        datum  = az_get(k, "sniper_datum")
+        # Berechne Ziel-Slot für Anzeige
+        fremder_bis_dt = datetime.strptime(fremder_bis, "%H:%M")
+        target_von_dt  = fremder_bis_dt - timedelta(minutes=30)
+        target_bis_dt  = target_von_dt + timedelta(minutes=dauer)
+        senden(
+            f"🎯 [{k}] Sniper-Ziel berechnet:\n"
+            f"📅 {datum} | Court {court}\n"
+            f"💥 Hämmere auf: <b>{target_von_dt.strftime('%H:%M')}–{target_bis_dt.strftime('%H:%M')}</b>\n\n"
+            f"🔄 <b>Bis wohin schieben nach Treffer?</b>",
+            buttons=zielzeit_buttons("sniper_ziel", dauer))
+
+    elif data.startswith("sniper_ziel_"):
+        ziel   = data.replace("sniper_ziel_", "")
+        datum  = az_get(k, "sniper_datum")
+        dauer  = az_get(k, "sniper_dauer")
+        court  = az_get(k, "sniper_court")
+        fremder_bis = az_get(k, "sniper_fremder_bis")
+
+        fremder_bis_dt = datetime.strptime(fremder_bis, "%H:%M")
+        target_von_dt  = fremder_bis_dt - timedelta(minutes=30)
+        target_bis_dt  = target_von_dt + timedelta(minutes=dauer)
+
+        az_set_multi(k,
+            sniper_ziel=ziel,
+            sniper_aktiv=True,
+            flow=None,
+        )
+
+        senden(
+            f"🎯 <b>[{k}] Sniper konfiguriert!</b>\n"
+            f"📅 {_datum_mit_tag(datum)}\n"
+            f"🏟️ Court {court} | Fremdes Ende: {fremder_bis} Uhr\n"
+            f"💥 Sniper-Ziel: <b>{target_von_dt.strftime('%H:%M')}–{target_bis_dt.strftime('%H:%M')}</b>\n"
+            f"🔄 Nach Treffer → Schiebe bis {ziel} Uhr\n\n"
+            f"🚀 Sniper startet jetzt!")
+
+        t = threading.Thread(target=sniper_loop, args=(k,), daemon=True)
+        t.start()
+        az_set(k, "sniper_thread", t)
+        zeige_account_auswahl()
+
+    # ── Abbrechen ─────────────────────────────────────────────────────────────
+    elif data == "abbrechen":
+        if k:
+            az_set_multi(k, flow=None, flow_datum=None, flow_dauer=None)
+        senden("↩️ Abgebrochen.")
+        zeige_account_auswahl()
+
+    else:
+        log.warning(f"Unbekannter Callback: {data}")
+        zeige_account_auswahl()
 
 # ══════════════════════════════════════════════
-# MAIN
+# TELEGRAM POLLING
+# ══════════════════════════════════════════════
+
+def telegram_loop():
+    log.info("📡 Telegram-Listener gestartet")
+    while True:
+        try:
+            for update in hole_updates():
+                if "message" in update:
+                    msg     = update["message"]
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    if chat_id != str(TELEGRAM_CHAT_ID):
+                        continue
+                    text   = msg.get("text", "").strip()
+                    k_flow = get_flow_account()
+                    if k_flow and az_get(k_flow, "flow") in ("direkte_startzeit",):
+                        handle_text(k_flow, text)
+                    else:
+                        zeige_account_auswahl()
+
+                elif "callback_query" in update:
+                    cb      = update["callback_query"]
+                    chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                    if chat_id == str(TELEGRAM_CHAT_ID):
+                        handle_callback(cb)
+        except Exception as e:
+            log.error(f"Telegram-Loop: {e}")
+        time.sleep(1)
+
+# ══════════════════════════════════════════════
+# START
 # ══════════════════════════════════════════════
 
 if __name__ == "__main__":
-    log.info("═" * 60)
-    log.info("🎾 Padel Bot v10.3.6 startet…")
-    log.info("   ⚡ BLITZ-Modus: Pre-warm + Parallel-Courts + Multi-Shot")
-    log.info("   🎯 SMART-SNIPER: Lauer letzte 30 Min vor fremder Endzeit")
-    log.info("   🔍 Person-ID-Verifikation aktiv")
-    log.info("   🛡️ Sync mit expected_slot")
-    log.info(f"   Accounts: {', '.join(ACCOUNTS.keys())}")
-    log.info("═" * 60)
-
-    # Initial-Login aller Accounts
+    log.info("=" * 60)
+    log.info("🎾 Padel Bot v10.0.0 – Fixes: Verifikation | Schiebe-Speed | Sniper")
+    log.info("   FIX 1: buche_slot() kein False-Positiv mehr (kein verifiziert=True Fallback)")
+    log.info("   FIX 2: Rebook nach Storno: 30× mit 0.1s | Storno-Retry: aktiv()-Check")
+    log.info("   NEU 3: Sniper-Modus – sekündlicher Dauerhammer + Schiebe nach Treffer")
+    log.info("   Schiebe-Logik: Storno/Neubuchung passiert HEUTE (nicht am Buchungstag!)")
     for k in ACCOUNTS:
-        try:
-            if einloggen(k):
-                sync_buchung_vom_server(k)
+        log.info(f"   [{k}] {ACCOUNTS[k]['email']}")
+    log.info(f"   Court-Priorität : 2 → 1 (automatisch)")
+    log.info(f"   Früh exklusiv   : {FRUEH_EXKLUSIV_VERSUCHE} × {AGGRESSIVE_INTERVAL}s")
+    log.info(f"   Schiebe         : {SCHIEBE_MINUTEN_VOR_MIN}–{SCHIEBE_MINUTEN_VOR_MAX} Min vor Slot-Ende (random)")
+    log.info("=" * 60)
+
+    for k in ACCOUNTS:
+        thread = acc[k].get("schiebe_thread")
+        if az_get(k, "schiebe_aktiv") and (not thread or not thread.is_alive()):
+            log.warning(f"[{k}] Startup: schiebe_aktiv korrigiert.")
+            az_set(k, "schiebe_aktiv", False)
+
+    fehler        = []
+    pid_warnungen = []
+    for k in ACCOUNTS:
+        if not einloggen(k):
+            fehler.append(k)
+            log.error(f"❌ Login [{k}] fehlgeschlagen!")
+        else:
+            pid = az_get(k, "person_id")
+            if pid:
+                log.info(f"   [{k}] PERSON_ID: {pid} ✅")
             else:
-                senden(f"❌ [{k}] Initial-Login fehlgeschlagen!")
-        except Exception as e:
-            log.exception(f"[{k}] Init: {e}")
+                log.warning(f"   [{k}] PERSON_ID: ⚠️ NICHT GEFUNDEN")
+                pid_warnungen.append(k)
 
-    accs_str = ", ".join(ACCOUNTS.keys())
-    senden(f"🎾 <b>Padel Bot v10.3.6 online</b>\n\n"
-           f"⚡ BLITZ-Modus aktiv:\n"
-           f"   • Pre-warm r1 bei T-10s\n"
-           f"   • r2+r3 parallel auf Court 1 & 2\n"
-           f"   • Multi-Shot ({MULTI_SHOT_COUNT} Bursts) bei Verfehlen\n"
-           f"   • Person-ID-Check (kein fremdes Schieben)\n"
-           f"   • Sync mit expected_slot\n\n"
-           f"🎯 SMART-SNIPER (NEU v10.3.6):\n"
-           f"   • Lauer nur in letzten {SNIPER_PRE_END_MINUTES} Min "
-                  f"vor fremder Endzeit\n"
-           f"   • Phase 2: Blitz auf Folge-Slot wenn kein Storno\n\n"
-           f"Accounts: {accs_str}\n\n"
-           f"Tippe /menu zum Starten.")
+    if len(fehler) == len(ACCOUNTS):
+        log.error("❌ Alle Accounts fehlgeschlagen – Bot beendet.")
+        exit(1)
+    elif fehler:
+        senden(f"⚠️ Login für {', '.join(fehler)} fehlgeschlagen!")
 
+    anzahl      = len(ACCOUNTS)
+    modus_label = "Dual-Account" if anzahl > 1 else "Einzel-Account"
+    startup_msg = (
+        f"🎾 <b>Padel Bot v10.0.0 gestartet!</b>\n\n"
+        f"{modus_label}  |  3 Schiebe-Modi  |  🎯 Sniper-Modus\n\n"
+        f"<b>NEU v10:</b>\n"
+        f"🔒 Buchung nur bestätigt wenn Server-Sync OK (kein False-Positiv)\n"
+        f"⚡ Rebook nach Storno: 30× mit 0.1s (statt langsamer Backoff)\n"
+        f"🛑 Stopp-Button bricht Storno-Retry sofort ab\n"
+        f"🎯 Sniper: hämmert sekündlich → Treffer → Schiebe bis Ziel\n\n"
+        f"<b>Sniper-Beispiel:</b>\n"
+        f"Fremder: Court 2 | 08:00–09:30\n"
+        f"→ Bot zielt: Court 2 | 09:00–10:30\n"
+        f"→ Hämmert sekündlich bis Treffer\n"
+        f"→ Danach: Schiebe bis Wunschzeit"
+    )
+
+    if pid_warnungen:
+        startup_msg += (f"\n\n⚠️ <b>Person-ID fehlt für: {', '.join(pid_warnungen)}</b>\n"
+                        f"Buchungen lösen beim ersten Versuch einen Neu-Login aus.")
+
+    senden(startup_msg)
+    zeige_account_auswahl()
+
+    threading.Thread(target=telegram_loop, daemon=True).start()
+
+    log.info("✅ Bot läuft. Strg+C zum Beenden.")
     try:
-        telegram_loop()
+        while True:
+            time.sleep(10)
     except KeyboardInterrupt:
-        log.info("Bot beendet (Ctrl+C)")
-        senden("⏹️ Padel Bot beendet")
+        log.info("Bot beendet.")
+        senden("⏹️ Padel Bot v10.0.0 wurde beendet.")
