@@ -97,7 +97,7 @@ R9) PHASE 3 IST STORNO → REBOOK, NIE UMGEKEHRT
  IDENTITÄTS- & SESSION-REGELN
 ═══════════════════════════════════════════════════════════════════════════
 
-R10) PERSON-ID-VERIFIKATION – MODUS-ABHÄNGIG (v10.3.5)
+R10) PERSON-ID-VERIFIKATION – MODUS-ABHÄNGIG (v10.3.6)
      /padel?currentDate=... liefert ALLE Reservierungen auf den Courts,
      auch fremde – jeweils mit personId-Feld. Verifikation verhindert dass
      fremde Buchungen als eigene gemeldet werden.
@@ -112,11 +112,11 @@ R10) PERSON-ID-VERIFIKATION – MODUS-ABHÄNGIG (v10.3.5)
        • Direkte Taktik Multi-Shot Bursts (5× parallel, ms-Bereich)
        • Sniper Phase 2 (Blitz bei Endzeit, übergibt an _aggressiv_buchen_ab)
 
-     SICHERHEITSNETZ NACH BURSTS (v10.3.5):
+     SICHERHEITSNETZ NACH BURSTS (v10.3.6):
      Nach Multi-Shot-Bursts läuft IMMER ein sync_buchung_vom_server(expected_slot=...)
      um false-positives zu erkennen. Treffer ohne my-bookings-Eintrag wird verworfen.
 
-R10a) NIEMALS "vertraue r3" bei verify_person_id=True (v10.3.5 Bugfix)
+R10a) NIEMALS "vertraue r3" bei verify_person_id=True (v10.3.6 Bugfix)
       Wenn personId-Feld leer ist ODER Verifikation in Exception läuft:
       MUSS (False, None) zurückgeben. Vorher: "vertraue r3" → False-Positive
       bei Max der nicht storniert hat aber Server HTTP 200 zurückgibt.
@@ -161,7 +161,7 @@ R17) PARALLELE THREADS NUTZEN GETEILTE SESSION
      Accounts. OK für 2 Threads à 2 Requests, aber NICHT auf 5+ Threads
      skalieren ohne Session-Klon oder Lock – Connection-Pool blockiert.
 
-R18) MULTI-SHOT NACH FREISCHALTUNG (v10.3.5)
+R18) MULTI-SHOT NACH FREISCHALTUNG (v10.3.6)
      Bei verfehltem ersten Burst: bis zu MULTI_SHOT_COUNT weitere Bursts
      mit jeweils frischen Executions. Bursts mit MULTI_SHOT_GAP_MS
      Pause zwischen sich (Connection-Pool entlasten).
@@ -171,7 +171,7 @@ R18) MULTI-SHOT NACH FREISCHALTUNG (v10.3.5)
  SMART-SNIPER-REGELN
 ═══════════════════════════════════════════════════════════════════════════
 
-R20) SNIPER LAUER-FENSTER = LETZTE 30 MIN VOR FREMDER ENDZEIT (v10.3.5)
+R20) SNIPER LAUER-FENSTER = LETZTE 30 MIN VOR FREMDER ENDZEIT (v10.3.6)
      Beobachtung: Menschen die schieben (Storno + Rebook), tun das
      fast immer in den letzten 30 Min ihrer Buchung. Davor lauern ist
      Verschwendung.
@@ -203,6 +203,18 @@ R22) SNIPER-TIMEOUT IST DEADLINE = FREMDE ENDZEIT + BLITZ-BUDGET
      SNIPER_TIMEOUT (1200s = 20 min) bleibt als Hard-Cap erhalten falls
      User außerhalb Lauer-Fenster manuell startet.
 
+R23) SNIPER PHASE 2 BLITZ – NUR EIN COURT (v10.3.6)
+     Wenn Sniper auf Max' Court (z.B. Court 2) lauert und Max nicht
+     storniert, blitzt Phase 2 NUR auf Max' Court – NICHT parallel auf
+     Court 1. Begründung: Court 1 könnte noch fremde Buchung haben die
+     den parallelen Thread ausbremst (Server muss Konflikt prüfen →
+     blockiert Connection-Pool).
+
+     Phase 2 ruft _aggressiv_buchen_ab(..., nur_ein_court=True) auf.
+
+     Direkte Taktik (im Schiebe-Menü) ruft OHNE nur_ein_court auf
+     → bleibt parallel auf beide Courts (kein fremder Konflikt).
+
 ═══════════════════════════════════════════════════════════════════════════
  ZEITZONE
 ═══════════════════════════════════════════════════════════════════════════
@@ -226,7 +238,7 @@ R19) IMMER jetzt_lokal() VERWENDEN
   ❌ Phase 1 Sniper auf falschem Slot (muss = fromTime fremde, nicht fromTime+dauer) (R21)
 
 ═══════════════════════════════════════════════════════════════════════════
- Padel Bot v10.3.5
+ Padel Bot v10.3.6
 ═══════════════════════════════════════════════════════════════════════════
 
 ÄNDERUNGEN gegenüber v10.2.0:
@@ -389,10 +401,10 @@ ANLAGE_SCHLUSS      = "22:00"
 SCHIEBE_MINUTEN_VOR_MIN = 5
 SCHIEBE_MINUTEN_VOR_MAX = 20
 LOGIN_CHECK_COOLDOWN    = 30
-AGGRESSIVE_TIMEOUT      = 60    # v10.3.5: 60s statt 300s (Slot ist eh in Sek. weg)
+AGGRESSIVE_TIMEOUT      = 60    # v10.3.6: 60s statt 300s (Slot ist eh in Sek. weg)
 SNIPER_TIMEOUT          = 1200  # 20 min – Sniper darf lauern auf fremde Stornos
 
-# v10.3.5 NEU – Smart-Sniper-Konfiguration (siehe R20)
+# v10.3.6 NEU – Smart-Sniper-Konfiguration (siehe R20)
 SNIPER_PRE_END_MINUTES = 30     # Lauer-Fenster = letzte 30 Min vor fremder Endzeit
 SNIPER_LOGIN_BUFFER    = 5      # Login-Refresh X Min vor Lauer-Start
 AGGRESSIVE_INTERVAL     = 0.05  # v10.3: schnellere Retry-Frequenz (war 0.1)
@@ -402,7 +414,7 @@ FRUEH_EXKLUSIV_VERSUCHE = 8
 BLITZ_PREWARM_SECONDS = 10      # Wie viele Sek. vor Zielzeit r1 gefeuert wird
 BLITZ_FIRE_OFFSET_MS  = 0       # ms vor/nach Zielzeit zum Feuern (0 = exakt)
 
-# v10.3.5 NEU – Multi-Shot-Konfiguration (siehe R18)
+# v10.3.6 NEU – Multi-Shot-Konfiguration (siehe R18)
 MULTI_SHOT_COUNT  = 5           # Anzahl Bursts (1=alt-Verhalten, 5=Standard)
 MULTI_SHOT_GAP_MS = 50          # Pause zwischen Bursts in ms (Connection-Pool)
 
@@ -1354,7 +1366,7 @@ def buche_slot_blitz(k: str, slot: dict,
                                         f"Jemand war schneller!")
                             return (False, None)
                         if not res_pid:
-                            # v10.3.5 FIX: personId-Feld leer → KEIN Treffer melden!
+                            # v10.3.6 FIX: personId-Feld leer → KEIN Treffer melden!
                             # Vorher: "vertraue r3" → False-Positive-Bug
                             log.warning(f"❌ [{k}] Blitz Court {court}: Slot in Reservierungen "
                                         f"aber personId leer – kein eindeutiger Treffer")
@@ -1369,7 +1381,7 @@ def buche_slot_blitz(k: str, slot: dict,
                                 f"in Reservierungen – möglicher false positive")
                     return (False, None)
             except Exception as ve:
-                # v10.3.5 FIX: Bei Exception NICHT mehr "vertraue r3" → kein Treffer melden
+                # v10.3.6 FIX: Bei Exception NICHT mehr "vertraue r3" → kein Treffer melden
                 log.warning(f"❌ [{k}] Blitz-Verifikation Exception: {ve} – kein Treffer")
                 return (False, None)
 
@@ -1441,7 +1453,7 @@ def sync_buchung_vom_server(k: str, expected_slot: dict = None,
     """
     Holt die aktuelle Buchung vom Server. Setzt aktive_buchung.
 
-    v10.3.5: Wieder v11.0-Logik mit 401-Retry und Paginierung.
+    v10.3.6: Wieder v11.0-Logik mit 401-Retry und Paginierung.
     Optional: expected_slot filtert auf exakten Match (nur für Blitz).
 
     Returns: True wenn Buchung gefunden, False sonst.
@@ -1689,7 +1701,8 @@ def _aggressiv_buchen_07(k: str, datum_de: str, datum_api: str,
 def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str,
                           dauer_min: int, ab_dt: datetime,
                           bis_dt: datetime = None,
-                          bevorzugter_court: int = 0) -> bool:
+                          bevorzugter_court: int = 0,
+                          nur_ein_court: bool = False) -> bool:
     """
     v10.3 BLITZ: Bucht ab gegebener Zeit – mit Pre-warm + parallelen Courts.
 
@@ -1703,6 +1716,10 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str,
       6. 0 Treffer → serielles Fallback-Hämmern (max AGGRESSIVE_TIMEOUT)
 
     ab_dt enthält das volle datetime (Datum + Uhrzeit ab wann buchbar).
+
+    v10.3.6: nur_ein_court=True → NUR der bevorzugte Court wird angefasst,
+    kein paralleles Feuern. Verhindert dass eine fremde Buchung auf dem
+    anderen Court die Session blockiert (Sniper Phase 2 Use-Case).
     """
     # Berechne das Ziel-Datetime (volles datum + ab_dt time)
     jetzt = jetzt_lokal()
@@ -1726,8 +1743,12 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str,
     from_t = target_from.strftime("%H:%M")
     to_t   = target_to_dt.strftime("%H:%M")
 
-    # Court-Reihenfolge (bevorzugt zuerst)
-    if bevorzugter_court == 1:
+    # Court-Reihenfolge
+    if nur_ein_court and bevorzugter_court in (1, 2):
+        # v10.3.6: Sniper-Modus → nur EIN Court, kein paralleles Feuern
+        courts_order = [bevorzugter_court]
+        log.info(f"[{k}] Blitz NUR-EIN-COURT-Modus: Court {bevorzugter_court}")
+    elif bevorzugter_court == 1:
         courts_order = [1, 2]
     else:
         courts_order = [2, 1]
@@ -1744,13 +1765,10 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str,
 
     # ─────────────── Pre-Check (one-per-account) ───────────────
     try:
-        if sync_buchung_vom_server(k, expected_slot=slots[courts_order[0]]):
-            log.info(f"✅ [{k}] Slot bereits gebucht – nichts zu tun")
-            return True
-        # Auch den zweiten Court probieren
-        if sync_buchung_vom_server(k, expected_slot=slots[courts_order[1]]):
-            log.info(f"✅ [{k}] Slot (Court {courts_order[1]}) bereits gebucht")
-            return True
+        for cc in courts_order:
+            if sync_buchung_vom_server(k, expected_slot=slots[cc]):
+                log.info(f"✅ [{k}] Slot (Court {cc}) bereits gebucht – nichts zu tun")
+                return True
     except Exception:
         pass
 
@@ -1762,7 +1780,7 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str,
     senden(f"⚡ [{k}] BLITZ-Buchung: {datum_de} {from_t}–{to_t}\n"
            f"   Pre-warm @ {prewarm_dt.strftime('%H:%M:%S')}\n"
            f"   Feuer @ {buchbar_dt.strftime('%H:%M:%S')}\n"
-           f"   v10.3.5: Pre-warm + Parallel + Multi-Shot")
+           f"   v10.3.6: Pre-warm + Parallel + Multi-Shot")
 
     while jetzt_lokal() < prewarm_dt:
         if not az_get(k, "schiebe_aktiv") and not az_get(k, "sniper_aktiv"):
@@ -1803,7 +1821,7 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str,
         else:
             break
 
-    # ─────────────── Phase 4: MULTI-SHOT FEUER (v10.3.5, R18) ───────────────
+    # ─────────────── Phase 4: MULTI-SHOT FEUER (v10.3.6, R18) ───────────────
     log.info(f"🔥 [{k}] BLITZ MULTI-SHOT START bei "
              f"{jetzt_lokal().strftime('%H:%M:%S.%f')[:-3]} "
              f"({MULTI_SHOT_COUNT} Bursts)")
@@ -1817,7 +1835,7 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str,
 
         def _do_blitz(court):
             pw_ex, pw_csrf = pw_per_court.get(court, (None, None))
-            # v10.3.5: Bei Blitz verify_person_id=False für maximale Speed.
+            # v10.3.6: Bei Blitz verify_person_id=False für maximale Speed.
             # Verifikation passiert NACH allen Bursts via sync_buchung_vom_server.
             ok, info = buche_slot_blitz(k, slots[court],
                                          prewarm_exec=pw_ex,
@@ -1864,7 +1882,7 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str,
             time.sleep(MULTI_SHOT_GAP_MS / 1000.0)
 
     # ─────────────── Phase 5: Auswertung mit Sync-Verifikation ───────────────
-    # v10.3.5: Da Bursts mit verify=False liefen (für Speed), MÜSSEN wir
+    # v10.3.6: Da Bursts mit verify=False liefen (für Speed), MÜSSEN wir
     # jetzt via Sync prüfen ob die Buchung wirklich uns gehört.
     if treffer:
         # Kurz warten damit Server-State konsistent ist
@@ -1970,7 +1988,7 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
     """
     Phase 3: Schrittweise schieben bis Zielzeit.
 
-    Logik aus v11.0 übernommen (v10.3.5):
+    Logik aus v11.0 übernommen (v10.3.6):
       - schiebe_moment basiert auf ende_dt - random_offset (5-20 Min)
         → KRITISCH: combine mit jetzt.date(), nicht datum_obj.date()! (R7)
       - Detaillierte Telegram-Updates vor jeder Wartephase und Aktion
@@ -2178,7 +2196,7 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
 
 
 # ══════════════════════════════════════════════
-# SCHIEBE-INTERNAL – v10.3.5 (Blitz-Start beibehalten)
+# SCHIEBE-INTERNAL – v10.3.6 (Blitz-Start beibehalten)
 # ══════════════════════════════════════════════
 
 def _schiebe_intern(k: str):
@@ -2470,7 +2488,7 @@ def _schiebe_intern(k: str):
 
 def _sniper_intern(k: str):
     """
-    Sniper-Modus v10.3.5: SMART-LAUER.
+    Sniper-Modus v10.3.6: SMART-LAUER.
 
     Wartet bis zum letzten 30-Min-Fenster vor der fremden Endzeit
     und hämmert dann gezielt auf den freiwerdenden Slot. Falls
@@ -2568,7 +2586,7 @@ def _sniper_intern(k: str):
     }
 
     # ─── User informieren ───
-    senden(f"🎯 [{k}] SMART-SNIPER aktiv (v10.3.5)\n"
+    senden(f"🎯 [{k}] SMART-SNIPER aktiv (v10.3.6)\n"
            f"   📅 {_datum_mit_tag(datum_de)} Court {court}\n"
            f"   🎯 Fremde Endzeit: {fremder_bis}\n"
            f"   💤 Schlaf bis {login_dt.strftime('%H:%M')} (Login)\n"
@@ -2716,11 +2734,10 @@ def _sniper_intern(k: str):
            f"{phase2_from}–{phase2_to}")
 
     # Übergabe an _aggressiv_buchen_ab mit fremder Endzeit als ab_dt
-    # (das ist genau JETZT, also passt auch wenn wir leicht drüber sind)
-    # _aggressiv_buchen_ab handhabt: Pre-warm + parallele Courts + Multi-Shot + Fallback
-    # Bei Court "Egal" (0) → beide Courts; sonst nur gewählter
+    # v10.3.6: nur_ein_court=True → blockt nicht durch fremde Buchung auf
+    # dem anderen Court (Court 1 evtl. noch belegt während wir auf Court 2 zielen)
     erfolg = _aggressiv_buchen_ab(k, datum_de, datum_api, dauer,
-                                   blitz_dt, None, court)
+                                   blitz_dt, None, court, nur_ein_court=True)
 
     if erfolg:
         # Sniper-spezifisches Schiebe-Ziel ggf. anwenden
@@ -3126,7 +3143,7 @@ def telegram_loop():
 
 if __name__ == "__main__":
     log.info("═" * 60)
-    log.info("🎾 Padel Bot v10.3.5 startet…")
+    log.info("🎾 Padel Bot v10.3.6 startet…")
     log.info("   ⚡ BLITZ-Modus: Pre-warm + Parallel-Courts + Multi-Shot")
     log.info("   🎯 SMART-SNIPER: Lauer letzte 30 Min vor fremder Endzeit")
     log.info("   🔍 Person-ID-Verifikation aktiv")
@@ -3145,14 +3162,14 @@ if __name__ == "__main__":
             log.exception(f"[{k}] Init: {e}")
 
     accs_str = ", ".join(ACCOUNTS.keys())
-    senden(f"🎾 <b>Padel Bot v10.3.5 online</b>\n\n"
+    senden(f"🎾 <b>Padel Bot v10.3.6 online</b>\n\n"
            f"⚡ BLITZ-Modus aktiv:\n"
            f"   • Pre-warm r1 bei T-10s\n"
            f"   • r2+r3 parallel auf Court 1 & 2\n"
            f"   • Multi-Shot ({MULTI_SHOT_COUNT} Bursts) bei Verfehlen\n"
            f"   • Person-ID-Check (kein fremdes Schieben)\n"
            f"   • Sync mit expected_slot\n\n"
-           f"🎯 SMART-SNIPER (NEU v10.3.5):\n"
+           f"🎯 SMART-SNIPER (NEU v10.3.6):\n"
            f"   • Lauer nur in letzten {SNIPER_PRE_END_MINUTES} Min "
                   f"vor fremder Endzeit\n"
            f"   • Phase 2: Blitz auf Folge-Slot wenn kein Storno\n\n"
