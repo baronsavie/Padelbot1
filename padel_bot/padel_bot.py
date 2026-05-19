@@ -156,7 +156,6 @@ FRUEH_EXKLUSIV_VERSUCHE = 8
 SNIPER_PRE_END_MINUTES = 30      # Lauer-Fenster: letzte 30 Min vor fremder Endzeit
 SNIPER_LOGIN_BUFFER    = 5       # Min vor Lauer-Start: Refresh-Login
 SNIPER_PHASE1_INTERVAL = 0.1     # s: Hammer-Intervall in Phase 1 (Lauern)
-SNIPER_TIMEOUT         = 1200    # s: Hard-Cap falls außerhalb Lauer-Fenster gestartet
 SNIPER_DEADLINE_BUFFER = 60      # s: Abbruch X Sek nach fremder Endzeit
 
 # Direkt-Blitz
@@ -347,7 +346,8 @@ def account_status_label(k: str) -> str:
     if aktiv:
         datum_str = _datum_mit_tag(aktiv.get("datum_de", "?"))
         return (f"🔴 {k} – {datum_str} "
-                f"{aktiv.get('fromTime','?')}–{aktiv.get('toTime','?')}")
+                f"{aktiv.get('fromTime','?')}–{aktiv.get('toTime','?')} "
+                f"C{aktiv.get('court','?')}")
     elif schiebe:
         datum_str = _datum_mit_tag(snap["schiebe_datum"] or "?")
         return f"🟡 {k} – Schiebe {datum_str}"
@@ -355,6 +355,33 @@ def account_status_label(k: str) -> str:
         datum_str = _datum_mit_tag(snap["sniper_datum"] or "?")
         return f"🔵 {k} – Sniper {datum_str}"
     return f"✅ {k} – frei"
+
+def _account_sort_key(k: str):
+    """Sortierung der Account-Liste: Buchungen/Schiebe/Sniper aufsteigend
+    nach Datum (und Uhrzeit), freie Accounts danach."""
+    snap  = az_snap(k, "aktive_buchung", "schiebe_aktiv", "schiebe_datum",
+                    "sniper_aktiv", "sniper_datum")
+    aktiv = snap["aktive_buchung"]
+    if aktiv:
+        try:
+            d = datetime.strptime(aktiv.get("datum_de", ""), "%d.%m.%Y").date()
+            t = datetime.strptime(aktiv.get("fromTime", "00:00"), "%H:%M").time()
+            return (0, datetime.combine(d, t), k)
+        except Exception:
+            return (0, datetime.max, k)
+    if snap["schiebe_aktiv"] and snap["schiebe_datum"]:
+        try:
+            d = datetime.strptime(snap["schiebe_datum"], "%d.%m.%Y").date()
+            return (0, datetime.combine(d, datetime.min.time()), k)
+        except Exception:
+            return (0, datetime.max, k)
+    if snap["sniper_aktiv"] and snap["sniper_datum"]:
+        try:
+            d = datetime.strptime(snap["sniper_datum"], "%d.%m.%Y").date()
+            return (0, datetime.combine(d, datetime.min.time()), k)
+        except Exception:
+            return (0, datetime.max, k)
+    return (1, datetime.max, k)
 
 def zeige_account_auswahl():
     set_flow_account(None)
@@ -366,13 +393,14 @@ def zeige_account_auswahl():
 
     anzahl     = len(ACCOUNTS)
     modus_label = "Dual-Account" if anzahl > 1 else "Einzel-Account"
+    sorted_accounts = sorted(ACCOUNTS, key=_account_sort_key)
     buttons = []
-    for k in ACCOUNTS:
+    for k in sorted_accounts:
         buttons.append([{"text": account_status_label(k), "callback_data": f"acc_{k}"}])
     buttons.append([{"text": "🔄 Aktualisieren", "callback_data": "refresh_accounts"}])
 
     status_zeilen = ""
-    for k in ACCOUNTS:
+    for k in sorted_accounts:
         label = account_status_label(k)
         aktiv = az_get(k, "aktive_buchung")
         if aktiv:
@@ -1949,7 +1977,8 @@ def _sniper_intern(k: str):
       - SPEED-Modus + Sicherheitsnetz via verifiziere_slot_via_my_bookings (R10).
 
     Deadline (R22): fremder_bis + SNIPER_DEADLINE_BUFFER (60s nach fremder Endzeit).
-    Hard-Cap: SNIPER_TIMEOUT (1200s) ab Sniper-Start (falls außerhalb Lauer-Fenster).
+    Tag der Hammer-/Blitz-Phase: sniper_datum − 7 Tage (7-Tage-Regel). Bei näherem
+    Ziel fällt der Unlock-Tag auf heute oder davor → läuft ab heute.
 
     Beispiel: Fremder Court 2, 17:00–18:30, Ziel 20:00 Uhr, Dauer 90 Min
       → Lauer-Start  : 18:00
@@ -1967,11 +1996,13 @@ def _sniper_intern(k: str):
     datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
     datum_api = datum_obj.strftime("%m/%d/%Y")
 
+    # 7-Tage-Regel: Unlock-Tag = Buchungs-Tag − 7. Bei knapperem Zielzeitraum
+    # (Slot bereits vor heute freigeschaltet) hämmert der Sniper ab heute auf
+    # fremde Stornierung — Phase 2 läuft dann ins Leere, ist aber unschädlich.
     jetzt = jetzt_lokal()
     fremder_bis_time = datetime.strptime(fremder_bis, "%H:%M").time()
-    fremder_bis_dt   = datetime.combine(jetzt.date(), fremder_bis_time)
-    # Falls fremder_bis schon heute vorbei: vermutlich für morgen gemeint – nicht behandelt,
-    # User muss Datum/Endzeit korrekt setzen (Sniper macht nur Sinn am Slot-Tag).
+    unlock_day = max((datum_obj - timedelta(days=7)).date(), jetzt.date())
+    fremder_bis_dt = datetime.combine(unlock_day, fremder_bis_time)
 
     lauer_start_dt   = fremder_bis_dt - timedelta(minutes=SNIPER_PRE_END_MINUTES)
     login_refresh_dt = lauer_start_dt - timedelta(minutes=SNIPER_LOGIN_BUFFER)
@@ -1992,22 +2023,20 @@ def _sniper_intern(k: str):
     p1_slot = _baue_slot_dict(court, p1_von, p1_bis, datum_de, datum_api, dauer_min)
     p2_slot = _baue_slot_dict(court, p2_von, p2_bis, datum_de, datum_api, dauer_min)
 
+    tag_hinweis = "" if unlock_day == jetzt.date() else f" am {unlock_day.strftime('%d.%m.')}"
     senden(f"🎯 <b>[{k}] Smart-Sniper aktiv!</b>\n"
            f"📅 {_datum_mit_tag(datum_de)}\n"
-           f"🏟️ Court {court} | Fremde endet: {fremder_bis} Uhr\n"
-           f"💤 Schlafe bis {login_refresh_dt.strftime('%H:%M')} "
+           f"🏟️ Court {court} | Fremde endet: {fremder_bis} Uhr{tag_hinweis}\n"
+           f"💤 Schlafe bis {login_refresh_dt.strftime('%H:%M')}{tag_hinweis} "
            f"(Login {SNIPER_LOGIN_BUFFER}min vor Lauer-Start)\n"
            f"👀 Phase 1 Lauern: {lauer_start_dt.strftime('%H:%M')}–{fremder_bis} "
            f"auf {p1_von}–{p1_bis}\n"
            f"⚡ Phase 2 Blitz : ab {fremder_bis} auf {p2_von}–{p2_bis}\n"
-           f"⏱️ Deadline       : {deadline_dt.strftime('%H:%M:%S')}\n"
+           f"⏱️ Deadline       : {deadline_dt.strftime('%H:%M:%S')}{tag_hinweis}\n"
            f"🔄 Nach Treffer → Schiebe bis {ziel_str} Uhr")
 
-    start_zeit = time.time()
-    hard_cap   = start_zeit + SNIPER_TIMEOUT
-
     def aktiv() -> bool:
-        return az_get(k, "sniper_aktiv") and time.time() < hard_cap
+        return az_get(k, "sniper_aktiv")
 
     def schlafe_bis(ziel_dt: datetime) -> bool:
         """Schläft in Chunks bis ziel_dt. Liefert False wenn abgebrochen."""
