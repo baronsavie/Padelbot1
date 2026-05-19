@@ -2095,11 +2095,18 @@ def _sniper_intern(k: str):
             return
 
     # ── Phase 1: Lauern (STRIKT) ────────────────────────────────────────────
-    senden(f"👀 [{k}] Phase 1 LAUERN auf {p1_von}–{p1_bis} Court {court} "
-           f"(alle {int(SNIPER_PHASE1_INTERVAL*1000)}ms)")
+    # Phase 1 stoppt bei prewarm_dt (= fremder_bis − BLITZ_PREWARM_SECONDS),
+    # damit Phase 2 in Ruhe pre-warmen und ms-präzise auf fremder_bis blitzen kann.
+    prewarm_dt = fremder_bis_dt - timedelta(seconds=BLITZ_PREWARM_SECONDS)
+    # Ein buche_slot-Versuch dauert ~3s (r1+r2+r3 + 1s Verify-Sleep). Bei knapper
+    # Restzeit lieber sauber stoppen, statt in den Pre-Warm-Bereich reinzulaufen.
+    MIN_REST_FOR_BUCHE = 3.5
+
+    senden(f"👀 [{k}] Phase 1 LAUERN auf {p1_von}–{p1_bis} Court {court}\n"
+           f"   Hammer bis {prewarm_dt.strftime('%H:%M:%S')}, dann Blitz-Vorbereitung")
     versuche      = 0
     letzter_login = time.time()
-    while aktiv() and jetzt_lokal() < fremder_bis_dt:
+    while aktiv() and jetzt_lokal() < prewarm_dt:
         # Session-Refresh alle 60s
         if versuche > 0 and time.time() - letzter_login > 60:
             if not ist_eingeloggt(k):
@@ -2109,6 +2116,10 @@ def _sniper_intern(k: str):
                     zeige_account_menue(k)
                     return
             letzter_login = time.time()
+
+        # Kein neuer Versuch, wenn er in den Pre-Warm-Bereich hineinlaufen würde.
+        if (prewarm_dt - jetzt_lokal()).total_seconds() < MIN_REST_FOR_BUCHE:
+            break
 
         if buche_slot(k, p1_slot, verify_person_id=True):
             treffer = az_get(k, "aktive_buchung")
@@ -2125,31 +2136,42 @@ def _sniper_intern(k: str):
         zeige_account_menue(k)
         return
 
-    # ── Phase 2: Blitz auf direkt anschließenden Slot (R23: ein Court) ──────
-    senden(f"⚡ [{k}] Phase 2 BLITZ ab {fremder_bis} auf {p2_von}–{p2_bis} "
-           f"Court {court} (Multi-Shot)")
+    # ── Phase 2: Pre-Warm bei T-10s, Burst exakt bei T-0 (ms-Präzision) ────
+    def warte_bis_genau(ziel_dt: datetime):
+        """Präzises Warten bis ziel_dt. Letzte 200ms busy-loop für ms-Genauigkeit."""
+        while True:
+            rest = (ziel_dt - jetzt_lokal()).total_seconds()
+            if rest <= 0:
+                return
+            if rest > 0.5:
+                time.sleep(rest - 0.2)
+            else:
+                while (ziel_dt - jetzt_lokal()).total_seconds() > 0:
+                    pass
+                return
+
+    senden(f"⚡ [{k}] Phase 2 Blitz-Vorbereitung auf {p2_von}–{p2_bis} Court {court}\n"
+           f"   Pre-Warm jetzt → Burst exakt um {fremder_bis_dt.strftime('%H:%M:%S')}")
     p2_versuche = 0
+
+    # Pre-Warm sofort (T-~10s). Cached execution-Token vor dem Burst-Zeitpunkt.
     execution = pre_warm_r1(k, court, datum_api, p2_von, p2_bis)
     if execution:
         log.info(f"⚡ [{k}] Sniper P2 Pre-Warm OK → {execution}")
+    else:
+        log.warning(f"[{k}] Sniper P2 Pre-Warm fehlgeschlagen – Burst-Schleife holt nach.")
 
-    # Warte präzise bis fremder_bis_dt (= buchbar_dt für p2_slot)
-    while aktiv():
-        rest = (fremder_bis_dt - jetzt_lokal()).total_seconds()
-        if rest <= 0:
-            break
-        if rest > 0.5:
-            time.sleep(rest - 0.2)
-        else:
-            while (fremder_bis_dt - jetzt_lokal()).total_seconds() > 0:
-                pass
-            break
+    # Präzise warten bis fremder_bis_dt (= buchbar_dt für p2_slot)
+    warte_bis_genau(fremder_bis_dt)
 
+    # Burst-Wellen: T+0, T+gap, T+2*gap, …
     for burst in range(MULTI_SHOT_COUNT + 1):
         if not aktiv() or jetzt_lokal() > deadline_dt:
             break
-        if burst > 0:
-            time.sleep(MULTI_SHOT_GAP_MS / 1000.0)
+        fire_dt = fremder_bis_dt + timedelta(milliseconds=BLITZ_FIRE_OFFSET_MS
+                                                          + burst * MULTI_SHOT_GAP_MS)
+        warte_bis_genau(fire_dt)
+
         if not execution:
             execution = pre_warm_r1(k, court, datum_api, p2_von, p2_bis)
             if not execution:
@@ -2168,6 +2190,7 @@ def _sniper_intern(k: str):
                 return
             else:
                 log.warning(f"[{k}] Sniper P2 Burst r3 OK aber nicht in my-bookings.")
+        # Verbrauchten Token sofort erneuern für die nächste Welle.
         execution = pre_warm_r1(k, court, datum_api, p2_von, p2_bis)
 
     senden(f"❌ [{k}] Sniper-Deadline erreicht. Fremder hat nicht storniert und "
