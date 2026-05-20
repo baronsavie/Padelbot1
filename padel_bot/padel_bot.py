@@ -163,6 +163,7 @@ BLITZ_PREWARM_SECONDS  = 10      # s: Pre-Warm r1 bei T-10s, Token cachen
 BLITZ_FIRE_OFFSET_MS   = 0       # ms: Feuer-Offset relativ buchbar_dt (nie negativ!)
 MULTI_SHOT_COUNT       = 5       # Anzahl Burst-Wellen nach erstem Miss
 MULTI_SHOT_GAP_MS      = 150     # ms: Pause zwischen Bursts
+PHASE1_HANDOFF_MARGIN  = 180     # s: Direkt-Modus wacht so viel vor Freischaltung auf (Phase 2 macht Login+Pre-Warm+Blitz)
 
 # ─────────────────────────────────────────────
 # KONSTANTEN
@@ -1713,14 +1714,23 @@ def _schiebe_intern(k: str):
 
     # ── Phase 1: Warten auf 7-Tage-Fenster ───────────────────────────────────
     if modus in ("frueh", "direkt"):
+        fenster_tag = (datum_obj - timedelta(days=7)).date()
+        if modus == "direkt" and buchbar_ab:
+            # Echte Freischaltung: 7×24h vor dem Slot, zur gewählten Buchungszeit.
+            unlock_dt = datetime.combine(fenster_tag,
+                                         datetime.strptime(buchbar_ab, "%H:%M").time())
+            # Kurz davor aufwachen – Phase 2 macht Login + Pre-Warm + präzisen Blitz.
+            ziel_wach = unlock_dt - timedelta(seconds=PHASE1_HANDOFF_MARGIN)
+        else:
+            # Früh-Methode: fix auf 07:00 (der 07:00-Slot wird dann freigeschaltet).
+            unlock_dt = datetime.combine(fenster_tag,
+                                         datetime.strptime("07:00", "%H:%M").time())
+            ziel_wach = unlock_dt
         while aktiv():
-            jetzt   = jetzt_lokal()
-            fenster = datetime.combine(
-                (datum_obj - timedelta(days=7)).date(),
-                datetime.strptime("07:00", "%H:%M").time())
-            if jetzt >= fenster:
+            jetzt = jetzt_lokal()
+            if jetzt >= ziel_wach:
                 break
-            sek_bis = (fenster - jetzt).total_seconds()
+            sek_bis = (unlock_dt - jetzt).total_seconds()   # Countdown zur echten Freischaltung
 
             tage_r_w = int(sek_bis // 86400)
             std_r_w  = int((sek_bis % 86400) // 3600)
@@ -1734,15 +1744,16 @@ def _schiebe_intern(k: str):
 
             senden(f"⏳ <b>[{k}] Wartet auf 7-Tage-Fenster</b>\n"
                    f"📅 {datum_de}\n"
-                   f"🔓 Buchbar ab: {fenster.strftime('%d.%m.%Y um 07:00 Uhr')}\n"
+                   f"🔓 Buchbar ab: {unlock_dt.strftime('%d.%m.%Y um %H:%M Uhr')}\n"
                    f"⏱️ Noch {warte_str_w}")
 
-            schlaf = min(sek_bis - 30, 23 * 3600)
+            sek_bis_wach = (ziel_wach - jetzt).total_seconds()
+            schlaf = min(sek_bis_wach - 30, 23 * 3600)
             if schlaf > 1:
                 if not schlafe(schlaf):
                     return
             else:
-                if not schlafe(max(0, sek_bis)):
+                if not schlafe(max(0, sek_bis_wach)):
                     return
                 break
 
@@ -2228,18 +2239,24 @@ def handle_text(k: str, text: str):
     datum_obj = datetime.strptime(datum, "%d.%m.%Y")
     tage_bis  = (datum_obj.date() - jetzt_lokal().date()).days
     jetzt     = jetzt_lokal()
-    buchbar_dt = datetime.combine(jetzt.date(), datetime.strptime(buchbar_ab, "%H:%M").time())
-    min_bis   = int((buchbar_dt - jetzt).total_seconds() / 60) if buchbar_dt > jetzt else 0
+    # Echte Freischaltung: 7×24h vor dem Slot, zur gewählten Buchungszeit.
+    unlock_dt = datetime.combine((datum_obj - timedelta(days=7)).date(),
+                                 datetime.strptime(buchbar_ab, "%H:%M").time())
+    if unlock_dt <= jetzt:
+        frei_txt = "🚀 Slot bereits freigeschaltet – Blitz startet sofort!"
+    else:
+        rest = unlock_dt - jetzt
+        h = rest.seconds // 3600
+        m = (rest.seconds % 3600) // 60
+        rest_str = (f"{rest.days}T {h}h {m}min" if rest.days > 0
+                    else f"{h}h {m}min" if h > 0 else f"{m}min")
+        frei_txt = f"⏳ Freischaltung in {rest_str}"
 
     senden(f"🎯 <b>[{k}] Direkte Taktik konfiguriert!</b>\n"
-           f"📅 {datum}\n"
-           f"⏰ Buchbar ab heute: {buchbar_ab} Uhr "
-           f"{'(in ' + str(min_bis) + ' Min)' if min_bis > 0 else '(sofort)'}\n"
-           f"🎯 Ziel: {ziel} Uhr ({dauer} Min)\n"
-           f"📆 Datum in {tage_bis} Tagen\n\n"
-           + (f"⏳ Warte noch {tage_bis-7} Tag(e) bis 7-Tage-Fenster, "
-              f"dann auf {buchbar_ab} Uhr..." if tage_bis > 7
-              else f"🚀 Warte auf {buchbar_ab} Uhr heute..."))
+           f"📅 {datum} (in {tage_bis} Tagen)\n"
+           f"🔓 Buchbar ab: {unlock_dt.strftime('%d.%m.%Y um %H:%M Uhr')}\n"
+           f"🎯 Schiebe-Ziel: {ziel} Uhr ({dauer} Min)\n"
+           f"{frei_txt}")
 
     t = threading.Thread(target=schiebe_loop, args=(k,), daemon=True)
     t.start()
