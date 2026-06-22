@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Padel Bot v11.0.0
+"""Padel Bot v11.0.1
+
+FIX v11.0.1: Duo-Schiebe-Rebook nagelt den Court jetzt FEST (kein Alternieren
+        auf den Partner-Court). Vorher konnte ein Duo-Account beim Schieben den
+        Court des Partners anvisieren → gegenseitiges Platz-Klauen / vergeudete
+        STRIKT-Verifikationsversuche, bis einer "nur storniert, nicht neugebucht"
+        hatte. Jeder Duo-Schiebevorgang läuft nun 1:1 wie ein einzelner auf festem
+        Court. Zusätzlich Duo-Sicherheitsnetz: bei verzögerter Verifikation wird
+        per my-bookings geprüft, ob doch gebucht wurde, bevor aufgegeben wird.
+        (Einzel-/Normal-Schiebe unverändert – Alternieren bleibt dort als Fallback.)
 
 ÄNDERUNGEN gegenüber v10.0.0:
 
@@ -293,6 +302,7 @@ def neuer_account_zustand(kuerzel: str) -> dict:
         # Duo-Modus: optionales Schiebe-Offset-Band (None = normaler 5–20-Min-Random)
         "schiebe_offset_min": None,
         "schiebe_offset_max": None,
+        "duo_court":          None,   # None = kein Duo; 1/2 = fester Court im Duo (kein Alternieren)
         # Sniper
         "sniper_aktiv":       False,
         "sniper_datum":       None,
@@ -1719,18 +1729,41 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
 
         gerade_court  = aktive_b["court"]
         anderer_court = 1 if gerade_court == 2 else 2
+        # Duo-Modus: FESTER Court – NICHT auf den Partner-Court alternieren.
+        # Im Einzelmodus ist der "andere" Court ein nützlicher Fallback; im Duo
+        # gehört er dem Partner-Account → Alternieren würde sich gegenseitig die
+        # Plätze klauen bzw. Versuche (je 1–2,5s STRIKT-Verifikation) verschwenden,
+        # bis ein Account gar keinen Court mehr bekommt ("nur storniert").
+        # So verhält sich jeder Duo-Schiebevorgang 1:1 wie ein einzelner auf festem Court.
+        duo_court = az_get(k, "duo_court")
 
         ok = False
         for versuch in range(30):
             if not aktiv():
                 return
-            court_v = gerade_court if versuch % 2 == 0 else anderer_court
+            if duo_court in (1, 2):
+                court_v = duo_court
+            else:
+                court_v = gerade_court if versuch % 2 == 0 else anderer_court
             slot_v  = _baue_slot_dict(court_v, naechster_von, naechster_bis,
                                       datum_de, datum_api, dauer_min)
             if buche_slot(k, slot_v):
                 ok = True
                 break
             time.sleep(0.1 if versuch < 15 else 0.5)
+
+        # Duo-Sicherheitsnetz: r3 kann serverseitig gebucht haben, während die
+        # STRIKT-Verifikation knapp daneben lag. Vor dem Aufgeben einmal die
+        # eigenen Buchungen prüfen (seiteneffektfrei, ohne schiebe_aktiv-Sperre).
+        if not ok and duo_court in (1, 2):
+            verifiziert = verifiziere_slot_via_my_bookings(
+                k, _baue_slot_dict(duo_court, naechster_von, naechster_bis,
+                                   datum_de, datum_api, dauer_min))
+            if verifiziert:
+                az_set(k, "aktive_buchung", verifiziert)
+                log.info(f"[{k}] Duo: Neubuchung per my-bookings bestätigt "
+                         f"(verzögerte Verifikation).")
+                ok = True
 
         letzter_session_check = time.time()
 
@@ -2517,6 +2550,7 @@ def _starte_duo(a: str, b: str, datum: str, ziel: str, buchbar_ab: str):
             schiebe_buchbar_ab=buchbar_ab,
             schiebe_offset_min=omin,
             schiebe_offset_max=omax,
+            duo_court=court,          # fester Court im Schiebe-Rebook (kein Alternieren)
             schiebe_aktiv=True,
             flow=None,
         )
@@ -2617,7 +2651,7 @@ def handle_callback(cb: dict):
             zeige_account_menue(k)
             return
         # Normaler Schiebe-Modus → eventuelles Duo-Offset-Band zurücksetzen
-        az_set_multi(k, schiebe_offset_min=None, schiebe_offset_max=None)
+        az_set_multi(k, schiebe_offset_min=None, schiebe_offset_max=None, duo_court=None)
         zeige_schiebe_modus_auswahl(k)
 
     # ── Sniper-Modus ──────────────────────────────────────────────────────────
@@ -2631,7 +2665,7 @@ def handle_callback(cb: dict):
             zeige_account_menue(k)
             return
         # Sniper nutzt nach Treffer ebenfalls _schiebe_phase3 → Duo-Offset zurücksetzen
-        az_set_multi(k, schiebe_offset_min=None, schiebe_offset_max=None)
+        az_set_multi(k, schiebe_offset_min=None, schiebe_offset_max=None, duo_court=None)
         az_set(k, "flow", "sniper_datum")
         senden(
             f"🎯 <b>[{k}] Sniper-Modus</b>\n\n"
