@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-"""Padel Bot v10.0.0
+"""Padel Bot v11.0.0
+
+ÄNDERUNGEN gegenüber v10.0.0:
+
+PERF 1: Telegram-Reaktion deutlich schneller (keine Funktionsänderung!).
+        - Eine gemeinsame requests.Session für ALLE Telegram-Calls
+          (Keep-Alive statt neuem TLS-Handshake pro senden/Button/getUpdates).
+        - time.sleep(1) im telegram_loop entfernt (getUpdates pollt bereits
+          serverseitig 5s → kein Busy-Loop). Buttons reagieren sofort.
+        - zeige_account_auswahl(): Account-Syncs laufen PARALLEL statt seriell
+          (identisches Ergebnis, aber 1× statt N× Wartezeit bei mehreren Accounts).
+        - hole_wetter(): 10-Min-Cache → keine wiederholten 8s-Timeouts beim
+          Menü-Rendern.
+
+NEU 2:  Duo-Modus (👥) – zwei Accounts parallel auf Court 1 + Court 2.
+        Basis = "Direkte Taktik". Ablauf:
+          1. Button "Duo-Modus" in der Account-Auswahl
+          2. Zwei freie Accounts wählen (Acc1 → Court 1, Acc2 → Court 2)
+          3. Datum → Zielzeit → Buchbar-ab-Zeit (90 Min fix)
+          4. Beide blitzen GLEICHZEITIG auf ihren Court bei Freischaltung
+          5. Versetzter Schiebe-Rhythmus: Court-1-Acc schiebt 5–8 Min vor Ende,
+             Court-2-Acc 11–14 Min vor Ende → ~5–6 Min Versatz, nie gleichzeitig.
+        Normaler Schiebe-Modus bleibt 100% unverändert (5–20 Min Random).
 
 ÄNDERUNGEN gegenüber v9.0.0:
 
@@ -77,7 +99,23 @@ WETTER_CODES = {
     95: "⛈️ Gewitter", 96: "⛈️ Gewitter mit Hagel", 99: "⛈️ Schweres Gewitter",
 }
 
+# PERF: Wetter-Cache (10 Min) – Forecasts ändern sich nicht sekündlich, aber
+# hole_wetter() wird bei jedem Menü-Render aufgerufen (Timeout 8s pro Call).
+_wetter_cache: dict = {}            # (datum_de, stunde) -> (timestamp, text)
+_wetter_cache_lock = threading.Lock()
+WETTER_CACHE_TTL = 600              # Sekunden
+
 def hole_wetter(datum_de: str, from_time: str) -> str:
+    try:
+        _stunde_key = int(from_time.split(":")[0])
+    except Exception:
+        _stunde_key = 0
+    _cache_key = (datum_de, _stunde_key)
+    _now = time.time()
+    with _wetter_cache_lock:
+        _cached = _wetter_cache.get(_cache_key)
+        if _cached and (_now - _cached[0]) < WETTER_CACHE_TTL:
+            return _cached[1]
     try:
         datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
         datum_iso = datum_obj.strftime("%Y-%m-%d")
@@ -107,7 +145,10 @@ def hole_wetter(datum_de: str, from_time: str) -> str:
         code   = codes[idx]
         wind   = winds[idx]
         desc   = WETTER_CODES.get(code, "❓")
-        return (f"\n{desc} | 🌡️ {temp:.0f}°C | ☔ {rain}% | 💨 {wind:.0f} km/h")
+        ergebnis = (f"\n{desc} | 🌡️ {temp:.0f}°C | ☔ {rain}% | 💨 {wind:.0f} km/h")
+        with _wetter_cache_lock:
+            _wetter_cache[_cache_key] = (_now, ergebnis)
+        return ergebnis
     except Exception as e:
         log.warning(f"Wetter-API Fehler: {e}")
         return ""
@@ -164,6 +205,17 @@ BLITZ_FIRE_OFFSET_MS   = 0       # ms: Feuer-Offset relativ buchbar_dt (nie nega
 MULTI_SHOT_COUNT       = 5       # Anzahl Burst-Wellen nach erstem Miss
 MULTI_SHOT_GAP_MS      = 150     # ms: Pause zwischen Bursts
 PHASE1_HANDOFF_MARGIN  = 180     # s: Direkt-Modus wacht so viel vor Freischaltung auf (Phase 2 macht Login+Pre-Warm+Blitz)
+
+# Duo-Modus: zwei Accounts parallel auf Court 1 + Court 2 (Basis = Direkte Taktik).
+# Versetzter Schiebe-Rhythmus, damit beide nie gleichzeitig schieben:
+#   Court-1-Account: 5–8 Min vor Slot-Ende   (schiebt später, näher am Ende)
+#   Court-2-Account: 11–14 Min vor Slot-Ende (schiebt früher)
+# → typischer Versatz ~5–6 Min, garantiert ≥3 Min Abstand.
+DUO_COURT1_OFFSET_MIN  = 5
+DUO_COURT1_OFFSET_MAX  = 8
+DUO_COURT2_OFFSET_MIN  = 11
+DUO_COURT2_OFFSET_MAX  = 14
+DUO_DAUER_MIN          = 90      # Duo immer 90 Min Spielzeit
 
 # ─────────────────────────────────────────────
 # KONSTANTEN
@@ -238,6 +290,9 @@ def neuer_account_zustand(kuerzel: str) -> dict:
         "schiebe_buchbar_ab": None,
         "schiebe_court":      None,
         "schiebe_thread":     None,
+        # Duo-Modus: optionales Schiebe-Offset-Band (None = normaler 5–20-Min-Random)
+        "schiebe_offset_min": None,
+        "schiebe_offset_max": None,
         # Sniper
         "sniper_aktiv":       False,
         "sniper_datum":       None,
@@ -256,6 +311,18 @@ acc = {k: neuer_account_zustand(k) for k in ACCOUNTS}
 _flow_account   = {"kuerzel": None}
 _flow_lock      = threading.Lock()
 telegram_offset = 0
+
+# Duo-Modus: Auswahl-Flow über ZWEI Accounts (nicht an einen Account gebunden).
+_duo = {"flow": None, "acc_a": None, "acc_b": None, "datum": None, "ziel": None}
+_duo_lock = threading.Lock()
+
+def _duo_reset():
+    with _duo_lock:
+        _duo.update(flow=None, acc_a=None, acc_b=None, datum=None, ziel=None)
+
+def _duo_awaiting_text() -> bool:
+    with _duo_lock:
+        return _duo["flow"] == "startzeit"
 
 # ─────────────────────────────────────────────
 # ACCOUNT-HELFER
@@ -283,10 +350,15 @@ def set_flow_account(k: str | None):
 # TELEGRAM HELPERS
 # ══════════════════════════════════════════════
 
+# PERF: EINE gemeinsame Session für alle Telegram-Calls → Keep-Alive,
+# spart pro senden/Button/getUpdates den TLS-Handshake (urllib3-Pool ist
+# thread-safe, daher unbedenklich aus Polling- und Schiebe-Threads).
+_TG_SESSION = _neue_session()
+
 def tg(method: str, payload: dict) -> dict:
     try:
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
-                          json=payload, timeout=10)
+        r = _TG_SESSION.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+                             json=payload, timeout=10)
         return r.json()
     except Exception as e:
         log.error(f"Telegram {method}: {e}")
@@ -304,8 +376,8 @@ def beantworte_callback(cid: str, text: str = "✅"):
 def hole_updates() -> list:
     global telegram_offset
     try:
-        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                         params={"offset": telegram_offset, "timeout": 5}, timeout=10)
+        r = _TG_SESSION.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                            params={"offset": telegram_offset, "timeout": 5}, timeout=10)
         updates = r.json().get("result", [])
         if updates:
             telegram_offset = updates[-1]["update_id"] + 1
@@ -357,6 +429,11 @@ def account_status_label(k: str) -> str:
         return f"🔵 {k} – Sniper {datum_str}"
     return f"✅ {k} – frei"
 
+def _account_frei(k: str) -> bool:
+    """True, wenn der Account keine aktive Buchung/Schiebe/Sniper hat (für Duo-Auswahl)."""
+    snap = az_snap(k, "aktive_buchung", "schiebe_aktiv", "sniper_aktiv")
+    return not (snap["aktive_buchung"] or snap["schiebe_aktiv"] or snap["sniper_aktiv"])
+
 def _account_sort_key(k: str):
     """Sortierung der Account-Liste: Buchungen/Schiebe/Sniper aufsteigend
     nach Datum (und Uhrzeit), freie Accounts danach."""
@@ -384,13 +461,27 @@ def _account_sort_key(k: str):
             return (0, datetime.max, k)
     return (1, datetime.max, k)
 
+def _sync_safe(k: str):
+    try:
+        sync_buchung_vom_server(k)
+    except Exception as e:
+        log.warning(f"[{k}] Sync: {e}")
+
 def zeige_account_auswahl():
     set_flow_account(None)
-    for k in ACCOUNTS:
-        try:
-            sync_buchung_vom_server(k)
-        except Exception as e:
-            log.warning(f"[{k}] Sync: {e}")
+    # PERF: Account-Syncs PARALLEL statt seriell. Jeder Account hat eigene
+    # http-Session + eigenen Lock → unbedenklich. Ergebnis identisch, aber
+    # statt Summe der Wartezeiten nur noch die des langsamsten Accounts.
+    if len(ACCOUNTS) > 1:
+        sync_threads = [threading.Thread(target=_sync_safe, args=(k,), daemon=True)
+                        for k in ACCOUNTS]
+        for t in sync_threads:
+            t.start()
+        for t in sync_threads:
+            t.join()
+    else:
+        for k in ACCOUNTS:
+            _sync_safe(k)
 
     anzahl     = len(ACCOUNTS)
     modus_label = "Dual-Account" if anzahl > 1 else "Einzel-Account"
@@ -399,6 +490,9 @@ def zeige_account_auswahl():
     for k in sorted_accounts:
         buttons.append([{"text": account_status_label(k), "callback_data": f"acc_{k}"}])
     buttons.append([{"text": "🔄 Aktualisieren", "callback_data": "refresh_accounts"}])
+    if len(ACCOUNTS) >= 2:
+        buttons.append([{"text": "👥 Duo-Modus (2 Accounts parallel)",
+                         "callback_data": "duo_start"}])
 
     status_zeilen = ""
     for k in sorted_accounts:
@@ -1523,7 +1617,11 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
 
         # Schiebe-Zeitpunkt: HEUTE um (Slot-Ende - RANDOM Minuten)
         jetzt = jetzt_lokal()
-        random_offset  = random.randint(SCHIEBE_MINUTEN_VOR_MIN, SCHIEBE_MINUTEN_VOR_MAX)
+        # Duo-Modus setzt ein eigenes Offset-Band pro Account (versetztes Schieben).
+        # Sonst (None) das normale 5–20-Min-Random – Verhalten unverändert.
+        off_min = az_get(k, "schiebe_offset_min") or SCHIEBE_MINUTEN_VOR_MIN
+        off_max = az_get(k, "schiebe_offset_max") or SCHIEBE_MINUTEN_VOR_MAX
+        random_offset  = random.randint(off_min, off_max)
         schiebe_moment = datetime.combine(
             jetzt.date(),                                  # ← HEUTE, nicht datum_obj!
             (ende_dt - timedelta(minutes=random_offset)).time())
@@ -2264,6 +2362,197 @@ def handle_text(k: str, text: str):
     zeige_account_auswahl()
 
 # ══════════════════════════════════════════════
+# DUO-MODUS (2 Accounts parallel, Basis = Direkte Taktik)
+# ══════════════════════════════════════════════
+
+def handle_duo_callback(data: str):
+    """Verarbeitet alle 'duo_*'-Callbacks (Account-Auswahl → Datum → Ziel)."""
+    if data == "duo_start":
+        frei = [k for k in ACCOUNTS if _account_frei(k)]
+        if len(frei) < 2:
+            senden("👥 <b>Duo-Modus</b> braucht <b>2 freie Accounts</b> "
+                   "(ohne aktive Buchung/Schiebe/Sniper).")
+            zeige_account_auswahl()
+            return
+        _duo_reset()
+        btns = [[{"text": account_status_label(k), "callback_data": f"duo_pa_{k}"}]
+                for k in frei]
+        btns.append([{"text": "❌ Abbrechen", "callback_data": "duo_cancel"}])
+        senden("👥 <b>Duo-Modus</b> – 2 Accounts parallel auf Court 1 + Court 2\n\n"
+               "Wähle den <b>1. Account</b> → 🏟️ <b>Court 1</b>:", buttons=btns)
+        return
+
+    if data == "duo_cancel":
+        _duo_reset()
+        senden("↩️ Duo-Modus abgebrochen.")
+        zeige_account_auswahl()
+        return
+
+    if data.startswith("duo_pa_"):
+        k = data[len("duo_pa_"):]
+        if k not in acc or not _account_frei(k):
+            senden("❌ Account nicht (mehr) frei. Bitte Duo neu starten.")
+            _duo_reset()
+            zeige_account_auswahl()
+            return
+        with _duo_lock:
+            _duo["acc_a"] = k
+        rest = [x for x in ACCOUNTS if x != k and _account_frei(x)]
+        if not rest:
+            senden("❌ Kein zweiter freier Account verfügbar.")
+            _duo_reset()
+            zeige_account_auswahl()
+            return
+        btns = [[{"text": account_status_label(x), "callback_data": f"duo_pb_{x}"}]
+                for x in rest]
+        btns.append([{"text": "❌ Abbrechen", "callback_data": "duo_cancel"}])
+        senden(f"👥 Duo | 🏟️ Court 1: <b>{k}</b>\n\n"
+               f"Wähle den <b>2. Account</b> → 🏟️ <b>Court 2</b>:", buttons=btns)
+        return
+
+    if data.startswith("duo_pb_"):
+        k = data[len("duo_pb_"):]
+        with _duo_lock:
+            a = _duo["acc_a"]
+        if not a:
+            senden("❌ Duo-Flow unterbrochen – bitte neu starten.")
+            _duo_reset()
+            zeige_account_auswahl()
+            return
+        if k == a or k not in acc or not _account_frei(k):
+            senden("❌ Bitte einen ANDEREN freien Account wählen.")
+            return
+        with _duo_lock:
+            _duo["acc_b"] = k
+        senden(f"👥 Duo | 🏟️ C1: <b>{a}</b> | 🏟️ C2: <b>{k}</b>\n\n"
+               f"📅 Für welches <b>Datum</b>?",
+               buttons=erstelle_datum_buttons("duo_datum"))
+        return
+
+    if data.startswith("duo_datum_"):
+        datum = data[len("duo_datum_"):]
+        with _duo_lock:
+            _duo["datum"] = datum
+            a, b = _duo["acc_a"], _duo["acc_b"]
+        if not (a and b):
+            senden("❌ Duo-Flow unterbrochen – bitte neu starten.")
+            _duo_reset()
+            zeige_account_auswahl()
+            return
+        senden(f"👥 Duo | 📅 {datum} | 90 Min\n\n"
+               f"🎯 <b>Bis wohin soll geschoben werden?</b> (Zielzeit)",
+               buttons=zielzeit_buttons("duo_ziel", DUO_DAUER_MIN))
+        return
+
+    if data.startswith("duo_ziel_"):
+        ziel = data[len("duo_ziel_"):]
+        with _duo_lock:
+            _duo["ziel"] = ziel
+            a, b, datum  = _duo["acc_a"], _duo["acc_b"], _duo["datum"]
+            if a and b and datum:
+                _duo["flow"] = "startzeit"
+        if not (a and b and datum):
+            senden("❌ Duo-Flow unterbrochen – bitte neu starten.")
+            _duo_reset()
+            zeige_account_auswahl()
+            return
+        senden(f"👥 <b>Duo-Modus</b>\n"
+               f"🏟️ C1: {a} | 🏟️ C2: {b}\n"
+               f"📅 {datum} | 🎯 Ziel: {ziel} Uhr | 90 Min\n\n"
+               f"⏰ <b>Ab wann ist der Slot buchbar?</b>\n"
+               f"Bitte Uhrzeit tippen (30-Min-Raster, z.B. <b>17:30</b>):\n\n"
+               f"<i>Beide Accounts blitzen dann gleichzeitig auf ihren Court.</i>")
+        return
+
+    senden("❓ Unbekannte Duo-Aktion.")
+    _duo_reset()
+    zeige_account_auswahl()
+
+
+def handle_duo_text(text: str):
+    """Verarbeitet die getippte Buchbar-ab-Zeit und startet beide Duo-Accounts."""
+    m = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
+    if not m:
+        senden("❌ Ungültiges Format. Bitte als <b>HH:MM</b> eingeben, z.B. <b>17:30</b>")
+        return
+    stunde, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= stunde <= 21 and minute in (0, 30)):
+        senden("❌ Zeit muss auf 30-Min-Raster liegen (z.B. 17:00 oder 17:30)")
+        return
+    buchbar_ab = f"{stunde:02d}:{minute:02d}"
+    with _duo_lock:
+        a     = _duo["acc_a"]
+        b     = _duo["acc_b"]
+        datum = _duo["datum"]
+        ziel  = _duo["ziel"]
+        _duo["flow"] = None
+    if not (a and b and datum and ziel):
+        senden("❌ Duo-Konfiguration unvollständig – bitte neu starten.")
+        _duo_reset()
+        zeige_account_auswahl()
+        return
+    if not _account_frei(a) or not _account_frei(b):
+        senden("⚠️ Einer der beiden Accounts ist nicht mehr frei – Duo abgebrochen.")
+        _duo_reset()
+        zeige_account_auswahl()
+        return
+    _starte_duo(a, b, datum, ziel, buchbar_ab)
+    _duo_reset()
+
+
+def _starte_duo(a: str, b: str, datum: str, ziel: str, buchbar_ab: str):
+    """Konfiguriert beide Accounts als Direkt-Schiebe (Court 1 / Court 2) mit
+    versetztem Schiebe-Offset-Band und startet beide Threads gleichzeitig."""
+    konfig = [
+        (a, 1, DUO_COURT1_OFFSET_MIN, DUO_COURT1_OFFSET_MAX),
+        (b, 2, DUO_COURT2_OFFSET_MIN, DUO_COURT2_OFFSET_MAX),
+    ]
+    for (k, court, omin, omax) in konfig:
+        az_set_multi(k,
+            schiebe_modus="direkt",
+            schiebe_datum=datum,
+            schiebe_ziel=ziel,
+            schiebe_dauer=DUO_DAUER_MIN,
+            schiebe_court=court,
+            schiebe_buchbar_ab=buchbar_ab,
+            schiebe_offset_min=omin,
+            schiebe_offset_max=omax,
+            schiebe_aktiv=True,
+            flow=None,
+        )
+
+    datum_obj = datetime.strptime(datum, "%d.%m.%Y")
+    unlock_dt = datetime.combine((datum_obj - timedelta(days=7)).date(),
+                                 datetime.strptime(buchbar_ab, "%H:%M").time())
+    jetzt = jetzt_lokal()
+    if unlock_dt <= jetzt:
+        frei_txt = "🚀 Slot bereits freigeschaltet – beide blitzen sofort!"
+    else:
+        rest = unlock_dt - jetzt
+        h  = rest.seconds // 3600
+        mi = (rest.seconds % 3600) // 60
+        rest_str = (f"{rest.days}T {h}h {mi}min" if rest.days > 0
+                    else f"{h}h {mi}min" if h > 0 else f"{mi}min")
+        frei_txt = f"⏳ Freischaltung in {rest_str}"
+
+    senden(
+        f"👥 <b>Duo-Modus gestartet!</b>\n"
+        f"📅 {_datum_mit_tag(datum)} | 🎯 Ziel: {ziel} Uhr | 90 Min\n"
+        f"🔓 Buchbar ab: {unlock_dt.strftime('%d.%m.%Y um %H:%M Uhr')}\n\n"
+        f"🏟️ <b>Court 1</b>: {a}  (schiebt {DUO_COURT1_OFFSET_MIN}–{DUO_COURT1_OFFSET_MAX} Min vor Ende)\n"
+        f"🏟️ <b>Court 2</b>: {b}  (schiebt {DUO_COURT2_OFFSET_MIN}–{DUO_COURT2_OFFSET_MAX} Min vor Ende)\n\n"
+        f"⚡ Beide blitzen gleichzeitig, schieben aber versetzt (~5–6 Min Abstand).\n"
+        f"{frei_txt}")
+
+    for (k, court, omin, omax) in konfig:
+        t = threading.Thread(target=schiebe_loop, args=(k,), daemon=True)
+        t.start()
+        az_set(k, "schiebe_thread", t)
+
+    zeige_account_auswahl()
+
+
+# ══════════════════════════════════════════════
 # TELEGRAM CALLBACKS
 # ══════════════════════════════════════════════
 
@@ -2272,6 +2561,10 @@ def handle_callback(cb: dict):
     data = cb.get("data", "")
     beantworte_callback(cid)
     log.info(f"Callback: {data}")
+
+    # Jeder Klick auf einen Nicht-Duo-Button verlässt einen offenen Duo-Eingabeschritt
+    if not data.startswith("duo_") and _duo_awaiting_text():
+        _duo_reset()
 
     if data in ("zurueck_accounts", "refresh_accounts"):
         zeige_account_auswahl()
@@ -2288,6 +2581,11 @@ def handle_callback(cb: dict):
         except Exception as e:
             log.warning(f"[{k}] Sync: {e}")
         zeige_account_menue(k)
+        return
+
+    # ── Duo-Modus (eigener Flow über 2 Accounts) – früh abfangen ──────────────
+    if data.startswith("duo_"):
+        handle_duo_callback(data)
         return
 
     k = get_flow_account()
@@ -2318,6 +2616,8 @@ def handle_callback(cb: dict):
             senden(f"⚠️ [{k}] Aktive Buchung vorhanden.\nSchiebe nur ohne aktive Buchung.")
             zeige_account_menue(k)
             return
+        # Normaler Schiebe-Modus → eventuelles Duo-Offset-Band zurücksetzen
+        az_set_multi(k, schiebe_offset_min=None, schiebe_offset_max=None)
         zeige_schiebe_modus_auswahl(k)
 
     # ── Sniper-Modus ──────────────────────────────────────────────────────────
@@ -2330,6 +2630,8 @@ def handle_callback(cb: dict):
             senden(f"⚠️ [{k}] Aktive Buchung vorhanden.\nSniper nur ohne aktive Buchung.")
             zeige_account_menue(k)
             return
+        # Sniper nutzt nach Treffer ebenfalls _schiebe_phase3 → Duo-Offset zurücksetzen
+        az_set_multi(k, schiebe_offset_min=None, schiebe_offset_max=None)
         az_set(k, "flow", "sniper_datum")
         senden(
             f"🎯 <b>[{k}] Sniper-Modus</b>\n\n"
@@ -2720,11 +3022,14 @@ def telegram_loop():
                     if chat_id != str(TELEGRAM_CHAT_ID):
                         continue
                     text   = msg.get("text", "").strip()
-                    k_flow = get_flow_account()
-                    if k_flow and az_get(k_flow, "flow") in ("direkte_startzeit",):
-                        handle_text(k_flow, text)
+                    if _duo_awaiting_text():
+                        handle_duo_text(text)
                     else:
-                        zeige_account_auswahl()
+                        k_flow = get_flow_account()
+                        if k_flow and az_get(k_flow, "flow") in ("direkte_startzeit",):
+                            handle_text(k_flow, text)
+                        else:
+                            zeige_account_auswahl()
 
                 elif "callback_query" in update:
                     cb      = update["callback_query"]
@@ -2733,7 +3038,10 @@ def telegram_loop():
                         handle_callback(cb)
         except Exception as e:
             log.error(f"Telegram-Loop: {e}")
-        time.sleep(1)
+            # PERF: kein festes time.sleep(1) mehr im Normalfall – getUpdates
+            # pollt bereits serverseitig bis zu 5s (kein Busy-Loop). Nur im
+            # Fehlerfall kurz pausieren, um Hot-Looping zu vermeiden.
+            time.sleep(1)
 
 # ══════════════════════════════════════════════
 # START
