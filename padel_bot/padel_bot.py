@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Padel Bot v11.0.1
+"""Padel Bot v12.0.0
+
+NEU v12.0.0: BLITZ-SCHIEBEN. Der Schiebe-Rebook arbeitet jetzt wie die
+        Direkt-Blitz-Taktik: das langsame r1 (Formular/Token) wird BEREITS VOR
+        dem Storno geholt (pre_warm_r1), solange die alte Buchung noch hält.
+        Im kritischen Fenster NACH dem Storno feuern dann nur noch r2+r3
+        (burst_r2_r3) – Multi-Shot, nur aktueller Court, SPEED-Verifikation per
+        my-bookings. Dadurch schrumpft das "offene" Fenster (Storno→Neubuchung)
+        spürbar → weniger Slot-Klau beim Schieben. Bei leerem Prewarm-Token
+        fällt es automatisch auf den alten buche_slot-Loop zurück (kein Risiko).
+        Greift im Einzel-Direkt-Schiebe UND im Duo (fester Court).
 
 FIX v11.0.1: Duo-Schiebe-Rebook nagelt den Court jetzt FEST (kein Alternieren
         auf den Partner-Court). Vorher konnte ein Duo-Account beim Schieben den
@@ -1710,6 +1720,24 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
                 return
             continue
 
+        # ── BLITZ-SCHIEBEN, Schritt 1: PRE-WARM r1 VOR dem Storno ─────────────
+        # Holt den r1-Formular-/execution-Token, solange die alte Buchung noch
+        # hält (kein Risiko – Slot bleibt belegt). Im kritischen Fenster NACH dem
+        # Storno feuern dann nur noch r2+r3 (burst_r2_r3) → kleinstmögliches
+        # Klau-Fenster. Nur aktueller Court (bzw. fester Duo-Court).
+        # Leerer Token → Fallback auf klassischen buche_slot-Loop (kein Risiko).
+        duo_court    = az_get(k, "duo_court")
+        blitz_court  = duo_court if duo_court in (1, 2) else aktive_b["court"]
+        ziel_slot    = _baue_slot_dict(blitz_court, naechster_von, naechster_bis,
+                                       datum_de, datum_api, dauer_min)
+        prewarm_exec = pre_warm_r1(k, blitz_court, datum_api,
+                                   naechster_von, naechster_bis)
+        if prewarm_exec:
+            log.info(f"⚡ [{k}] Schiebe-Prewarm Court {blitz_court} OK → {prewarm_exec}")
+        else:
+            log.warning(f"[{k}] Schiebe-Prewarm Court {blitz_court} leer "
+                        f"→ Fallback buche_slot")
+
         storno_ok = False
         for storno_versuch in range(6):
             if not aktiv():
@@ -1727,41 +1755,63 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
                 return
             continue
 
-        gerade_court  = aktive_b["court"]
-        anderer_court = 1 if gerade_court == 2 else 2
-        # Duo-Modus: FESTER Court – NICHT auf den Partner-Court alternieren.
-        # Im Einzelmodus ist der "andere" Court ein nützlicher Fallback; im Duo
-        # gehört er dem Partner-Account → Alternieren würde sich gegenseitig die
-        # Plätze klauen bzw. Versuche (je 1–2,5s STRIKT-Verifikation) verschwenden,
-        # bis ein Account gar keinen Court mehr bekommt ("nur storniert").
-        # So verhält sich jeder Duo-Schiebevorgang 1:1 wie ein einzelner auf festem Court.
-        duo_court = az_get(k, "duo_court")
+        gerade_court = aktive_b["court"]   # für eff_court-Fallback weiter unten
 
+        # ── BLITZ-SCHIEBEN, Schritt 2: SPEED-Burst r2+r3 mit vorgewärmtem Token ──
+        # Genau wie _direkt_blitz, nur ausgelöst durch "nach Storno" statt
+        # "bei Freischaltung". Nur EIN Court (aktueller/Duo-Court), Multi-Shot,
+        # SPEED-Verifikation per my-bookings (kein 1–2,5s Verify-Sleep pro Schuss).
         ok = False
-        for versuch in range(30):
-            if not aktiv():
-                return
-            if duo_court in (1, 2):
-                court_v = duo_court
-            else:
-                court_v = gerade_court if versuch % 2 == 0 else anderer_court
-            slot_v  = _baue_slot_dict(court_v, naechster_von, naechster_bis,
-                                      datum_de, datum_api, dauer_min)
-            if buche_slot(k, slot_v):
-                ok = True
-                break
-            time.sleep(0.1 if versuch < 15 else 0.5)
+        if prewarm_exec:
+            execution = prewarm_exec
+            for welle in range(MULTI_SHOT_COUNT + 1):
+                if not aktiv():
+                    return
+                if not execution:
+                    execution = pre_warm_r1(k, blitz_court, datum_api,
+                                            naechster_von, naechster_bis)
+                    if not execution:
+                        time.sleep(MULTI_SHOT_GAP_MS / 1000.0)
+                        continue
+                t0 = time.perf_counter()
+                erfolg, _ = burst_r2_r3(k, blitz_court, execution, ziel_slot)
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                log.info(f"⚡ [{k}] Schiebe-Burst {welle+1}/{MULTI_SHOT_COUNT+1} "
+                         f"Court {blitz_court}: ok={erfolg} ({dt_ms:.0f}ms)")
+                if erfolg:
+                    verifiziert = verifiziere_slot_via_my_bookings(k, ziel_slot)
+                    if verifiziert:
+                        az_set(k, "aktive_buchung", verifiziert)
+                        ok = True
+                        break
+                    log.warning(f"[{k}] Schiebe-Burst r3 OK aber nicht in "
+                                f"my-bookings → nächste Welle")
+                # Token ist verbraucht → für die nächste Welle neu vorwärmen
+                execution = pre_warm_r1(k, blitz_court, datum_api,
+                                        naechster_von, naechster_bis)
+                time.sleep(MULTI_SHOT_GAP_MS / 1000.0)
 
-        # Duo-Sicherheitsnetz: r3 kann serverseitig gebucht haben, während die
-        # STRIKT-Verifikation knapp daneben lag. Vor dem Aufgeben einmal die
-        # eigenen Buchungen prüfen (seiteneffektfrei, ohne schiebe_aktiv-Sperre).
-        if not ok and duo_court in (1, 2):
-            verifiziert = verifiziere_slot_via_my_bookings(
-                k, _baue_slot_dict(duo_court, naechster_von, naechster_bis,
-                                   datum_de, datum_api, dauer_min))
+        # ── Fallback: klassischer buche_slot-Loop (nur aktueller Court) ──
+        # Greift, wenn der Prewarm-Token leer war oder alle Blitz-Wellen daneben
+        # lagen. Verhält sich dann exakt wie bisher – nur ohne Court-Alternieren
+        # (User-Vorgabe: nur aktueller Court).
+        if not ok:
+            for versuch in range(30):
+                if not aktiv():
+                    return
+                if buche_slot(k, ziel_slot):
+                    ok = True
+                    break
+                time.sleep(0.1 if versuch < 15 else 0.5)
+
+        # Sicherheitsnetz: r3 kann serverseitig gebucht haben, während die
+        # Verifikation knapp daneben lag. Vor dem Aufgeben einmal die eigenen
+        # Buchungen prüfen (seiteneffektfrei).
+        if not ok:
+            verifiziert = verifiziere_slot_via_my_bookings(k, ziel_slot)
             if verifiziert:
                 az_set(k, "aktive_buchung", verifiziert)
-                log.info(f"[{k}] Duo: Neubuchung per my-bookings bestätigt "
+                log.info(f"[{k}] Schiebe: Neubuchung per my-bookings bestätigt "
                          f"(verzögerte Verifikation).")
                 ok = True
 
