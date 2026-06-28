@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Padel Bot v12.0.0
+"""Padel Bot v13.0.0
+
+NEU v13.0.0: 3h-MODUS (Block). Rein additiv – KERN-CODE UNVERÄNDERT.
+        Zwei Accounts erzeugen zusammen einen durchgehenden 3-Stunden-Block
+        (2× 90 Min). Ablauf:
+          1. Button "3h-Modus" in der Account-Auswahl
+          2. Account 1 (Schieber) + Account 2 (Anschluss-Blitzer) wählen
+          3. Datum → Court → Wunschanfang (Block-Start) → Buchbar-ab-Zeit X
+        Konfiguration (beide laufen über den UNVERÄNDERTEN schiebe_loop):
+          • Account 1 = Direkte Taktik: Start ab X, schiebt bis Wunschanfang
+            (z.B. 10:30 → Slot 10:30–12:00).
+          • Account 2 = Direkte Taktik: blitzt den DIREKT folgenden Slot bei
+            dessen Freischaltung (Start = Wunschanfang+90 = 12:00 → 12:00–13:30),
+            Ziel == Start → kein Schieben, nur Blitz. "Bekannte Startzeit".
+        Ergebnis: durchgehender Block Wunschanfang … Wunschanfang+180 (3 Std.).
+        Bei festem Court liegt der ganze Block auf einem Platz.
 
 NEU v12.0.0: BLITZ-SCHIEBEN. Der Schiebe-Rebook arbeitet jetzt wie die
         Direkt-Blitz-Taktik: das langsame r1 (Formular/Token) wird BEREITS VOR
@@ -236,6 +251,10 @@ DUO_COURT2_OFFSET_MIN  = 11
 DUO_COURT2_OFFSET_MAX  = 14
 DUO_DAUER_MIN          = 90      # Duo immer 90 Min Spielzeit
 
+# 3h-Modus (Block): Acc1 schiebt bis Wunschanfang, Acc2 blitzt den Anschluss-Slot.
+# Beide je 90 Min → zusammen ein durchgehender 3-Stunden-Block (2× 90 Min).
+BLOCK_DAUER_MIN        = 90
+
 # ─────────────────────────────────────────────
 # KONSTANTEN
 # ─────────────────────────────────────────────
@@ -344,6 +363,21 @@ def _duo_awaiting_text() -> bool:
     with _duo_lock:
         return _duo["flow"] == "startzeit"
 
+# 3h-Modus (Block): eigener Auswahl-Flow über ZWEI Accounts (wie Duo), zusätzlich
+# mit Court-Wahl. Acc1 schiebt bis Wunschanfang, Acc2 blitzt den Anschluss-Slot.
+_block = {"flow": None, "acc_a": None, "acc_b": None,
+          "datum": None, "ziel": None, "court": None}
+_block_lock = threading.Lock()
+
+def _block_reset():
+    with _block_lock:
+        _block.update(flow=None, acc_a=None, acc_b=None,
+                      datum=None, ziel=None, court=None)
+
+def _block_awaiting_text() -> bool:
+    with _block_lock:
+        return _block["flow"] == "startzeit"
+
 # ─────────────────────────────────────────────
 # ACCOUNT-HELFER
 # ─────────────────────────────────────────────
@@ -376,13 +410,24 @@ def set_flow_account(k: str | None):
 _TG_SESSION = _neue_session()
 
 def tg(method: str, payload: dict) -> dict:
-    try:
-        r = _TG_SESSION.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
-                             json=payload, timeout=10)
-        return r.json()
-    except Exception as e:
-        log.error(f"Telegram {method}: {e}")
-        return {}
+    # FIX v12: Bei langer Idle-Phase (z.B. ~80 Min zwischen Schiebe-Schritten)
+    # schließt Telegram die Keep-Alive-Verbindung im _TG_SESSION-Pool. Der erste
+    # POST darauf scheitert dann mit RemoteDisconnected ("Connection aborted").
+    # urllib3 wiederholt POSTs nicht automatisch → daher hier 1× manueller Retry
+    # mit frischer Verbindung. Verlorene Nachrichten (z.B. "⚡ Schiebe jetzt!")
+    # werden so vermieden; das Buchen war ohnehin nie betroffen.
+    for versuch in range(2):
+        try:
+            r = _TG_SESSION.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+                                 json=payload, timeout=10)
+            return r.json()
+        except Exception as e:
+            if versuch == 0:
+                log.warning(f"Telegram {method}: {e} → Retry mit frischer Verbindung")
+                continue
+            log.error(f"Telegram {method}: {e}")
+            return {}
+    return {}
 
 def senden(text: str, buttons: list = None):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
@@ -513,6 +558,8 @@ def zeige_account_auswahl():
     if len(ACCOUNTS) >= 2:
         buttons.append([{"text": "👥 Duo-Modus (2 Accounts parallel)",
                          "callback_data": "duo_start"}])
+        buttons.append([{"text": "🔗 3h-Modus (Block, 2 Accounts)",
+                         "callback_data": "block_start"}])
 
     status_zeilen = ""
     for k in sorted_accounts:
@@ -2637,6 +2684,274 @@ def _starte_duo(a: str, b: str, datum: str, ziel: str, buchbar_ab: str):
 
 
 # ══════════════════════════════════════════════
+# 3h-MODUS (Block: Acc1 schiebt bis Wunschanfang → Acc2 blitzt Anschluss)
+# ══════════════════════════════════════════════
+
+def handle_block_callback(data: str):
+    """Verarbeitet alle 'block_*'-Callbacks (Account-Auswahl → Datum → Court →
+    Wunschanfang). Acc1 = Schieber (Direkte Taktik bis Wunschanfang),
+    Acc2 = Anschluss-Blitz auf den direkt folgenden 90-Min-Slot.
+    Baut nur auf bestehenden Bausteinen auf – KERN-CODE unverändert."""
+    if data == "block_start":
+        frei = [k for k in ACCOUNTS if _account_frei(k)]
+        if len(frei) < 2:
+            senden("🔗 <b>3h-Modus</b> braucht <b>2 freie Accounts</b> "
+                   "(ohne aktive Buchung/Schiebe/Sniper).")
+            zeige_account_auswahl()
+            return
+        _block_reset()
+        btns = [[{"text": account_status_label(k), "callback_data": f"block_pa_{k}"}]
+                for k in frei]
+        btns.append([{"text": "❌ Abbrechen", "callback_data": "block_cancel"}])
+        senden("🔗 <b>3h-Modus</b> – durchgehender 3-Stunden-Block (2× 90 Min)\n\n"
+               "Wähle den <b>1. Account</b> = 🏃 <b>Schieber</b>\n"
+               "<i>(schiebt bis zum Wunschanfang, z.B. 10:30 → 10:30–12:00):</i>",
+               buttons=btns)
+        return
+
+    if data == "block_cancel":
+        _block_reset()
+        senden("↩️ 3h-Modus abgebrochen.")
+        zeige_account_auswahl()
+        return
+
+    if data.startswith("block_pa_"):
+        k = data[len("block_pa_"):]
+        if k not in acc or not _account_frei(k):
+            senden("❌ Account nicht (mehr) frei. Bitte 3h-Modus neu starten.")
+            _block_reset()
+            zeige_account_auswahl()
+            return
+        with _block_lock:
+            _block["acc_a"] = k
+        rest = [x for x in ACCOUNTS if x != k and _account_frei(x)]
+        if not rest:
+            senden("❌ Kein zweiter freier Account verfügbar.")
+            _block_reset()
+            zeige_account_auswahl()
+            return
+        btns = [[{"text": account_status_label(x), "callback_data": f"block_pb_{x}"}]
+                for x in rest]
+        btns.append([{"text": "❌ Abbrechen", "callback_data": "block_cancel"}])
+        senden(f"🔗 3h | 🏃 Schieber: <b>{k}</b>\n\n"
+               f"Wähle den <b>2. Account</b> = ⚡ <b>Anschluss-Blitzer</b>:",
+               buttons=btns)
+        return
+
+    if data.startswith("block_pb_"):
+        k = data[len("block_pb_"):]
+        with _block_lock:
+            a = _block["acc_a"]
+        if not a:
+            senden("❌ 3h-Flow unterbrochen – bitte neu starten.")
+            _block_reset()
+            zeige_account_auswahl()
+            return
+        if k == a or k not in acc or not _account_frei(k):
+            senden("❌ Bitte einen ANDEREN freien Account wählen.")
+            return
+        with _block_lock:
+            _block["acc_b"] = k
+        senden(f"🔗 3h | 🏃 {a} | ⚡ {k}\n\n"
+               f"📅 Für welches <b>Datum</b>?",
+               buttons=erstelle_datum_buttons("block_datum"))
+        return
+
+    if data.startswith("block_datum_"):
+        datum = data[len("block_datum_"):]
+        with _block_lock:
+            _block["datum"] = datum
+            a, b = _block["acc_a"], _block["acc_b"]
+        if not (a and b):
+            senden("❌ 3h-Flow unterbrochen – bitte neu starten.")
+            _block_reset()
+            zeige_account_auswahl()
+            return
+        senden(f"🔗 3h | 🏃 {a} | ⚡ {b} | 📅 {datum}\n\n"
+               f"🏟️ <b>Welcher Court?</b>\n"
+               f"<i>Fester Court = durchgehend ein Platz für alle 3 Stunden.</i>",
+               buttons=court_buttons("block_court"))
+        return
+
+    if data.startswith("block_court_"):
+        court_val = data[len("block_court_"):]
+        try:
+            court_int = int(court_val)
+        except ValueError:
+            court_int = 0
+        with _block_lock:
+            _block["court"] = court_int
+            a, b, datum = _block["acc_a"], _block["acc_b"], _block["datum"]
+        if not (a and b and datum):
+            senden("❌ 3h-Flow unterbrochen – bitte neu starten.")
+            _block_reset()
+            zeige_account_auswahl()
+            return
+        court_label = {0: "Egal (Court 2 bevorzugt)", 1: "Court 1",
+                       2: "Court 2"}.get(court_int, "?")
+        senden(f"🔗 3h | 🏟️ {court_label} | 📅 {datum} | je 90 Min\n\n"
+               f"🎯 <b>Wunschanfang</b> des Blocks?\n"
+               f"<i>Acc1 schiebt bis hierhin (z.B. 10:30 → 10:30–12:00), "
+               f"Acc2 blitzt den Anschluss (12:00–13:30).</i>",
+               buttons=zielzeit_buttons("block_ziel", BLOCK_DAUER_MIN * 2))
+        return
+
+    if data.startswith("block_ziel_"):
+        ziel = data[len("block_ziel_"):]
+        with _block_lock:
+            _block["ziel"] = ziel
+            a, b      = _block["acc_a"], _block["acc_b"]
+            datum     = _block["datum"]
+            court     = _block["court"]
+            if a and b and datum and court is not None:
+                _block["flow"] = "startzeit"
+        if not (a and b and datum and court is not None):
+            senden("❌ 3h-Flow unterbrochen – bitte neu starten.")
+            _block_reset()
+            zeige_account_auswahl()
+            return
+        ziel_dt       = datetime.strptime(ziel, "%H:%M")
+        anschluss_von = (ziel_dt + timedelta(minutes=BLOCK_DAUER_MIN)).strftime("%H:%M")
+        block_bis     = (ziel_dt + timedelta(minutes=BLOCK_DAUER_MIN * 2)).strftime("%H:%M")
+        senden(f"🔗 <b>3h-Modus</b>\n"
+               f"🏃 {a} | ⚡ {b}\n"
+               f"📅 {datum} | 🎯 Block: {ziel}–{block_bis} Uhr (3 Std.)\n\n"
+               f"⏰ <b>Ab wann startet der Schieber ({a})?</b>\n"
+               f"Buchbar-ab-Zeit tippen (30-Min-Raster, z.B. <b>{ziel}</b> oder früher):\n\n"
+               f"<i>Acc1 blitzt diesen Start-Slot und schiebt bis {ziel}.\n"
+               f"Acc2 blitzt {anschluss_von}–{block_bis} bei Freischaltung um {anschluss_von}.</i>")
+        return
+
+    senden("❓ Unbekannte 3h-Aktion.")
+    _block_reset()
+    zeige_account_auswahl()
+
+
+def handle_block_text(text: str):
+    """Verarbeitet die getippte Buchbar-ab-Zeit (Start des Schiebers) und
+    startet beide Accounts (Schieber + Anschluss-Blitzer)."""
+    m = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
+    if not m:
+        senden("❌ Ungültiges Format. Bitte als <b>HH:MM</b> eingeben, z.B. <b>17:30</b>")
+        return
+    stunde, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= stunde <= 21 and minute in (0, 30)):
+        senden("❌ Zeit muss auf 30-Min-Raster liegen (z.B. 17:00 oder 17:30)")
+        return
+    buchbar_ab = f"{stunde:02d}:{minute:02d}"
+    with _block_lock:
+        a, b   = _block["acc_a"], _block["acc_b"]
+        datum  = _block["datum"]
+        ziel   = _block["ziel"]
+        court  = _block["court"]
+        _block["flow"] = None
+    if not (a and b and datum and ziel and court is not None):
+        senden("❌ 3h-Konfiguration unvollständig – bitte neu starten.")
+        _block_reset()
+        zeige_account_auswahl()
+        return
+    # Man schiebt vorwärts → Start darf nicht NACH dem Wunschanfang liegen.
+    if datetime.strptime(buchbar_ab, "%H:%M") > datetime.strptime(ziel, "%H:%M"):
+        senden(f"❌ Startzeit ({buchbar_ab}) liegt nach dem Wunschanfang ({ziel}).\n"
+               f"Bitte eine Zeit ≤ {ziel} tippen.")
+        with _block_lock:
+            _block["flow"] = "startzeit"      # Eingabe erneut erwarten
+        return
+    if not _account_frei(a) or not _account_frei(b):
+        senden("⚠️ Einer der beiden Accounts ist nicht mehr frei – 3h-Modus abgebrochen.")
+        _block_reset()
+        zeige_account_auswahl()
+        return
+    _starte_block(a, b, datum, ziel, court, buchbar_ab)
+    _block_reset()
+
+
+def _starte_block(a: str, b: str, datum: str, ziel: str, court: int, buchbar_ab: str):
+    """Konfiguriert beide Accounts und startet sie über den UNVERÄNDERTEN
+    schiebe_loop:
+      • Acc1 (Schieber)  = Direkte Taktik, Start ab 'buchbar_ab', Ziel 'ziel'
+                           → landet auf ziel … ziel+90 (z.B. 10:30–12:00).
+      • Acc2 (Anschluss) = Direkte Taktik, Start = Ziel = ziel+90
+                           → blitzt ziel+90 … ziel+180 (z.B. 12:00–13:30) bei
+                             Freischaltung; Ziel == Start ⇒ Phase 3 endet sofort
+                             (kein Schieben, reiner Blitz / "bekannte Startzeit").
+    Zusammen = durchgehender 3-Stunden-Block."""
+    dauer         = BLOCK_DAUER_MIN
+    ziel_dt       = datetime.strptime(ziel, "%H:%M")
+    anschluss_von = (ziel_dt + timedelta(minutes=dauer)).strftime("%H:%M")        # Acc2 from
+    anschluss_bis = (ziel_dt + timedelta(minutes=2 * dauer)).strftime("%H:%M")    # Acc2 to
+    fester_court  = court if court in (1, 2) else None
+
+    # Account 1 = Schieber (Direkte Taktik bis 'ziel')
+    az_set_multi(a,
+        schiebe_modus="direkt",
+        schiebe_datum=datum,
+        schiebe_ziel=ziel,
+        schiebe_dauer=dauer,
+        schiebe_court=court,
+        schiebe_buchbar_ab=buchbar_ab,
+        schiebe_offset_min=None,
+        schiebe_offset_max=None,
+        duo_court=fester_court,        # fester Court → kein Alternieren beim Schieben
+        schiebe_aktiv=True,
+        flow=None,
+    )
+    # Account 2 = Anschluss-Blitzer (Direkte Taktik, Start == Ziel == Anschluss-Slot)
+    az_set_multi(b,
+        schiebe_modus="direkt",
+        schiebe_datum=datum,
+        schiebe_ziel=anschluss_von,    # Ziel == Start → Phase 3 endet sofort (kein Schieben)
+        schiebe_dauer=dauer,
+        schiebe_court=court,
+        schiebe_buchbar_ab=anschluss_von,  # Blitz exakt bei Freischaltung des Anschluss-Slots
+        schiebe_offset_min=None,
+        schiebe_offset_max=None,
+        duo_court=fester_court,
+        schiebe_aktiv=True,
+        flow=None,
+    )
+
+    datum_obj   = datetime.strptime(datum, "%d.%m.%Y")
+    fenster_tag = (datum_obj - timedelta(days=7)).date()
+    unlock_a    = datetime.combine(fenster_tag, datetime.strptime(buchbar_ab, "%H:%M").time())
+    unlock_b    = datetime.combine(fenster_tag, datetime.strptime(anschluss_von, "%H:%M").time())
+    court_label = {0: "Egal (Court 2 bevorzugt)", 1: "Court 1",
+                   2: "Court 2"}.get(court, "?")
+
+    jetzt = jetzt_lokal()
+    if unlock_a <= jetzt:
+        frei_txt = "🚀 Start-Slot bereits freigeschaltet – Schieber blitzt sofort!"
+    else:
+        rest = unlock_a - jetzt
+        h  = rest.seconds // 3600
+        mi = (rest.seconds % 3600) // 60
+        rest_str = (f"{rest.days}T {h}h {mi}min" if rest.days > 0
+                    else f"{h}h {mi}min" if h > 0 else f"{mi}min")
+        frei_txt = f"⏳ Schieber-Freischaltung in {rest_str}"
+
+    senden(
+        f"🔗 <b>3h-Modus gestartet!</b>\n"
+        f"📅 {_datum_mit_tag(datum)} | 🏟️ {court_label} | je 90 Min\n"
+        f"🎯 <b>Block: {ziel}–{anschluss_bis} Uhr</b> (3 Std.)\n\n"
+        f"1️⃣ 🏃 <b>{a}</b> – Schieber (Direkte Taktik)\n"
+        f"   ⏰ Start ab {buchbar_ab} → schiebt bis 🎯 {ziel}  (Slot {ziel}–{anschluss_von})\n"
+        f"   🔓 {unlock_a.strftime('%d.%m. %H:%M')} Uhr\n\n"
+        f"2️⃣ ⚡ <b>{b}</b> – Anschluss-Blitz\n"
+        f"   💥 blitzt {anschluss_von}–{anschluss_bis} bei Freischaltung\n"
+        f"   🔓 {unlock_b.strftime('%d.%m. %H:%M')} Uhr\n\n"
+        f"{frei_txt}\n"
+        f"<i>Acc2 blitzt eigenständig zur Anschluss-Freischaltung – läuft auch, "
+        f"falls Acc1 den Zielslot knapp verpasst.</i>")
+
+    for k in (a, b):
+        t = threading.Thread(target=schiebe_loop, args=(k,), daemon=True)
+        t.start()
+        az_set(k, "schiebe_thread", t)
+
+    zeige_account_auswahl()
+
+
+# ══════════════════════════════════════════════
 # TELEGRAM CALLBACKS
 # ══════════════════════════════════════════════
 
@@ -2649,6 +2964,9 @@ def handle_callback(cb: dict):
     # Jeder Klick auf einen Nicht-Duo-Button verlässt einen offenen Duo-Eingabeschritt
     if not data.startswith("duo_") and _duo_awaiting_text():
         _duo_reset()
+    # Dasselbe für den 3h-Modus-Eingabeschritt
+    if not data.startswith("block_") and _block_awaiting_text():
+        _block_reset()
 
     if data in ("zurueck_accounts", "refresh_accounts"):
         zeige_account_auswahl()
@@ -2670,6 +2988,11 @@ def handle_callback(cb: dict):
     # ── Duo-Modus (eigener Flow über 2 Accounts) – früh abfangen ──────────────
     if data.startswith("duo_"):
         handle_duo_callback(data)
+        return
+
+    # ── 3h-Modus (Block, eigener Flow über 2 Accounts) – früh abfangen ────────
+    if data.startswith("block_"):
+        handle_block_callback(data)
         return
 
     k = get_flow_account()
@@ -3108,6 +3431,8 @@ def telegram_loop():
                     text   = msg.get("text", "").strip()
                     if _duo_awaiting_text():
                         handle_duo_text(text)
+                    elif _block_awaiting_text():
+                        handle_block_text(text)
                     else:
                         k_flow = get_flow_account()
                         if k_flow and az_get(k_flow, "flow") in ("direkte_startzeit",):
