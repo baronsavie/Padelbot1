@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
-"""Padel Bot v15.0.0
+"""Padel Bot v16.0.0
 
-NEU v15.0.0: SNIPER PHASE 1 – "Poll + vorgewärmter Blitz" statt Blind-Hammer.
-        Problem vorher: Phase 1 (das Lauern) feuerte blind ~1×/s ein komplettes
-        buche_slot (r1+r2+r3) in den noch belegten Slot. Ein Versuch = 3
-        sequentielle Requests (~0,6–2s je nach Server-Tempo), d.h. die "scharfen"
-        Commit-Momente lagen ~0,6–2s auseinander. Storniert der Fremde schnell
-        (oder per Bot, ~330ms Storno→Rebook), fällt der freie Moment zwischen
-        zwei Schüsse → "funktioniert nur wenn jemand sehr langsam schiebt".
-        Warum nicht einfach wie beim Schieben vorwärmen? Beim Schieben ist der
-        Feuer-Moment bekannt (direkt nach dem EIGENEN Storno); beim Sniper ist er
-        unbekannt, und der WebFlow-execution-Token ist pro Versuch verbraucht.
-        Lösung (deckt sich mit der schon länger notierten Polling-Idee):
-          • BILLIG pollen: 1 GET auf die Reservierungsliste je Zyklus (~0,2s),
-            ~3× schneller/leichter als ein voller Buchungsversuch.
-          • Dabei EINEN r1-Token vorgewärmt bereithalten (proaktiv alle paar
-            Sekunden erneuert).
-          • Sobald der p1-Slot frei erkannt wird → sofort nur r2+r3 feuern
-            (bewährter ~330ms-Burst), kein r1-Delay im kritischen Moment.
-          • Token leer/verbraucht → Fallback auf klassisches buche_slot.
-        Ergebnis: "Sensing" ~0,2s statt ~0,6–2s, deutlich engeres Netz UND
-        geringere Last (wichtig fürs Home-Assistant-Green-Gerät: nahezu reines
-        I/O-Warten, keine CPU-Dauerlast). Phase 2 (Blitz auf den frisch
-        freigeschalteten Anschluss-Slot) und die komplette Schiebe-Logik bleiben
-        100% unverändert.
-        Hinweis/Grenze: Ein reiner ~330ms-Bot-Rebook kann weiterhin dazwischen
-        greifen (Detect+Burst ≈ 0,4–0,5s); Phase 2 bleibt dafür der zweite Biss.
+NEU v16.0.0: SNIPER PHASE 1 – TOKEN-POOL + DAUER-BURST (mehrgleisig).
+        Live-Test (v15-Diagnose) bestätigt: jedes r1 liefert einen EIGENEN
+        Vorgang (e2s1, e3s1, e4s1 …) und dauert nur ~110ms. Damit ist ein
+        Token-Vorrat sinnvoll und der Feuer-Takt wird allein von r2+r3 (~330ms)
+        begrenzt, nicht mehr vom langsamen r1.
+        Ablauf Phase 1 (Lauern):
+          • SNIPER_POOL_WARMERS Nachschub-Threads holen LAUFEND r1-Tokens auf
+            Vorrat in einen Puffer (füllen nur bei Platz → r1-Last regelt sich
+            selbst aufs Feuer-Tempo, kein Leerlauf-Spam).
+          • SNIPER_POOL_FIRERS Feuer-Threads ziehen je einen Token und feuern
+            sofort r2+r3 (~330ms) in den belegten Slot. Jeder Schuss ist ein
+            ECHTER Buchungsversuch ("schießen = gucken") – aber der langsame
+            r1-Teil ist vorab & parallel erledigt. Mit 2 Feuer-Threads → ~6
+            Schüsse/s, Commit-Takt ~160ms. Sobald der Slot frei wird, sitzt einer
+            der Dauerschüsse quasi sofort.
+          • Puffer leer → Feuer-Thread holt sich selbst ein r1 (Fallback).
+          • Treffer wird nur GEMELDET (ergebnis-Dict + stop-Event); der
+            Koordinator-Thread (= sniper_loop) ruft danach trigger_phase3 → die
+            Schiebe-Taktik läuft im langlebigen Thread (nicht im Feuer-Thread).
+          • Session-Refresh alle 60s: Feuer kurz pausieren, neu einloggen, Puffer
+            leeren (alte Tokens gehören zur alten Session), weiter.
+        Ersetzt das v15-Polling (das gegen sehr schnelle Rebooks zu langsam war,
+        weil "erst gucken, dann greifen" ein Extra-Schritt ist). Phase 2 (Blitz
+        auf den frisch freigeschalteten Anschluss-Slot) und die komplette
+        Schiebe-Logik bleiben 100% unverändert. Der v15-Diagnose-Button wurde
+        wieder entfernt.
 
-DIAGNOSE v15: Button "🔬 Token-Test" im Account-Menü. Bucht NICHTS – feuert nur
-        5× r1 (Formular-GET) und zeigt die execution-Tokens + r1-Antwortzeit.
-        Klärt, ob jedes r1 einen eigenen Vorgang liefert (e1s1, e2s1, … →
-        Token-Pool/Dauer-Burst als v16 sinnvoll) oder pro Session immer dasselbe
-        e1s1 kommt (→ Plan B: parallele Blast-Worker). Rein additiv, Kern unberührt.
+NEU v16.0.0: Optionaler Zugriffsschutz per Passwort. Config-Option
+        `zugriff_passwort` (Standard leer = aus). Ist sie gesetzt, muss der
+        (ohnehin auf telegram_chat_id beschränkte) Chat das Passwort nach jedem
+        Bot-Start EINMAL senden, bevor Befehle verarbeitet werden. Laufende
+        Schiebe-/Sniper-Threads sind davon nicht betroffen.
 
 FIX v14.0.0: Sniper schiebt nach Treffer jetzt zuverlässig weiter.
         Bug: trigger_phase3() (Sniper-Treffer → Schiebe-Übergabe) setzte
@@ -148,6 +149,7 @@ Das Schieben geschieht HEUTE (z.B. 19.04), nicht am Buchungstag (26.04)!
 
 import re
 import json
+import queue
 import random
 import requests
 import threading
@@ -266,6 +268,12 @@ def _optional(key: str, default: str = "") -> str:
 TELEGRAM_BOT_TOKEN = _required("telegram_bot_token")
 TELEGRAM_CHAT_ID   = _required("telegram_chat_id")
 
+# Optionaler Zugriffsschutz: wenn 'zugriff_passwort' in der Config gesetzt ist,
+# muss der (ohnehin auf telegram_chat_id beschränkte) Chat es nach jedem
+# Bot-Start einmal senden, bevor Befehle verarbeitet werden. Leer = aus.
+ZUGRIFF_PASSWORT = _optional("zugriff_passwort")
+_zugriff_frei    = (ZUGRIFF_PASSWORT == "")   # ohne Passwort → sofort frei
+
 ANLAGE_OEFFNUNG     = "07:00"
 ANLAGE_SCHLUSS      = "22:00"
 
@@ -279,11 +287,11 @@ FRUEH_EXKLUSIV_VERSUCHE = 8
 # Smart-Sniper (R20–R23)
 SNIPER_PRE_END_MINUTES = 30      # Lauer-Fenster: letzte 30 Min vor fremder Endzeit
 SNIPER_LOGIN_BUFFER    = 5       # Min vor Lauer-Start: Refresh-Login
-SNIPER_PHASE1_INTERVAL = 0.1     # s: (v14-Legacy, ungenutzt) Hammer-Intervall Phase 1
 SNIPER_DEADLINE_BUFFER = 60      # s: Abbruch X Sek nach fremder Endzeit
-# v15: Phase-1-Lauern = billiges Reservierungs-Polling + vorgewärmter Blitz.
-SNIPER_PHASE1_POLL_INTERVAL = 0.2   # s: Poll-Intervall (1 billiges GET je Zyklus)
-SNIPER_PHASE1_REWARM_SECS   = 4     # s: r1-Token spätestens alle X s neu vorwärmen
+# v16: Phase-1-Lauern = Token-Pool + Dauer-Burst (mehrgleisig).
+SNIPER_POOL_WARMERS = 2     # Nachschub-Threads: holen laufend r1-Tokens in den Puffer
+SNIPER_POOL_FIRERS  = 2     # Feuer-Threads: ziehen Token, feuern r2+r3 (~330ms/Schuss)
+SNIPER_POOL_MAX     = 12    # max. vorgewärmte Tokens im Puffer
 
 # Direkt-Blitz
 BLITZ_PREWARM_SECONDS  = 10      # s: Pre-Warm r1 bei T-10s, Token cachen
@@ -667,7 +675,6 @@ def zeige_account_menue(k: str):
                [{"text": "🔄 Schiebe-Taktik",          "callback_data": f"menu_schiebe_{k}"}],
                [{"text": "🎯 Sniper-Modus",            "callback_data": f"menu_sniper_{k}"}],
                [{"text": "📊 Status",                  "callback_data": f"menu_status_{k}"}],
-               [{"text": "🔬 Token-Test (nur Analyse)",  "callback_data": f"menu_tokentest_{k}"}],
                [{"text": "⏹️ Stoppen (Schiebe/Sniper)", "callback_data": f"menu_stopp_{k}"}],
                [{"text": "🗑️ Buchung stornieren",      "callback_data": f"menu_storno_{k}"}],
                *([back_btn] if back_btn else []),
@@ -2258,7 +2265,9 @@ def _sniper_intern(k: str):
     Phase 1 (Lauern, lauer_start bis fremder_bis):
       - Ziel-Slot: fremder_bis - 30min bis +dauer (R21: bei fremder Startzeit-Position,
         d.h. überlappt mit den letzten 30 Min der fremden Buchung).
-      - Hämmere alle SNIPER_PHASE1_INTERVAL (0.1s) mit verify_person_id=True (STRIKT)
+      - v16: Token-Pool + Dauer-Burst. SNIPER_POOL_WARMERS Threads füllen laufend
+        einen r1-Token-Puffer, SNIPER_POOL_FIRERS Threads feuern daraus r2+r3
+        (~330ms/Schuss). Treffer via my-bookings verifiziert.
       - R23: Nur 1 Court (Court des Fremden).
 
     Phase 2 (Blitz, ab fremder_bis):
@@ -2275,7 +2284,7 @@ def _sniper_intern(k: str):
     Beispiel: Fremder Court 2, 17:00–18:30, Ziel 20:00 Uhr, Dauer 90 Min
       → Lauer-Start  : 18:00
       → Login-Refresh: 17:55
-      → Phase 1      : 18:00–18:30 hämmert Slot 18:00–19:30 Court 2 (verify=True)
+      → Phase 1      : 18:00–18:30 Dauer-Burst auf Slot 18:00–19:30 Court 2 (Token-Pool)
       → Phase 2      : ab 18:30 Blitz auf Slot 18:30–20:00 Court 2 (verify=False+Sync)
       → Deadline     : 18:31:00
     """
@@ -2395,93 +2404,119 @@ def _sniper_intern(k: str):
             zeige_account_menue(k)
             return
 
-    # ── Phase 1: Lauern (v15: Poll + vorgewärmter Blitz) ─────────────────────
+    # ── Phase 1: Lauern (v16: Token-Pool + Dauer-Burst, mehrgleisig) ─────────
     # Phase 1 stoppt bei prewarm_dt (= fremder_bis − BLITZ_PREWARM_SECONDS),
     # damit Phase 2 in Ruhe pre-warmen und ms-präzise auf fremder_bis blitzen kann.
     prewarm_dt = fremder_bis_dt - timedelta(seconds=BLITZ_PREWARM_SECONDS)
 
-    # v15-KERNIDEE: Früher feuerte Phase 1 blind ~1×/s ein volles buche_slot
-    # (r1+r2+r3, 3 Requests) in den belegten Slot. Der WebFlow-Token ist pro
-    # Versuch verbraucht → "einmal vorwärmen, oft feuern" geht hier NICHT (anders
-    # als beim Schieben, wo der Feuer-Moment bekannt ist). Deshalb: BILLIG pollen
-    # (1 GET auf die Reservierungsliste, ~3× schneller als ein Buchungsversuch)
-    # und dabei EINEN r1-Token vorgewärmt bereithalten. Sobald der p1-Slot frei
-    # wird, sofort nur r2+r3 feuern (der bewährte ~330ms-Burst) – kein r1-Delay im
-    # kritischen Moment. Ergebnis: "Sensing" ~0,2s statt ~0,6–2s, geringere Last.
-    # Fällt der Token aus (leer) → Fallback auf klassisches buche_slot.
-    p1_von_t = datetime.strptime(p1_von, "%H:%M")
-    p1_bis_t = datetime.strptime(p1_bis, "%H:%M")
+    # v16-KERNIDEE (live bestätigt): jedes r1 = eigener Vorgang (e2s1, e3s1 …),
+    # r1 dauert nur ~110ms. Also Vorrat statt Einzel-Token:
+    #   • Nachschub-Threads füllen laufend einen Puffer mit r1-Tokens (nur bei
+    #     Platz → r1-Last regelt sich selbst aufs Feuer-Tempo).
+    #   • Feuer-Threads ziehen je einen Token und feuern sofort r2+r3 (~330ms).
+    #     Jeder Schuss ist ein echter Buchungsversuch ("schießen = gucken"), aber
+    #     das langsame r1 ist vorab/parallel erledigt → Commit-Takt ~ r2+r3.
+    #   • Treffer wird nur GEMELDET; trigger_phase3 ruft der Koordinator-Thread
+    #     (= sniper_loop) danach auf, damit die Schiebe-Taktik im langlebigen
+    #     Thread läuft (nicht in einem Feuer-Thread, der gleich endet).
+    token_q      = queue.Queue(maxsize=SNIPER_POOL_MAX)
+    stop_evt     = threading.Event()    # allen Threads: Phase-1-Feierabend
+    pause_evt    = threading.Event()    # während Re-Login: Feuer/Nachschub kurz anhalten
+    treffer_lock = threading.Lock()
+    ergebnis     = {"treffer": None, "schuss": 0}
 
-    def _p1_frei(reservierungen: list) -> bool:
-        """True, wenn KEINE Reservierung auf dem Court den p1-Slot überlappt."""
-        for r in reservierungen:
-            try:
-                if int(r["court"]) != int(court):
-                    continue
-                rv = datetime.strptime(r["fromTime"], "%H:%M")
-                rb = datetime.strptime(r["toTime"],   "%H:%M")
-            except Exception:
+    def _p1_laeuft() -> bool:
+        return aktiv() and not stop_evt.is_set() and jetzt_lokal() < prewarm_dt
+
+    def _warmer():
+        while _p1_laeuft():
+            if pause_evt.is_set() or token_q.full():
+                time.sleep(0.03)
                 continue
-            if not (rb <= p1_von_t or rv >= p1_bis_t):   # Überlappung [rv,rb)∩[p1_von,p1_bis)
-                return False
-        return True
+            ex = pre_warm_r1(k, court, datum_api, p1_von, p1_bis)
+            if not ex:
+                time.sleep(0.05)
+                continue
+            try:
+                token_q.put_nowait(ex)
+            except queue.Full:
+                pass
 
-    def _p1_greifen(quelle: str) -> bool:
-        """Vorgewärmten Burst (sonst Fallback buche_slot) auf p1. True bei Treffer."""
-        nonlocal execution
-        if execution:
-            ok, _ = burst_r2_r3(k, court, execution, p1_slot)
-            execution = None                       # Token ist verbraucht
+    def _firer():
+        while _p1_laeuft():
+            if pause_evt.is_set():
+                time.sleep(0.03)
+                continue
+            try:
+                ex = token_q.get(timeout=0.2)
+            except queue.Empty:
+                ex = pre_warm_r1(k, court, datum_api, p1_von, p1_bis)  # Fallback: selbst holen
+                if not ex:
+                    continue
+            if not _p1_laeuft():        # Stop/Treffer/Zeitgrenze während get()/pre_warm? → nicht mehr feuern
+                return
+            ok, _ = burst_r2_r3(k, court, ex, p1_slot)
+            ergebnis["schuss"] += 1     # nur kosmetisch (Race unkritisch)
             if ok:
-                treffer = verifiziere_slot_via_my_bookings(k, p1_slot)
-                if treffer:
-                    trigger_phase3(treffer, f"Phase 1 {quelle}", versuche)
-                    return True
-        # Kein/verbrauchter Token oder Burst-Verify daneben → strenger Voll-Versuch
-        if buche_slot(k, p1_slot, verify_person_id=True):
-            treffer = az_get(k, "aktive_buchung")
-            if treffer:
-                trigger_phase3(treffer, f"Phase 1 {quelle} (Fallback)", versuche)
-                return True
-        return False
+                with treffer_lock:
+                    if ergebnis["treffer"]:
+                        return
+                    treffer = verifiziere_slot_via_my_bookings(k, p1_slot)
+                    if treffer:
+                        ergebnis["treffer"] = treffer
+                        stop_evt.set()
+                        return
+                # r3 OK, aber (noch) nicht in my-bookings → weiterfeuern
 
     senden(f"👀 [{k}] Phase 1 LAUERN auf {p1_von}–{p1_bis} Court {court}\n"
-           f"   Poll ~{int(SNIPER_PHASE1_POLL_INTERVAL*1000)}ms + vorgewärmter Blitz "
-           f"bis {prewarm_dt.strftime('%H:%M:%S')}")
-    versuche      = 0
+           f"   Token-Pool: {SNIPER_POOL_WARMERS} Nachschub + {SNIPER_POOL_FIRERS} Feuer "
+           f"(Dauer-Burst) bis {prewarm_dt.strftime('%H:%M:%S')}")
+
+    threads = ([threading.Thread(target=_warmer, daemon=True)
+                for _ in range(SNIPER_POOL_WARMERS)]
+             + [threading.Thread(target=_firer, daemon=True)
+                for _ in range(SNIPER_POOL_FIRERS)])
+    for t in threads:
+        t.start()
+
+    # Koordinator (dieser = sniper_loop-Thread): Session-Refresh + Abbruch-Wache.
     letzter_login = time.time()
-    execution     = pre_warm_r1(k, court, datum_api, p1_von, p1_bis)
-    letzter_warm  = time.time()
-    while aktiv() and jetzt_lokal() < prewarm_dt:
-        # Session-Refresh alle 60s (danach Token neu vorwärmen – alte Session tot).
-        if versuche > 0 and time.time() - letzter_login > 60:
+    login_failed  = False
+    while _p1_laeuft():
+        if time.time() - letzter_login > 60:
             if not ist_eingeloggt(k):
-                if not einloggen(k):
-                    senden(f"❌ [{k}] Sniper P1: Login fehlgeschlagen.")
-                    az_set(k, "sniper_aktiv", False)
-                    zeige_account_menue(k)
-                    return
-                execution = None
+                pause_evt.set()
+                time.sleep(0.15)                       # laufende Requests auslaufen lassen
+                ok_login = einloggen(k)
+                try:                                   # Puffer leeren: alte Tokens = alte Session
+                    while True:
+                        token_q.get_nowait()
+                except queue.Empty:
+                    pass
+                pause_evt.clear()
+                if not ok_login:
+                    login_failed = True
+                    stop_evt.set()
+                    break
             letzter_login = time.time()
+        time.sleep(0.2)
 
-        # Token frisch halten: WebFlow-Execution bleibt Minuten gültig, wir
-        # erneuern proaktiv alle paar Sekunden, damit der Griff garantiert sofort
-        # sitzt (statt im kritischen Moment erst r1 nachladen zu müssen).
-        if not execution or time.time() - letzter_warm > SNIPER_PHASE1_REWARM_SECS:
-            execution    = pre_warm_r1(k, court, datum_api, p1_von, p1_bis)
-            letzter_warm = time.time()
+    stop_evt.set()
+    for t in threads:
+        t.join(timeout=1.5)
 
-        versuche += 1
-        if _p1_frei(hole_reservierungen(k, datum_api)):
-            log.info(f"[{k}] Sniper P1: p1-Slot frei erkannt → Blitz-Griff "
-                     f"(Poll-Zyklus {versuche})")
-            if _p1_greifen("Poll-Treffer"):
-                return
+    if ergebnis["treffer"]:
+        trigger_phase3(ergebnis["treffer"], "Phase 1 Pool-Burst", ergebnis["schuss"])
+        return
 
-        time.sleep(SNIPER_PHASE1_POLL_INTERVAL)
+    if login_failed:
+        senden(f"❌ [{k}] Sniper P1: Login fehlgeschlagen.")
+        az_set(k, "sniper_aktiv", False)
+        zeige_account_menue(k)
+        return
 
     if not aktiv():
-        senden(f"⏹️ [{k}] Sniper gestoppt nach Phase 1 ({versuche} Versuche).")
+        senden(f"⏹️ [{k}] Sniper gestoppt nach Phase 1 ({ergebnis['schuss']} Schüsse).")
         az_set(k, "sniper_aktiv", False)
         zeige_account_menue(k)
         return
@@ -3063,71 +3098,6 @@ def _starte_block(a: str, b: str, datum: str, ziel: str, court: int, buchbar_ab:
 
 
 # ══════════════════════════════════════════════
-# TOKEN-TEST (Diagnose – bucht NICHTS)
-# ══════════════════════════════════════════════
-
-def _token_test_lauf(k: str):
-    """
-    🔬 Diagnose (bucht NICHTS): feuert 5× r1 (reiner Formular-GET, kein r2/r3)
-    und zeigt die execution-Tokens. Klärt DIE entscheidende Frage für den
-    Token-Pool-Modus (v16):
-      • Liefert jedes frische r1 einen EIGENEN Vorgang (e1s1, e2s1, e3s1 …)?
-        → Token-Vorrat/Pool sinnvoll (Dauer-Burst ~330ms Takt).
-      • Oder gibt der Server pro Session immer dasselbe e1s1 zurück?
-        → Pool auf einer Session zwecklos → Plan B: parallele Blast-Worker.
-    Zusätzlich wird die r1-Antwortzeit gemessen (nützlich fürs Takt-Design).
-    Läuft in eigenem Thread, blockiert den Telegram-Loop nicht.
-    """
-    try:
-        senden(f"🔬 [{k}] Token-Test – Session wird sichergestellt …")
-        if not stelle_session_sicher(k):
-            senden(f"❌ [{k}] Token-Test: Login/Session fehlgeschlagen.")
-            return
-
-        # Harmloser Zielslot NUR für r1 (kein r2/r3 → garantiert keine Buchung):
-        # morgen, 20:00–21:30, Court 2.
-        datum_de  = (jetzt_lokal() + timedelta(days=1)).strftime("%d.%m.%Y")
-        datum_api = datetime.strptime(datum_de, "%d.%m.%Y").strftime("%m/%d/%Y")
-        court, von, bis = 2, "20:00", "21:30"
-
-        tokens, zeiten = [], []
-        for _ in range(5):
-            t0 = time.perf_counter()
-            ex = pre_warm_r1(k, court, datum_api, von, bis)
-            zeiten.append((time.perf_counter() - t0) * 1000.0)
-            tokens.append(ex)
-            time.sleep(0.2)
-
-        zeilen = "\n".join(
-            f"   r1 #{i + 1}: <code>{tokens[i] or '—'}</code>  ({zeiten[i]:.0f} ms)"
-            for i in range(len(tokens)))
-        # "e1s1" → "e1"; Menge der verschiedenen Vorgänge:
-        e_teile = sorted({ex.split("s")[0] for ex in tokens if ex and "s" in ex})
-        avg_ms  = sum(zeiten) / len(zeiten) if zeiten else 0.0
-
-        if len(e_teile) >= 2:
-            fazit = ("✅ <b>POOL MÖGLICH</b> – jedes r1 = eigener Vorgang.\n"
-                     "→ v16 mit Token-Vorrat (Dauer-Burst ~330ms) bauen.")
-        elif len(e_teile) == 1:
-            fazit = (f"⚠️ <b>ALLE GLEICH</b> ({e_teile[0]}) – eine Session = ein Vorgang.\n"
-                     "→ Pool zwecklos, Plan B: parallele Blast-Worker.")
-        else:
-            fazit = "❌ Keine Tokens erhalten – Session/Netz prüfen."
-
-        senden(f"🔬 <b>[{k}] Token-Test (bucht nichts)</b>\n"
-               f"Slot: Court {court} {von}–{bis} am {datum_de}\n\n"
-               f"{zeilen}\n\n"
-               f"Verschiedene Vorgänge: <b>{e_teile or '—'}</b>\n"
-               f"Ø r1-Zeit: <b>{avg_ms:.0f} ms</b>\n\n"
-               f"{fazit}")
-    except Exception as e:
-        log.error(f"[{k}] Token-Test Crash: {e}", exc_info=True)
-        senden(f"💥 [{k}] Token-Test Fehler: {e}")
-    finally:
-        zeige_account_menue(k)
-
-
-# ══════════════════════════════════════════════
 # TELEGRAM CALLBACKS
 # ══════════════════════════════════════════════
 
@@ -3267,16 +3237,6 @@ def handle_callback(cb: dict):
                    f"👤 Person: {pid}\n"
                    + (f"🔄 Schiebe ({modus_l}) läuft..." if schiebe else "Bot wartet."))
         zeige_account_menue(k)
-
-    elif data == "menu_tokentest":
-        # 🔬 Diagnose für v16-Entscheidung – bucht NICHTS (nur 5× r1).
-        if az_get(k, "schiebe_aktiv") or az_get(k, "sniper_aktiv"):
-            senden(f"⚠️ [{k}] Erst laufenden Prozess stoppen – der Token-Test "
-                   f"würde die Session stören.")
-            zeige_account_menue(k)
-            return
-        senden(f"🔬 [{k}] Token-Test läuft (bucht nichts, ~2 s) …")
-        threading.Thread(target=_token_test_lauf, args=(k,), daemon=True).start()
 
     elif data == "menu_stopp":
         stopped = []
@@ -3605,7 +3565,9 @@ def handle_callback(cb: dict):
 # ══════════════════════════════════════════════
 
 def telegram_loop():
-    log.info("📡 Telegram-Listener gestartet")
+    global _zugriff_frei
+    log.info("📡 Telegram-Listener gestartet"
+             + (" (🔒 Passwort-Schutz aktiv)" if ZUGRIFF_PASSWORT else ""))
     while True:
         try:
             for update in hole_updates():
@@ -3615,6 +3577,16 @@ def telegram_loop():
                     if chat_id != str(TELEGRAM_CHAT_ID):
                         continue
                     text   = msg.get("text", "").strip()
+                    # Optionaler Passwort-Gate: erst freischalten, dann Befehle.
+                    if not _zugriff_frei:
+                        if text == ZUGRIFF_PASSWORT:
+                            _zugriff_frei = True
+                            senden("🔓 Zugriff freigeschaltet.")
+                            zeige_account_auswahl()
+                        else:
+                            senden("🔒 <b>Passwort erforderlich.</b>\n"
+                                   "Bitte das Zugriffs-Passwort senden.")
+                        continue
                     if _duo_awaiting_text():
                         handle_duo_text(text)
                     elif _block_awaiting_text():
@@ -3630,6 +3602,9 @@ def telegram_loop():
                     cb      = update["callback_query"]
                     chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
                     if chat_id == str(TELEGRAM_CHAT_ID):
+                        if not _zugriff_frei:
+                            senden("🔒 Bitte zuerst das Zugriffs-Passwort senden.")
+                            continue
                         handle_callback(cb)
         except Exception as e:
             log.error(f"Telegram-Loop: {e}")
