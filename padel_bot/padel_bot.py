@@ -1,5 +1,43 @@
 #!/usr/bin/env python3
-"""Padel Bot v16.0.0
+"""Padel Bot v16.0.1
+
+FIX v16.0.1: Vier Fixes nach Live-Vorfällen vom 01.07./02.07.:
+
+  FIX A (Sniper-Crash 01.07. 17:04): NameError 'versuche' in _sniper_intern.
+        Phase 2 referenzierte den v13-Zähler `versuche`, der in v16 durch
+        `ergebnis["schuss"]` ersetzt wurde – sowohl beim P2-Treffer
+        (trigger_phase3) als auch in der Deadline-Meldung. Jeder Sniper-Lauf,
+        der Phase 2 erreichte, crashte damit. Beide Stellen korrigiert.
+
+  FIX B (Server-Ausfall 01.07. 15:30 + 17:30 → "Login fehlgeschlagen"):
+        Der ungebremste Phase-1-Dauer-Burst (~30 Requests/s; execution-Zähler
+        e955/e710 = ~700–950 neue Server-Vorgänge in <1 Min) hat den
+        ebusy-Server BEIDE Male exakt ~45–50s nach Lauer-Start abstürzen
+        lassen (Connection refused – auch Login unmöglich). Fix:
+        SNIPER_SHOT_GAP_MS drosselt jeden Feuer-Thread nach dem Schuss →
+        Gesamtlast ~2 Schüsse/s wie in v13 (die nie Ausfälle hatte),
+        Slot-frei-Erkennung weiterhin <1s. Zusätzlich: schlägt der 60s-
+        Session-Refresh-Login fehl (Server-Ausfall), bricht der Sniper nicht
+        mehr sofort ab, sondern versucht alle 10s neu einzuloggen, solange
+        das Phase-1-Fenster läuft (Feuer pausiert derweil).
+
+  FIX C (Endlos-Storno 02.07. 15:23, >25 Min auf fremde ID 19508):
+        Wurzel: buche_slot() STRIKT verifizierte über /padel-Reservierungen –
+        die zeigen ALLE Buchungen (auch fremde) und wurden nur auf
+        Court+Zeit gematcht. Am 02.07. 14:20 schnappte sich jemand den Slot
+        im Storno-Fenster; der Fallback-buche_slot hielt DESSEN Buchung
+        (ID 19508) für die eigene ("OK + verifiziert") → der nächste
+        Schiebe-Schritt stornierte endlos ins Leere. Fix: Nach dem
+        Reservierungs-Match bestätigt jetzt zusätzlich my-bookings (listet
+        NUR eigene Buchungen) das Eigentum; sonst False → der bestehende
+        Rebook-Fallback + ehrliche Fehlermeldung greifen.
+
+  FIX D (Sicherheitsnetz zu FIX C): Schlägt das Storno im Schiebe-Loop 6×
+        fehl, wird per my-bookings geprüft, ob die Buchung überhaupt (noch)
+        uns gehört. Nicht (mehr) unsere → weiter zum Rebook statt
+        Endlosschleife. Noch unsere, aber mit anderer ID → booking_id wird
+        korrigiert und erneut storniert. storniere_buchung() loggt bei
+        Fehlschlag jetzt den HTTP-Status (vorher stiller False-Return).
 
 NEU v16.0.0: SNIPER PHASE 1 – TOKEN-POOL + DAUER-BURST (mehrgleisig).
         Live-Test (v15-Diagnose) bestätigt: jedes r1 liefert einen EIGENEN
@@ -13,9 +51,9 @@ NEU v16.0.0: SNIPER PHASE 1 – TOKEN-POOL + DAUER-BURST (mehrgleisig).
           • SNIPER_POOL_FIRERS Feuer-Threads ziehen je einen Token und feuern
             sofort r2+r3 (~330ms) in den belegten Slot. Jeder Schuss ist ein
             ECHTER Buchungsversuch ("schießen = gucken") – aber der langsame
-            r1-Teil ist vorab & parallel erledigt. Mit 2 Feuer-Threads → ~6
-            Schüsse/s, Commit-Takt ~160ms. Sobald der Slot frei wird, sitzt einer
-            der Dauerschüsse quasi sofort.
+            r1-Teil ist vorab & parallel erledigt. (v16.0.1: auf ~1,5 Schüsse/s
+            gedrosselt, siehe FIX B – der ungebremste Takt hat den Server
+            abgeschossen.) Sobald der Slot frei wird, sitzt ein Dauerschuss.
           • Puffer leer → Feuer-Thread holt sich selbst ein r1 (Fallback).
           • Treffer wird nur GEMELDET (ergebnis-Dict + stop-Event); der
             Koordinator-Thread (= sniper_loop) ruft danach trigger_phase3 → die
@@ -292,6 +330,13 @@ SNIPER_DEADLINE_BUFFER = 60      # s: Abbruch X Sek nach fremder Endzeit
 SNIPER_POOL_WARMERS = 2     # Nachschub-Threads: holen laufend r1-Tokens in den Puffer
 SNIPER_POOL_FIRERS  = 2     # Feuer-Threads: ziehen Token, feuern r2+r3 (~330ms/Schuss)
 SNIPER_POOL_MAX     = 12    # max. vorgewärmte Tokens im Puffer
+# FIX v16.0.1: Pause pro Feuer-Thread NACH jedem Schuss. Der ungebremste
+# Dauer-Burst (~30 Req/s, ~900 Server-Vorgänge in 50s) hat den ebusy-Server
+# am 01.07. um 15:30 UND 17:30 jeweils ~45s nach Lauer-Start abstürzen lassen
+# (Connection refused → auch Login unmöglich). Mit 1000ms Gap + 2 Feuer-Threads
+# ≈ 1,5 Schüsse/s (~4–5 Req/s gesamt, wie die stabile v13) – ein frei werdender
+# Slot wird trotzdem in <1s erwischt.
+SNIPER_SHOT_GAP_MS  = 1000
 
 # Direkt-Blitz
 BLITZ_PREWARM_SECONDS  = 10      # s: Pre-Warm r1 bei T-10s, Token cachen
@@ -1125,6 +1170,23 @@ def buche_slot(k: str, slot: dict, verify_person_id: bool = True) -> bool:
             az_set(k, "aktive_buchung", None)
             return False
 
+        # FIX v16.0.1 (Eigentums-Check): Die /padel-Reservierungen oben zeigen
+        # ALLE Buchungen (auch fremde) und matchen nur Court+Zeit. Schnappte
+        # sich jemand den Slot im Storno-Fenster, galt dessen Buchung bisher
+        # als eigene (02.07.: fremde ID 19508 → Endlos-Storno ins Leere).
+        # my-bookings listet NUR eigene Buchungen → verbindliche Bestätigung.
+        eigene = verifiziere_slot_via_my_bookings(k, slot)
+        if not eigene:
+            time.sleep(1.0)
+            eigene = verifiziere_slot_via_my_bookings(k, slot)
+        if not eigene:
+            log.warning(f"[{k}] ⚠️ Slot belegt, aber NICHT in my-bookings – "
+                        f"fremde Buchung (ID {booking_id})! Keine Bestätigung.")
+            az_set(k, "aktive_buchung", None)
+            return False
+        if eigene.get("booking_id"):
+            booking_id = eigene["booking_id"]
+
         az_set(k, "aktive_buchung", {**slot, "court": int(court), "booking_id": booking_id})
         log.info(f"✅ [{k}] Buchung OK + verifiziert – ID: {booking_id}")
         return True
@@ -1153,6 +1215,10 @@ def storniere_buchung(k: str, booking_id: int, datum_api: str) -> bool:
             az_set(k, "aktive_buchung", None)
             log.info(f"✅ [{k}] Stornierung OK")
             return True
+        # FIX v16.0.1: Status loggen – vorher stiller False-Return, dadurch war
+        # der Endlos-Storno vom 02.07. im Log nicht diagnostizierbar.
+        log.warning(f"[{k}] Stornierung fehlgeschlagen: HTTP {r2.status_code} "
+                    f"(ID {booking_id})")
         return False
     except Exception as e:
         log.error(f"[{k}] Stornierung: {e}")
@@ -1856,11 +1922,33 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
             time.sleep(10)
 
         if not storno_ok:
-            senden(f"❌ [{k}] Stornierung nach 6 Versuchen fehlgeschlagen – retry in 30s.\n"
-                   f"Buchung bleibt: {aktive_b['fromTime']}–{aktive_b['toTime']}")
-            if not schlafe(30):
-                return
-            continue
+            # FIX v16.0.1: Gehört die Buchung überhaupt (noch) uns? Am 02.07.
+            # hielt der Bot eine FREMDE booking_id (19508, Slot im Storno-
+            # Fenster geklaut) für seine eigene und stornierte >25 Min endlos
+            # ins Leere. my-bookings listet nur EIGENE Buchungen:
+            #   • Slot nicht (mehr) drin → Buchung war fremd oder ist schon
+            #     weg → wir halten NICHTS → weiter zum Rebook-Pfad (der bei
+            #     belegtem Slot sauber mit Fehlermeldung endet).
+            #   • Slot drin, aber andere ID → gespeicherte ID war falsch →
+            #     ID korrigieren und nächste Runde erneut stornieren.
+            noch_meine = verifiziere_slot_via_my_bookings(k, aktive_b)
+            if noch_meine is None:
+                log.warning(f"[{k}] Storno scheitert UND Slot nicht in my-bookings "
+                            f"→ ID {booking_id} war fremd/weg. Weiter zum Rebook.")
+                senden(f"⚠️ [{k}] {aktive_b['fromTime']}–{aktive_b['toTime']} gehört "
+                       f"nicht (mehr) zu diesem Account – versuche Neubuchung...")
+                az_set(k, "aktive_buchung", None)
+                storno_ok = True
+            else:
+                if noch_meine.get("booking_id") and noch_meine["booking_id"] != booking_id:
+                    log.warning(f"[{k}] booking_id korrigiert: "
+                                f"{booking_id} → {noch_meine['booking_id']}")
+                    az_set(k, "aktive_buchung", noch_meine)
+                senden(f"❌ [{k}] Stornierung nach 6 Versuchen fehlgeschlagen – retry in 30s.\n"
+                       f"Buchung bleibt: {aktive_b['fromTime']}–{aktive_b['toTime']}")
+                if not schlafe(30):
+                    return
+                continue
 
         gerade_court = aktive_b["court"]   # für eff_court-Fallback weiter unten
 
@@ -2467,6 +2555,9 @@ def _sniper_intern(k: str):
                         stop_evt.set()
                         return
                 # r3 OK, aber (noch) nicht in my-bookings → weiterfeuern
+            # FIX v16.0.1: Feuer-Takt drosseln – der ungebremste Burst hat den
+            # Server am 01.07. zweimal abgeschossen (siehe SNIPER_SHOT_GAP_MS).
+            time.sleep(SNIPER_SHOT_GAP_MS / 1000.0)
 
     senden(f"👀 [{k}] Phase 1 LAUERN auf {p1_von}–{p1_bis} Court {court}\n"
            f"   Token-Pool: {SNIPER_POOL_WARMERS} Nachschub + {SNIPER_POOL_FIRERS} Feuer "
@@ -2488,6 +2579,23 @@ def _sniper_intern(k: str):
                 pause_evt.set()
                 time.sleep(0.15)                       # laufende Requests auslaufen lassen
                 ok_login = einloggen(k)
+                # FIX v16.0.1: Login-Fehlschlag ist meist ein KURZER Server-
+                # Ausfall (01.07. 15:31/17:31: Connection refused). Vorher
+                # brach der Sniper hier sofort komplett ab. Jetzt: alle 10s
+                # neu versuchen, solange das Phase-1-Fenster läuft – Feuer
+                # und Nachschub bleiben derweil pausiert (kein Fehler-Spam).
+                if not ok_login:
+                    log.warning(f"[{k}] Sniper P1: Login fehlgeschlagen – "
+                                f"Server-Ausfall? Retry alle 10s...")
+                    naechster_versuch = time.time() + 10
+                    while not ok_login and _p1_laeuft():
+                        time.sleep(1.0)
+                        if time.time() >= naechster_versuch:
+                            ok_login = einloggen(k)
+                            naechster_versuch = time.time() + 10
+                    if ok_login:
+                        log.info(f"[{k}] Sniper P1: Login wieder OK – "
+                                 f"Feuer geht weiter.")
                 try:                                   # Puffer leeren: alte Tokens = alte Session
                     while True:
                         token_q.get_nowait()
@@ -2570,8 +2678,9 @@ def _sniper_intern(k: str):
         if ok:
             verifiziert = verifiziere_slot_via_my_bookings(k, p2_slot)
             if verifiziert:
+                # FIX v16.0.1: `versuche` gab es nur in v13 – NameError-Crash.
                 trigger_phase3(verifiziert, "Phase 2 Blitz",
-                               versuche + p2_versuche)
+                               ergebnis["schuss"] + p2_versuche)
                 return
             else:
                 log.warning(f"[{k}] Sniper P2 Burst r3 OK aber nicht in my-bookings.")
@@ -2580,7 +2689,7 @@ def _sniper_intern(k: str):
 
     senden(f"❌ [{k}] Sniper-Deadline erreicht. Fremder hat nicht storniert und "
            f"Blitz hat den frisch freigeschalteten Slot nicht erwischt.\n"
-           f"   Phase 1: {versuche} Versuche, Phase 2: {p2_versuche} Bursts.")
+           f"   Phase 1: {ergebnis['schuss']} Schüsse, Phase 2: {p2_versuche} Bursts.")
     az_set(k, "sniper_aktiv", False)
     zeige_account_menue(k)
 
@@ -3619,7 +3728,7 @@ def telegram_loop():
 
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("🎾 Padel Bot v10.0.0 – Fixes: Verifikation | Schiebe-Speed | Sniper")
+    log.info("🎾 Padel Bot v16.0.1 – Fixes: Sniper-NameError | Feuer-Drossel | Eigentums-Check")
     log.info("   FIX 1: buche_slot() kein False-Positiv mehr (kein verifiziert=True Fallback)")
     log.info("   FIX 2: Rebook nach Storno: 30× mit 0.1s | Storno-Retry: aktiv()-Check")
     log.info("   NEU 3: Sniper-Modus – sekündlicher Dauerhammer + Schiebe nach Treffer")
@@ -3660,7 +3769,7 @@ if __name__ == "__main__":
     anzahl      = len(ACCOUNTS)
     modus_label = "Dual-Account" if anzahl > 1 else "Einzel-Account"
     startup_msg = (
-        f"🎾 <b>Padel Bot v10.0.0 gestartet!</b>\n\n"
+        f"🎾 <b>Padel Bot v16.0.1 gestartet!</b>\n\n"
         f"{modus_label}  |  3 Schiebe-Modi  |  🎯 Sniper-Modus\n\n"
         f"<b>NEU v10:</b>\n"
         f"🔒 Buchung nur bestätigt wenn Server-Sync OK (kein False-Positiv)\n"
@@ -3689,4 +3798,4 @@ if __name__ == "__main__":
             time.sleep(10)
     except KeyboardInterrupt:
         log.info("Bot beendet.")
-        senden("⏹️ Padel Bot v10.0.0 wurde beendet.")
+        senden("⏹️ Padel Bot v16.0.1 wurde beendet.")
