@@ -1084,8 +1084,8 @@ def storniere_buchung(k: str, booking_id: int, datum_api: str) -> bool:
     h = _ajax_header(csrf_t, accept="text/html, */*; q=0.01",
                      referer=f"{BASE_URL}/padel?currentDate={datum_api}")
     try:
-        http.get(f"{BASE_URL}/court-module/{MODULE}/bookings/{booking_id}/cancel",
-                 headers=h, timeout=10)
+        r1 = http.get(f"{BASE_URL}/court-module/{MODULE}/bookings/{booking_id}/cancel",
+                      headers=h, timeout=10)
         r2 = http.get(f"{BASE_URL}/court-module/{MODULE}/bookings/{booking_id}/cancel",
                       params={"button_confirm": CONFIRM_KEY},
                       headers={**h, "accept": "*/*"}, timeout=10)
@@ -1093,6 +1093,10 @@ def storniere_buchung(k: str, booking_id: int, datum_api: str) -> bool:
             az_set(k, "aktive_buchung", None)
             log.info(f"✅ [{k}] Stornierung OK")
             return True
+        # DIAGNOSE: warum schlug der Cancel fehl? (Statuscode + Body-Anfang beider Schritte)
+        body2 = (r2.text or "")[:300].replace("\n", " ")
+        log.warning(f"[{k}] Storno FAIL ID {booking_id}: "
+                    f"r1={r1.status_code} r2={r2.status_code} | body2={body2!r}")
         return False
     except Exception as e:
         log.error(f"[{k}] Stornierung: {e}")
