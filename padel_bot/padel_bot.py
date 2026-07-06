@@ -363,6 +363,22 @@ def _duo_awaiting_text() -> bool:
     with _duo_lock:
         return _duo["flow"] == "startzeit"
 
+# Safe-Modus: ZWEI Accounts wechseln sich EINEN Slot auf EINEM Court ab.
+# Nie bucht der Account neu, der gerade storniert hat – immer der freie Partner.
+_safe = {"flow": None, "acc_a": None, "acc_b": None, "court": None,
+         "datum": None, "ziel": None, "strategie": None}
+_safe_lock = threading.Lock()
+SAFE_UEBERLAPP_MIN = 30   # Übergabe: Überlappung des nächsten Slots (wie klassisch)
+
+def _safe_reset():
+    with _safe_lock:
+        _safe.update(flow=None, acc_a=None, acc_b=None, court=None,
+                     datum=None, ziel=None, strategie=None)
+
+def _safe_awaiting_text() -> bool:
+    with _safe_lock:
+        return _safe["flow"] == "startzeit"
+
 # 3h-Modus (Block): eigener Auswahl-Flow über ZWEI Accounts (wie Duo), zusätzlich
 # mit Court-Wahl. Acc1 schiebt bis Wunschanfang, Acc2 blitzt den Anschluss-Slot.
 _block = {"flow": None, "acc_a": None, "acc_b": None,
@@ -560,6 +576,8 @@ def zeige_account_auswahl():
                          "callback_data": "duo_start"}])
         buttons.append([{"text": "🔗 3h-Modus (Block, 2 Accounts)",
                          "callback_data": "block_start"}])
+        buttons.append([{"text": "🛡️ Safe-Modus (2 Accounts, 1 Slot)",
+                         "callback_data": "safe_start"}])
 
     status_zeilen = ""
     for k in sorted_accounts:
@@ -1025,48 +1043,29 @@ def buche_slot(k: str, slot: dict, verify_person_id: bool = True) -> bool:
             log.info(f"⚡ [{k}] SPEED-Buchung r3 OK – ID: {booking_id} (Sync folgt vom Caller)")
             return True
 
-        # Verifizierung: keine Falsch-Positive, kein Fallback auf True.
-        time.sleep(1.0)
-        verifiziert = False
-        try:
-            server_res = hole_reservierungen(k, datum_api)
-            for res in server_res:
-                if (res["court"] == int(court) and
-                        res["fromTime"] == from_t and res["toTime"] == to_t):
-                    res_bid = res.get("booking") or res.get("bookingOrBlockingId")
-                    if booking_id and res_bid and res_bid == booking_id:
-                        verifiziert = True
-                        break
-                    elif not booking_id and res_bid:
-                        booking_id  = res_bid
-                        verifiziert = True
-                        break
-        except Exception as ve1:
-            log.warning(f"[{k}] Verifikations-Versuch 1 fehlgeschlagen: {ve1}")
+        # Verifizierung NUR über my-bookings (EIGENTUM!), NICHT über den Court-Plan.
+        # hole_reservierungen()/​/padel liefert ALLE Buchungen+Blockungen des Courts –
+        # ein fremd belegter Slot ginge dort als "verifiziert" durch und dessen FREMDE
+        # booking_id würde als unsere gespeichert (→ späteres Storno = 403-Endlosschleife,
+        # siehe Fehler1.log ID 19811). /user/my-bookings enthält ausschließlich EIGENE
+        # Buchungen. Kurzer Retry gegen my-bookings-Lag (verhindert Falsch-Negativ).
+        expected = {**slot, "court": int(court), "fromTime": from_t, "toTime": to_t}
+        verifiziert_dict = None
+        for _vv in range(3):
+            verifiziert_dict = verifiziere_slot_via_my_bookings(k, expected)
+            if verifiziert_dict:
+                break
+            time.sleep(1.0)
 
-        # Zweiter Versuch falls erster fehlgeschlagen (1.5s später)
-        if not verifiziert:
-            try:
-                time.sleep(1.5)
-                server_res2 = hole_reservierungen(k, datum_api)
-                for res in server_res2:
-                    if (res["court"] == int(court) and
-                            res["fromTime"] == from_t and res["toTime"] == to_t):
-                        res_bid = res.get("booking") or res.get("bookingOrBlockingId")
-                        if res_bid:
-                            booking_id  = res_bid
-                        verifiziert = True
-                        break
-            except Exception as ve2:
-                log.warning(f"[{k}] Verifikations-Versuch 2 fehlgeschlagen: {ve2}")
-
-        if not verifiziert:
-            log.warning(f"[{k}] ⚠️ Buchung NICHT verifiziert – möglicherweise zwischengebucht!")
+        if not verifiziert_dict:
+            log.warning(f"[{k}] ⚠️ Buchung NICHT in eigenen my-bookings – "
+                        f"fremder Slot oder Fehlschlag (r3-ID war {booking_id}).")
             az_set(k, "aktive_buchung", None)
             return False
 
-        az_set(k, "aktive_buchung", {**slot, "court": int(court), "booking_id": booking_id})
-        log.info(f"✅ [{k}] Buchung OK + verifiziert – ID: {booking_id}")
+        az_set(k, "aktive_buchung", verifiziert_dict)
+        log.info(f"✅ [{k}] Buchung OK + verifiziert (eigen) – "
+                 f"ID: {verifiziert_dict.get('booking_id')}")
         return True
     except Exception as e:
         log.error(f"[{k}] Buchungsfehler: {e}")
@@ -1520,6 +1519,12 @@ def burst_r2_r3(k: str, court: int, execution: str, slot: dict) -> tuple[bool, d
             if mid:
                 booking_id = int(mid.group(1))
                 break
+        # DIAGNOSE (temporär): Warum landet ein "ok=True"-Burst nie in my-bookings?
+        # Zeigt r3-Status + geparste ID + Body-Anfang → verrät, ob r3 wirklich gebucht
+        # hat (echte Buchungsseite/-ID) oder nur eine 200-Overlap-/Bestätigungsseite kam.
+        _b3 = (r3.text or "")[:400].replace("\n", " ")
+        log.info(f"🔎 [{k}] Burst-r3 Court {court}: status={r3.status_code} "
+                 f"parsed_id={booking_id} | body={_b3!r}")
         return True, {**slot, "court": int(court), "booking_id": booking_id}
     except Exception as e:
         log.warning(f"[{k}] burst_r2_r3 Court {court}: {e}")
@@ -1800,6 +1805,21 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
             time.sleep(10)
 
         if not storno_ok:
+            # 403 = Server verweigert den Cancel. Häufigste Ursache: die lokal
+            # gemerkte Buchung gehört gar nicht (mehr) zu diesem Account
+            # (Phantom-/Fremdbuchung, bereits storniert). Dann ist Weiter-Retry
+            # sinnlos → würde ewig gegen den Server hämmern. Erst prüfen, ob die
+            # Buchung überhaupt noch in my-bookings steht.
+            noch_meins = verifiziere_slot_via_my_bookings(k, aktive_b)
+            if not noch_meins:
+                log.warning(f"[{k}] Storno unmöglich: ID {booking_id} nicht in "
+                            f"my-bookings → gehört nicht (mehr) zu diesem Account.")
+                az_set(k, "aktive_buchung", None)
+                beende(f"⛔ [{k}] Buchung {booking_id} ist nicht (mehr) in deinem "
+                       f"Konto (Storno 403) – Schiebe gestoppt.\n"
+                       f"🆘 Bitte manuell prüfen:\n"
+                       f"{BASE_URL}/padel?currentDate={datum_api}")
+                return
             senden(f"❌ [{k}] Stornierung nach 6 Versuchen fehlgeschlagen – retry in 30s.\n"
                    f"Buchung bleibt: {aktive_b['fromTime']}–{aktive_b['toTime']}")
             if not schlafe(30):
@@ -1825,7 +1845,7 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
                         time.sleep(MULTI_SHOT_GAP_MS / 1000.0)
                         continue
                 t0 = time.perf_counter()
-                erfolg, _ = burst_r2_r3(k, blitz_court, execution, ziel_slot)
+                erfolg, burst_dict = burst_r2_r3(k, blitz_court, execution, ziel_slot)
                 dt_ms = (time.perf_counter() - t0) * 1000.0
                 log.info(f"⚡ [{k}] Schiebe-Burst {welle+1}/{MULTI_SHOT_COUNT+1} "
                          f"Court {blitz_court}: ok={erfolg} ({dt_ms:.0f}ms)")
@@ -1835,8 +1855,9 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
                         az_set(k, "aktive_buchung", verifiziert)
                         ok = True
                         break
+                    _pid = burst_dict.get("booking_id") if burst_dict else None
                     log.warning(f"[{k}] Schiebe-Burst r3 OK aber nicht in "
-                                f"my-bookings → nächste Welle")
+                                f"my-bookings → nächste Welle (parsed_id={_pid})")
                 # Token ist verbraucht → für die nächste Welle neu vorwärmen
                 execution = pre_warm_r1(k, blitz_court, datum_api,
                                         naechster_von, naechster_bis)
@@ -2688,6 +2709,412 @@ def _starte_duo(a: str, b: str, datum: str, ziel: str, buchbar_ab: str):
 
 
 # ══════════════════════════════════════════════
+# SAFE-MODUS (2 Accounts wechseln sich EINEN Court-Slot ab)
+# ══════════════════════════════════════════════
+# Zwei Accounts halten EINEN gemeinsamen Slot auf EINEM Court und schieben ihn
+# abwechselnd Richtung Ziel. Immer der FREIE Partner blitzt drauf, nie der, der
+# gerade storniert hat. Zwei Strategien:
+#   "uebergabe": Halter storniert → Partner blitzt sofort auf den (überlappenden)
+#                nächsten Slot. Kurzes ~0,3s-Fenster, immer möglich.
+#   "leapfrog" : Partner bucht den ANSCHLIESSENDEN (nicht überlappenden) Slot
+#                ZUERST (sobald er im 7-Tage-Fenster öffnet = zur alten Slot-Ende-
+#                Zeit), DANN storniert der Halter. Nie eine Lücke.
+# Bei Fehlschlag probiert NUR der freie Account (Bursts+Fallback), sonst Alarm+Stop.
+
+def _slots_ueberlappen(von1: str, bis1: str, von2: str, bis2: str) -> bool:
+    a1 = datetime.strptime(von1, "%H:%M"); a2 = datetime.strptime(bis1, "%H:%M")
+    b1 = datetime.strptime(von2, "%H:%M"); b2 = datetime.strptime(bis2, "%H:%M")
+    return a1 < b2 and b1 < a2
+
+def _safe_next_slot(from_t: str, to_t: str, dauer_min: int,
+                    ziel_dt: datetime, schluss: datetime, strategie: str):
+    """Nächster Slot Richtung Ziel. leapfrog = anschließend (keine Überlappung),
+    uebergabe = 30-Min-Überlappung wie klassisch. None wenn nach Schluss."""
+    ende_dt = datetime.strptime(to_t, "%H:%M")
+    if strategie == "leapfrog":
+        neuer_start = ende_dt
+    else:
+        neuer_start = ende_dt - timedelta(minutes=SAFE_UEBERLAPP_MIN)
+    if neuer_start >= ziel_dt:
+        neuer_start = ziel_dt
+    neues_ende = neuer_start + timedelta(minutes=dauer_min)
+    if neues_ende > schluss:
+        return None
+    return neuer_start.strftime("%H:%M"), neues_ende.strftime("%H:%M")
+
+def _safe_grab(k: str, court: int, datum_api: str, von: str, bis: str,
+               ziel_slot: dict, prewarm: str | None) -> bool:
+    """Freier Account schnappt den Slot: Blitz-Burst (vorgewärmt) + Multi-Shot,
+    dann Fallback buche_slot. True nur nach my-bookings-Verifikation (Eigentum)."""
+    execution = prewarm
+    for _welle in range(MULTI_SHOT_COUNT + 1):
+        if not az_get(k, "schiebe_aktiv"):
+            return False
+        if not execution:
+            execution = pre_warm_r1(k, court, datum_api, von, bis)
+            if not execution:
+                time.sleep(MULTI_SHOT_GAP_MS / 1000.0)
+                continue
+        erfolg, _bd = burst_r2_r3(k, court, execution, ziel_slot)
+        if erfolg:
+            v = verifiziere_slot_via_my_bookings(k, ziel_slot)
+            if v:
+                az_set(k, "aktive_buchung", v)
+                return True
+        execution = pre_warm_r1(k, court, datum_api, von, bis)
+        time.sleep(MULTI_SHOT_GAP_MS / 1000.0)
+    # Fallback: klassischer buche_slot (verifiziert selbst über my-bookings)
+    for _v in range(20):
+        if not az_get(k, "schiebe_aktiv"):
+            return False
+        if buche_slot(k, ziel_slot):
+            return True
+        time.sleep(0.2)
+    return bool(az_get(k, "aktive_buchung"))
+
+def _safe_storno(k: str, booking_id, datum_api: str) -> bool:
+    if not booking_id:
+        return True
+    for _v in range(6):
+        if not az_get(k, "schiebe_aktiv"):
+            return False
+        if storniere_buchung(k, booking_id, datum_api):
+            az_set(k, "aktive_buchung", None)
+            return True
+        time.sleep(2)
+    return False
+
+def _safe_schiebe_loop(a: str, b: str, court: int, datum_de: str, ziel_str: str,
+                       dauer_min: int, buchbar_ab: str, strategie: str):
+    datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
+    datum_api = datum_obj.strftime("%m/%d/%Y")
+    ziel_dt   = datetime.strptime(ziel_str, "%H:%M")
+    schluss   = datetime.strptime(ANLAGE_SCHLUSS, "%H:%M")
+    strat_lbl = "Leapfrog" if strategie == "leapfrog" else "Übergabe"
+
+    def aktiv() -> bool:
+        return bool(az_get(a, "schiebe_aktiv") and az_get(b, "schiebe_aktiv"))
+
+    def schlafe(sek: float) -> bool:
+        ende = time.time() + sek
+        while time.time() < ende:
+            if not aktiv():
+                return False
+            time.sleep(min(1, max(0, ende - time.time())))
+        return True
+
+    try:
+        # ── Phase 1: warten auf Freischaltung, dann A blitzt Initial-Slot ──
+        fenster_tag = (datum_obj - timedelta(days=7)).date()
+        unlock_dt   = datetime.combine(fenster_tag,
+                                       datetime.strptime(buchbar_ab, "%H:%M").time())
+        ziel_wach   = unlock_dt - timedelta(seconds=PHASE1_HANDOFF_MARGIN)
+        while aktiv() and jetzt_lokal() < ziel_wach:
+            if not schlafe(30):
+                return
+        if not aktiv():
+            return
+
+        senden(f"🛡️ <b>Safe-Modus – Start ({strat_lbl})</b>\n"
+               f"🏟️ Court {court} | 📅 {_datum_mit_tag(datum_de)} | 🎯 {ziel_str} Uhr\n"
+               f"🔓 Buchbar ab {unlock_dt.strftime('%d.%m. %H:%M')} – {a} blitzt zuerst.")
+
+        for k in (a, b):
+            if not _session_refresh_vor_aktion(k, f"Safe-Init {buchbar_ab}"):
+                senden(f"❌ Safe: Login {k} vor Start fehlgeschlagen.")
+                return
+
+        jetzt = jetzt_lokal()
+        buchbar_dt = unlock_dt if unlock_dt > jetzt else jetzt + timedelta(seconds=1)
+        erfolg = _direkt_blitz(a, datum_de, datum_api, dauer_min,
+                               buchbar_dt, [court], bevorzugter_court=court)
+        if not erfolg or not az_get(a, "aktive_buchung"):
+            senden(f"❌ Safe-Modus: Initial-Buchung durch {a} fehlgeschlagen.\n"
+                   f"🆘 {BASE_URL}/padel?currentDate={datum_api}")
+            return
+
+        halter, frei = a, b
+        hb0 = az_get(a, "aktive_buchung")
+        senden(f"🛡️ <b>Safe-Modus läuft</b> ({strat_lbl})\n"
+               f"🔴 Hält: {halter} ({hb0['fromTime']}–{hb0['toTime']}) | Court {court}\n"
+               f"🟢 Frei: {frei}\n🎯 Ziel: {ziel_str} Uhr")
+
+        # ── Phase 2: abwechselnd schieben ──
+        while aktiv():
+            hb = az_get(halter, "aktive_buchung")
+            if not hb:
+                senden(f"❌ Safe: {halter} hält keine Buchung mehr – gestoppt.")
+                return
+
+            if datetime.strptime(hb["fromTime"], "%H:%M") >= ziel_dt:
+                wetter = hole_wetter(hb["datum_de"], hb["fromTime"]) or ""
+                senden(f"🎯 <b>Safe-Modus: Ziel erreicht!</b>\n"
+                       f"🔴 {halter} hält {hb['fromTime']}–{hb['toTime']} | Court {court}\n"
+                       f"📅 {_datum_mit_tag(hb['datum_de'])}\n\nViel Spaß! 🎾" + wetter)
+                return
+
+            nxt = _safe_next_slot(hb["fromTime"], hb["toTime"], dauer_min,
+                                  ziel_dt, schluss, strategie)
+            if nxt is None:
+                senden(f"⚠️ Safe: nächster Slot würde nach {ANLAGE_SCHLUSS} enden.\n"
+                       f"✅ {halter} behält {hb['fromTime']}–{hb['toTime']}.")
+                return
+            von, bis  = nxt
+            ziel_slot = _baue_slot_dict(court, von, bis, datum_de, datum_api, dauer_min)
+            ueberlappt = _slots_ueberlappen(hb["fromTime"], hb["toTime"], von, bis)
+            # Leapfrog nur ohne Überlappung; sonst (z.B. letzter Hop ans Ziel) Übergabe.
+            leapfrog = (strategie == "leapfrog" and not ueberlappt)
+
+            # Schiebe-Zeitpunkt HEUTE: der neue Slot öffnet im 7-Tage-Fenster zu
+            # seiner Startzeit. Übergabe feuert wie klassisch kurz VOR altem Slot-
+            # Ende (überlappender Slot ist dann längst offen). Leapfrog feuert erst
+            # wenn der anschließende Slot öffnet (= alte Slot-Ende-Zeit) + Puffer.
+            ende_dt = datetime.strptime(hb["toTime"], "%H:%M")
+            if leapfrog:
+                moment_time = (datetime.strptime(von, "%H:%M") + timedelta(seconds=5)).time()
+            else:
+                off = random.randint(SCHIEBE_MINUTEN_VOR_MIN, SCHIEBE_MINUTEN_VOR_MAX)
+                moment_time = (ende_dt - timedelta(minutes=off)).time()
+            schiebe_moment = datetime.combine(jetzt_lokal().date(), moment_time)
+
+            if (schiebe_moment - jetzt_lokal()).total_seconds() > 0:
+                senden(f"⏳ [Safe] Nächster {'Sprung' if leapfrog else 'Schub'} um "
+                       f"{schiebe_moment.strftime('%H:%M')} Uhr\n"
+                       f"🔴 {halter}: {hb['fromTime']}–{hb['toTime']} → "
+                       f"🟢 {frei}: {von}–{bis}")
+                while aktiv():
+                    rest = (schiebe_moment - jetzt_lokal()).total_seconds()
+                    if rest <= 2:
+                        break
+                    if not schlafe(min(rest - 1, 30)):
+                        return
+            if not aktiv():
+                return
+
+            # Beide frisch einloggen kurz vor der Aktion
+            for k in (halter, frei):
+                _session_refresh_vor_aktion(k, f"Safe {'Sprung' if leapfrog else 'Schub'} {von}")
+
+            prewarm = pre_warm_r1(frei, court, datum_api, von, bis)   # Blitz-Token vorwärmen
+
+            if leapfrog:
+                # 1) Freier bucht den anschließenden Slot ZUERST (Halter hält noch)
+                if not _safe_grab(frei, court, datum_api, von, bis, ziel_slot, prewarm):
+                    senden(f"❌ Safe (Leapfrog): {frei} bekam {von}–{bis} nicht.\n"
+                           f"✅ {halter} hält weiter {hb['fromTime']}–{hb['toTime']} – gestoppt.\n"
+                           f"🆘 {BASE_URL}/padel?currentDate={datum_api}")
+                    return
+                # 2) Alter Halter storniert seinen Slot (kein Verlust falls es scheitert)
+                if not _safe_storno(halter, hb.get("booking_id"), datum_api):
+                    senden(f"⚠️ Safe (Leapfrog): Storno des alten Slots ({halter}, "
+                           f"{hb['fromTime']}–{hb['toTime']}) fehlgeschlagen – bitte manuell "
+                           f"löschen. Neuer Slot läuft weiter.")
+            else:
+                # Übergabe: Halter storniert ZUERST, dann Freier blitzt
+                if not _safe_storno(halter, hb.get("booking_id"), datum_api):
+                    if not verifiziere_slot_via_my_bookings(halter, hb):
+                        az_set(halter, "aktive_buchung", None)
+                    senden(f"❌ Safe (Übergabe): Storno von {halter} fehlgeschlagen – gestoppt.\n"
+                           f"🆘 {BASE_URL}/padel?currentDate={datum_api}")
+                    return
+                if not _safe_grab(frei, court, datum_api, von, bis, ziel_slot, prewarm):
+                    senden(f"❌ Safe (Übergabe): {frei} bekam {von}–{bis} nach Storno NICHT.\n"
+                           f"🆘 SOFORT manuell: {BASE_URL}/padel?currentDate={datum_api}")
+                    return
+
+            # Rollen tauschen: der freie hält jetzt, der alte Halter wird frei
+            halter, frei = frei, halter
+            nb = az_get(halter, "aktive_buchung")
+            senden(f"✅ <b>Safe: {'Gesprungen' if leapfrog else 'Übergeben'}!</b>\n"
+                   f"🔴 Hält jetzt: {halter} ({nb['fromTime']}–{nb['toTime']}) | Court {court}\n"
+                   f"🟢 Frei: {frei}\n🔄 Weiter → {ziel_str} Uhr")
+
+    except Exception as e:
+        log.error(f"[Safe {a}/{b}] CRASH: {e}", exc_info=True)
+        senden(f"💥 <b>Safe-Modus abgestürzt!</b>\n{e}")
+    finally:
+        az_set(a, "schiebe_aktiv", False)
+        az_set(b, "schiebe_aktiv", False)
+        zeige_account_auswahl()
+
+
+def _starte_safe(a: str, b: str, court: int, datum: str, ziel: str,
+                 strategie: str, buchbar_ab: str):
+    for k in (a, b):
+        az_set_multi(k, schiebe_aktiv=True, duo_court=court, flow=None,
+                     schiebe_datum=datum, schiebe_ziel=ziel, schiebe_court=court,
+                     schiebe_dauer=DUO_DAUER_MIN, schiebe_modus="safe")
+    strat_lbl = "Leapfrog" if strategie == "leapfrog" else "Übergabe"
+    senden(f"🛡️ <b>Safe-Modus gestartet!</b> ({strat_lbl})\n"
+           f"🏟️ Court {court} | 📅 {_datum_mit_tag(datum)} | 🎯 {ziel} Uhr | 90 Min\n"
+           f"🔴 {a} blitzt zuerst, danach wechseln sich {a} + {b} ab.\n"
+           f"🔓 Buchbar ab {buchbar_ab} Uhr.")
+    t = threading.Thread(target=_safe_schiebe_loop,
+                         args=(a, b, court, datum, ziel, DUO_DAUER_MIN, buchbar_ab, strategie),
+                         daemon=True)
+    t.start()
+    az_set(a, "schiebe_thread", t)
+    az_set(b, "schiebe_thread", t)
+    zeige_account_auswahl()
+
+
+def handle_safe_callback(data: str):
+    """Verarbeitet alle 'safe_*'-Callbacks (Account-Auswahl → Court → Datum →
+    Ziel → Strategie)."""
+    if data == "safe_start":
+        frei = [k for k in ACCOUNTS if _account_frei(k)]
+        if len(frei) < 2:
+            senden("🛡️ <b>Safe-Modus</b> braucht <b>2 freie Accounts</b> "
+                   "(ohne aktive Buchung/Schiebe/Sniper).")
+            zeige_account_auswahl()
+            return
+        _safe_reset()
+        btns = [[{"text": account_status_label(k), "callback_data": f"safe_pa_{k}"}]
+                for k in frei]
+        btns.append([{"text": "❌ Abbrechen", "callback_data": "safe_cancel"}])
+        senden("🛡️ <b>Safe-Modus</b> – 2 Accounts wechseln sich EINEN Slot ab.\n\n"
+               "Wähle den <b>1. Account</b> (blitzt zuerst):", buttons=btns)
+        return
+
+    if data == "safe_cancel":
+        _safe_reset()
+        senden("↩️ Safe-Modus abgebrochen.")
+        zeige_account_auswahl()
+        return
+
+    if data.startswith("safe_pa_"):
+        k = data[len("safe_pa_"):]
+        if k not in acc or not _account_frei(k):
+            senden("❌ Account nicht (mehr) frei. Bitte Safe neu starten.")
+            _safe_reset()
+            zeige_account_auswahl()
+            return
+        with _safe_lock:
+            _safe["acc_a"] = k
+        rest = [x for x in ACCOUNTS if x != k and _account_frei(x)]
+        if not rest:
+            senden("❌ Kein zweiter freier Account verfügbar.")
+            _safe_reset()
+            zeige_account_auswahl()
+            return
+        btns = [[{"text": account_status_label(x), "callback_data": f"safe_pb_{x}"}]
+                for x in rest]
+        btns.append([{"text": "❌ Abbrechen", "callback_data": "safe_cancel"}])
+        senden(f"🛡️ Safe | 1. Account: <b>{k}</b>\n\n"
+               f"Wähle den <b>2. Account</b>:", buttons=btns)
+        return
+
+    if data.startswith("safe_pb_"):
+        k = data[len("safe_pb_"):]
+        with _safe_lock:
+            a = _safe["acc_a"]
+        if not a or k == a or k not in acc or not _account_frei(k):
+            senden("❌ Bitte einen ANDEREN freien Account wählen.")
+            return
+        with _safe_lock:
+            _safe["acc_b"] = k
+        btns = [[{"text": "🏟️ Court 1", "callback_data": "safe_court_1"},
+                 {"text": "🏟️ Court 2", "callback_data": "safe_court_2"}],
+                [{"text": "❌ Abbrechen", "callback_data": "safe_cancel"}]]
+        senden(f"🛡️ Safe | {a} + <b>{k}</b>\n\nAuf welchem <b>Court</b>?", buttons=btns)
+        return
+
+    if data.startswith("safe_court_"):
+        c = int(data[len("safe_court_"):])
+        with _safe_lock:
+            _safe["court"] = c
+            a, b = _safe["acc_a"], _safe["acc_b"]
+        if not (a and b):
+            senden("❌ Safe-Flow unterbrochen – bitte neu starten.")
+            _safe_reset()
+            zeige_account_auswahl()
+            return
+        senden(f"🛡️ Safe | Court {c}\n\n📅 Für welches <b>Datum</b>?",
+               buttons=erstelle_datum_buttons("safe_datum"))
+        return
+
+    if data.startswith("safe_datum_"):
+        d = data[len("safe_datum_"):]
+        with _safe_lock:
+            _safe["datum"] = d
+        senden(f"🛡️ Safe | 📅 {d} | 90 Min\n\n🎯 <b>Bis wohin schieben?</b> (Zielzeit)",
+               buttons=zielzeit_buttons("safe_ziel", DUO_DAUER_MIN))
+        return
+
+    if data.startswith("safe_ziel_"):
+        z = data[len("safe_ziel_"):]
+        with _safe_lock:
+            _safe["ziel"] = z
+        btns = [[{"text": "🤝 Übergabe (Storno → Partner blitzt)",
+                  "callback_data": "safe_strat_uebergabe"}],
+                [{"text": "🐸 Leapfrog (Partner sichert vor, dann Storno)",
+                  "callback_data": "safe_strat_leapfrog"}],
+                [{"text": "❌ Abbrechen", "callback_data": "safe_cancel"}]]
+        senden(f"🛡️ Safe | 🎯 {z} Uhr\n\nWelche <b>Strategie</b>?", buttons=btns)
+        return
+
+    if data.startswith("safe_strat_"):
+        s = data[len("safe_strat_"):]
+        with _safe_lock:
+            _safe["strategie"] = s
+            a, b     = _safe["acc_a"], _safe["acc_b"]
+            court    = _safe["court"]
+            datum    = _safe["datum"]
+            ziel     = _safe["ziel"]
+            if a and b and court and datum and ziel:
+                _safe["flow"] = "startzeit"
+        if not (a and b and court and datum and ziel):
+            senden("❌ Safe-Flow unterbrochen – bitte neu starten.")
+            _safe_reset()
+            zeige_account_auswahl()
+            return
+        senden(f"🛡️ <b>Safe-Modus</b>\n"
+               f"{a} + {b} | 🏟️ Court {court}\n"
+               f"📅 {datum} | 🎯 {ziel} Uhr | "
+               f"{'Leapfrog' if s == 'leapfrog' else 'Übergabe'}\n\n"
+               f"⏰ <b>Ab wann ist der Slot buchbar?</b>\n"
+               f"Bitte Uhrzeit tippen (30-Min-Raster, z.B. <b>17:30</b>):")
+        return
+
+    senden("❓ Unbekannte Safe-Aktion.")
+    _safe_reset()
+    zeige_account_auswahl()
+
+
+def handle_safe_text(text: str):
+    """Verarbeitet die getippte Buchbar-ab-Zeit und startet den Safe-Modus."""
+    m = re.match(r"^(\d{1,2}):(\d{2})$", text.strip())
+    if not m:
+        senden("❌ Ungültiges Format. Bitte als <b>HH:MM</b> eingeben, z.B. <b>17:30</b>")
+        return
+    stunde, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= stunde <= 21 and minute in (0, 30)):
+        senden("❌ Zeit muss auf 30-Min-Raster liegen (z.B. 17:00 oder 17:30)")
+        return
+    buchbar_ab = f"{stunde:02d}:{minute:02d}"
+    with _safe_lock:
+        a         = _safe["acc_a"]
+        b         = _safe["acc_b"]
+        court     = _safe["court"]
+        datum     = _safe["datum"]
+        ziel      = _safe["ziel"]
+        strategie = _safe["strategie"]
+        _safe["flow"] = None
+    if not (a and b and court and datum and ziel and strategie):
+        senden("❌ Safe-Konfiguration unvollständig – bitte neu starten.")
+        _safe_reset()
+        zeige_account_auswahl()
+        return
+    if not _account_frei(a) or not _account_frei(b):
+        senden("⚠️ Einer der beiden Accounts ist nicht mehr frei – Safe abgebrochen.")
+        _safe_reset()
+        zeige_account_auswahl()
+        return
+    _starte_safe(a, b, court, datum, ziel, strategie, buchbar_ab)
+    _safe_reset()
+
+
+# ══════════════════════════════════════════════
 # 3h-MODUS (Block: Acc1 schiebt bis Wunschanfang → Acc2 blitzt Anschluss)
 # ══════════════════════════════════════════════
 
@@ -2971,6 +3398,9 @@ def handle_callback(cb: dict):
     # Dasselbe für den 3h-Modus-Eingabeschritt
     if not data.startswith("block_") and _block_awaiting_text():
         _block_reset()
+    # Dasselbe für den Safe-Modus-Eingabeschritt
+    if not data.startswith("safe_") and _safe_awaiting_text():
+        _safe_reset()
 
     if data in ("zurueck_accounts", "refresh_accounts"):
         zeige_account_auswahl()
@@ -2997,6 +3427,11 @@ def handle_callback(cb: dict):
     # ── 3h-Modus (Block, eigener Flow über 2 Accounts) – früh abfangen ────────
     if data.startswith("block_"):
         handle_block_callback(data)
+        return
+
+    # ── Safe-Modus (eigener Flow über 2 Accounts) – früh abfangen ─────────────
+    if data.startswith("safe_"):
+        handle_safe_callback(data)
         return
 
     k = get_flow_account()
@@ -3437,6 +3872,8 @@ def telegram_loop():
                         handle_duo_text(text)
                     elif _block_awaiting_text():
                         handle_block_text(text)
+                    elif _safe_awaiting_text():
+                        handle_safe_text(text)
                     else:
                         k_flow = get_flow_account()
                         if k_flow and az_get(k_flow, "flow") in ("direkte_startzeit",):
