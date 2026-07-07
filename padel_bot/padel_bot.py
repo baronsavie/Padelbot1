@@ -368,7 +368,8 @@ def _duo_awaiting_text() -> bool:
 _safe = {"flow": None, "acc_a": None, "acc_b": None, "court": None,
          "datum": None, "ziel": None, "strategie": None}
 _safe_lock = threading.Lock()
-SAFE_UEBERLAPP_MIN = 30   # Übergabe: Überlappung des nächsten Slots (wie klassisch)
+SAFE_UEBERLAPP_MIN = 30    # Übergabe: Überlappung des nächsten Slots (wie klassisch)
+SAFE_CANCEL_DELAY_SEC = 300  # Leapfrog: Wartezeit, bevor der alte Halter storniert (kein Stress)
 
 def _safe_reset():
     with _safe_lock:
@@ -1533,16 +1534,23 @@ def burst_r2_r3(k: str, court: int, execution: str, slot: dict) -> tuple[bool, d
 
 def _direkt_blitz(k: str, datum_de: str, datum_api: str, dauer_min: int,
                   buchbar_dt: datetime, courts_zu_versuchen: list[int],
-                  bevorzugter_court: int = 0) -> bool:
+                  bevorzugter_court: int = 0,
+                  von: str | None = None, bis: str | None = None) -> bool:
     """
     R15–R18: Pre-Warm bei T-10s, Burst bei T-0 parallel auf bis zu 2 Courts.
     Bei Miss: bis zu MULTI_SHOT_COUNT weitere Bursts mit MULTI_SHOT_GAP_MS Pause.
     Nach jedem Treffer Sicherheitsnetz via verifiziere_slot_via_my_bookings() (R10).
     R1: Bei Doppel-Treffer (Server-Race) wird nicht-bevorzugter Court storniert.
+
+    von/bis: expliziter Slot (statt aus buchbar_dt abgeleitet) – für Safe-Modus
+    (z.B. 30-Min-Füller). buchbar_dt bleibt der EXAKTE Feuer-Zeitpunkt (T-0).
     """
-    buchbar_zeit = buchbar_dt.time()
-    from_t       = buchbar_zeit.strftime("%H:%M")
-    to_t         = (buchbar_dt + timedelta(minutes=dauer_min)).time().strftime("%H:%M")
+    if von and bis:
+        from_t, to_t = von, bis
+    else:
+        buchbar_zeit = buchbar_dt.time()
+        from_t       = buchbar_zeit.strftime("%H:%M")
+        to_t         = (buchbar_dt + timedelta(minutes=dauer_min)).time().strftime("%H:%M")
 
     treffer      = {}      # court -> verifizierte Buchung
     treffer_lock = threading.Lock()
@@ -2784,6 +2792,29 @@ def _safe_storno(k: str, booking_id, datum_api: str) -> bool:
         time.sleep(2)
     return False
 
+def _safe_blitz_hartnaeckig(k: str, court: int, datum_de: str, datum_api: str,
+                            dauer_min: int, race_dt: datetime, von: str, bis: str,
+                            weiter_sec: int = 120) -> bool:
+    """Nutzt EXAKT den bewährten Direkt-Blitz `_direkt_blitz` (Pre-Warm r1 @T-10s,
+    millisekundengenauer Burst r2+r3 @T-0, Multi-Shot, my-bookings-Verifikation) –
+    hier auf 1 Court und für den EXPLIZITEN Slot [von,bis] (z.B. 30-Min-Füller).
+    race_dt = exakter Feuer-Zeitpunkt (T-0); liegt er in der Vergangenheit, feuert
+    _direkt_blitz sofort. Verfehlt der Blitz, wird HARTNÄCKIG weiter versucht
+    (buche_slot) bis Treffer oder weiter_sec. True nur bei verifizierter EIGENER Buchung."""
+    if (_direkt_blitz(k, datum_de, datum_api, dauer_min, race_dt, [court],
+                      bevorzugter_court=court, von=von, bis=bis)
+            and az_get(k, "aktive_buchung")):
+        return True
+    ziel_slot = _baue_slot_dict(court, von, bis, datum_de, datum_api, dauer_min)
+    ende = time.time() + weiter_sec
+    while time.time() < ende:
+        if not az_get(k, "schiebe_aktiv"):
+            return False
+        if buche_slot(k, ziel_slot):
+            return True
+        time.sleep(1)
+    return bool(az_get(k, "aktive_buchung"))
+
 def _safe_schiebe_loop(a: str, b: str, court: int, datum_de: str, ziel_str: str,
                        dauer_min: int, buchbar_ab: str, strategie: str):
     datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
@@ -2865,52 +2896,74 @@ def _safe_schiebe_loop(a: str, b: str, court: int, datum_de: str, ziel_str: str,
             # Leapfrog nur ohne Überlappung; sonst (z.B. letzter Hop ans Ziel) Übergabe.
             leapfrog = (strategie == "leapfrog" and not ueberlappt)
 
-            # Schiebe-Zeitpunkt HEUTE: der neue Slot öffnet im 7-Tage-Fenster zu
-            # seiner Startzeit. Übergabe feuert wie klassisch kurz VOR altem Slot-
-            # Ende (überlappender Slot ist dann längst offen). Leapfrog feuert erst
-            # wenn der anschließende Slot öffnet (= alte Slot-Ende-Zeit) + Puffer.
-            ende_dt = datetime.strptime(hb["toTime"], "%H:%M")
+            # ── LEAPFROG: der freie Account blitzt den anschließenden Slot mit
+            #    EXAKTEM Timing – echter _direkt_blitz (Pre-Warm r1 bei T-10s, Burst
+            #    exakt bei T-0), GENAU wie "Direkt-Modus bekannte Uhrzeit". Dieser
+            #    Slot öffnet erst zu SEINER Startzeit heute → echtes T-0-Rennen.
+            #    Erst wenn der freie ihn SICHER hat, storniert der alte Halter. ────
             if leapfrog:
-                moment_time = (datetime.strptime(von, "%H:%M") + timedelta(seconds=5)).time()
-            else:
-                off = random.randint(SCHIEBE_MINUTEN_VOR_MIN, SCHIEBE_MINUTEN_VOR_MAX)
-                moment_time = (ende_dt - timedelta(minutes=off)).time()
-            schiebe_moment = datetime.combine(jetzt_lokal().date(), moment_time)
-
-            if (schiebe_moment - jetzt_lokal()).total_seconds() > 0:
-                senden(f"⏳ [Safe] Nächster {'Sprung' if leapfrog else 'Schub'} um "
-                       f"{schiebe_moment.strftime('%H:%M')} Uhr\n"
-                       f"🔴 {halter}: {hb['fromTime']}–{hb['toTime']} → "
-                       f"🟢 {frei}: {von}–{bis}")
+                unlock_next = datetime.combine(jetzt_lokal().date(),
+                                               datetime.strptime(von, "%H:%M").time())
+                senden(f"⏳ [Safe-Leapfrog] {frei} blitzt {von}–{bis} exakt um {von} Uhr\n"
+                       f"🔴 {halter} hält solange {hb['fromTime']}–{hb['toTime']}")
+                # bis kurz vor Slot-Öffnung warten (Session am Leben halten)
                 while aktiv():
-                    rest = (schiebe_moment - jetzt_lokal()).total_seconds()
-                    if rest <= 2:
+                    rest = (unlock_next - jetzt_lokal()).total_seconds()
+                    if rest <= PHASE1_HANDOFF_MARGIN:
                         break
-                    if not schlafe(min(rest - 1, 30)):
+                    if not schlafe(min(rest - PHASE1_HANDOFF_MARGIN, 30)):
                         return
-            if not aktiv():
-                return
-
-            # Beide frisch einloggen kurz vor der Aktion
-            for k in (halter, frei):
-                _session_refresh_vor_aktion(k, f"Safe {'Sprung' if leapfrog else 'Schub'} {von}")
-
-            prewarm = pre_warm_r1(frei, court, datum_api, von, bis)   # Blitz-Token vorwärmen
-
-            if leapfrog:
-                # 1) Freier bucht den anschließenden Slot ZUERST (Halter hält noch)
-                if not _safe_grab(frei, court, datum_api, von, bis, ziel_slot, prewarm):
+                if not aktiv():
+                    return
+                if not _session_refresh_vor_aktion(frei, f"Safe-Leapfrog {von}"):
+                    senden(f"❌ Safe (Leapfrog): Login {frei} fehlgeschlagen – "
+                           f"{halter} hält weiter {hb['fromTime']}–{hb['toTime']} – gestoppt.")
+                    return
+                # Exakt der Blitz-Pfad der Direkt-Buchung (Pre-Warm r1 @T-10s, Burst @T-0)
+                # + hartnäckig dranbleiben, falls der erste Burst verfehlt.
+                erfolg = _safe_blitz_hartnaeckig(frei, court, datum_de, datum_api,
+                                                 dauer_min, unlock_next, von, bis)
+                if not erfolg or not az_get(frei, "aktive_buchung"):
                     senden(f"❌ Safe (Leapfrog): {frei} bekam {von}–{bis} nicht.\n"
                            f"✅ {halter} hält weiter {hb['fromTime']}–{hb['toTime']} – gestoppt.\n"
                            f"🆘 {BASE_URL}/padel?currentDate={datum_api}")
                     return
-                # 2) Alter Halter storniert seinen Slot (kein Verlust falls es scheitert)
+                # Freier hat den neuen Slot SICHER. Kein Stress: der alte Slot hat
+                # noch ~90 Min. Erst nach kurzer Wartezeit stornieren – solange
+                # halten BEIDE ihren Block (kurzzeitig 3h Abdeckung).
+                senden(f"⏸️ [Safe-Leapfrog] {frei} hat {von}–{bis} sicher.\n"
+                       f"{halter} storniert {hb['fromTime']}–{hb['toTime']} in "
+                       f"~{SAFE_CANCEL_DELAY_SEC // 60} Min.")
+                if not schlafe(SAFE_CANCEL_DELAY_SEC):
+                    return   # gestoppt → beide behalten ihren Block (kein Storno)
                 if not _safe_storno(halter, hb.get("booking_id"), datum_api):
                     senden(f"⚠️ Safe (Leapfrog): Storno des alten Slots ({halter}, "
                            f"{hb['fromTime']}–{hb['toTime']}) fehlgeschlagen – bitte manuell "
                            f"löschen. Neuer Slot läuft weiter.")
+
+            # ── ÜBERGABE: Halter storniert ZUERST, dann Freier blitzt auf den
+            #    (überlappenden, längst offenen) Slot. Kurzes ~0,3s-Fenster. ──────
             else:
-                # Übergabe: Halter storniert ZUERST, dann Freier blitzt
+                off = random.randint(SCHIEBE_MINUTEN_VOR_MIN, SCHIEBE_MINUTEN_VOR_MAX)
+                ende_dt = datetime.strptime(hb["toTime"], "%H:%M")
+                schiebe_moment = datetime.combine(
+                    jetzt_lokal().date(), (ende_dt - timedelta(minutes=off)).time())
+                if (schiebe_moment - jetzt_lokal()).total_seconds() > 0:
+                    senden(f"⏳ [Safe-Übergabe] Nächster Schub um "
+                           f"{schiebe_moment.strftime('%H:%M')} Uhr\n"
+                           f"🔴 {halter}: {hb['fromTime']}–{hb['toTime']} → "
+                           f"🟢 {frei}: {von}–{bis}")
+                    while aktiv():
+                        rest = (schiebe_moment - jetzt_lokal()).total_seconds()
+                        if rest <= 2:
+                            break
+                        if not schlafe(min(rest - 1, 30)):
+                            return
+                if not aktiv():
+                    return
+                for k in (halter, frei):
+                    _session_refresh_vor_aktion(k, f"Safe-Übergabe {von}")
+                prewarm = pre_warm_r1(frei, court, datum_api, von, bis)
                 if not _safe_storno(halter, hb.get("booking_id"), datum_api):
                     if not verifiziere_slot_via_my_bookings(halter, hb):
                         az_set(halter, "aktive_buchung", None)
@@ -2938,20 +2991,167 @@ def _safe_schiebe_loop(a: str, b: str, court: int, datum_de: str, ziel_str: str,
         zeige_account_auswahl()
 
 
+def _safe3h_loop(a: str, b: str, court: int, datum_de: str, ziel_str: str,
+                 buchbar_ab: str):
+    """3-Std-Block: zwei Accounts halten zwei ANEINANDER anschließende 90-Min-Blöcke
+    (= 3h) und wandern als 'Fließband' Richtung Ziel-Fenster [ziel, ziel+180].
+    Der jeweils unterste Account blitzt den neu öffnenden obersten Block (präzise
+    + hartnäckig), erst danach (nach kurzer Wartezeit) storniert er seinen alten
+    untersten Block → nie eine Lücke. Stopp, sobald beide Ziel-Blöcke gehalten werden.
+    Startblock wird automatisch rückwärts vom Ziel eingerastet."""
+    dauer_min = 90
+    datum_obj = datetime.strptime(datum_de, "%d.%m.%Y")
+    datum_api = datum_obj.strftime("%m/%d/%Y")
+    ziel_dt   = datetime.strptime(ziel_str, "%H:%M")
+    buch_dt   = datetime.strptime(buchbar_ab, "%H:%M")
+    oeffnung  = datetime.strptime(ANLAGE_OEFFNUNG, "%H:%M")
+    schluss   = datetime.strptime(ANLAGE_SCHLUSS, "%H:%M")
+    fenster_tag = (datum_obj - timedelta(days=7)).date()
+
+    def aktiv() -> bool:
+        return bool(az_get(a, "schiebe_aktiv") and az_get(b, "schiebe_aktiv"))
+
+    def schlafe(sek: float) -> bool:
+        ende = time.time() + sek
+        while time.time() < ende:
+            if not aktiv():
+                return False
+            time.sleep(min(1, max(0, ende - time.time())))
+        return True
+
+    def hhmm(dt: datetime) -> str:
+        return dt.strftime("%H:%M")
+
+    def unlock(dt: datetime) -> datetime:
+        return datetime.combine(fenster_tag, dt.time())
+
+    def warte_bis(ziel_dt2: datetime) -> bool:
+        """Bis ~PHASE1_HANDOFF_MARGIN vor ziel_dt2 warten (Session am Leben halten)."""
+        while aktiv():
+            rest = (ziel_dt2 - jetzt_lokal()).total_seconds()
+            if rest <= PHASE1_HANDOFF_MARGIN:
+                return True
+            if not schlafe(min(rest - PHASE1_HANDOFF_MARGIN, 30)):
+                return False
+        return False
+
+    def blitz(k: str, von: str, bis: str, open_dt: datetime) -> bool:
+        if not aktiv():
+            return False
+        if not _session_refresh_vor_aktion(k, f"Safe3h {von}"):
+            return False
+        return _safe_blitz_hartnaeckig(k, court, datum_de, datum_api,
+                                       dauer_minuten(von, bis), open_dt, von, bis)
+
+    try:
+        if ziel_dt + timedelta(minutes=180) > schluss:
+            senden(f"⚠️ Safe-3h: Ziel {ziel_str}–{hhmm(ziel_dt + timedelta(minutes=180))} "
+                   f"läge nach {ANLAGE_SCHLUSS}. Bitte früheres Ziel wählen.")
+            return
+
+        # ── Blockfolge bauen: Sprungbrett-Blöcke (auch 30/60 Min!) von buchbar_ab
+        #    bis zum Ziel, sodass der LETZTE Sprungbrett-Block EXAKT auf {ziel}
+        #    endet → danach sauber (ohne Überlappung) in die zwei 90-Min-Ziel-Blöcke
+        #    [ziel..+90] und [ziel+90..+180]. Nur die letzten ZWEI bleiben (= 3h);
+        #    alle davor sind Sprungbretter und werden beim Weiterwandern storniert.
+        blocks = []
+        cur = buch_dt
+        while cur < ziel_dt:
+            end = min(cur + timedelta(minutes=90), ziel_dt)
+            blocks.append((cur, end))
+            cur = end
+        t2_ende = ziel_dt + timedelta(minutes=180)
+        blocks.append((ziel_dt, ziel_dt + timedelta(minutes=90)))            # Ziel-Block 1
+        blocks.append((ziel_dt + timedelta(minutes=90), t2_ende))            # Ziel-Block 2
+
+        plan = " → ".join(f"{hhmm(s)}-{hhmm(e)}" for s, e in blocks)
+        senden(f"🧱 <b>Safe 3-Std-Block – Start</b>\n"
+               f"🏟️ Court {court} | 📅 {_datum_mit_tag(datum_de)}\n"
+               f"🎯 Ziel-Fenster: {ziel_str}–{hhmm(t2_ende)} (2×90 Min)\n"
+               f"🪜 Plan: {plan}\n"
+               f"(nur die letzten zwei Blöcke bleiben – der Rest sind Sprungbretter)")
+
+        # ── Block 0: Initial-Blitz durch A ─────────────────────────────────────
+        s0, e0 = blocks[0]
+        if not warte_bis(unlock(s0)):
+            return
+        if not blitz(a, hhmm(s0), hhmm(e0), unlock(s0)) or not az_get(a, "aktive_buchung"):
+            senden(f"❌ Safe-3h: {a} bekam Startblock {hhmm(s0)}–{hhmm(e0)} nicht – gestoppt.")
+            return
+        holder, frei = a, b
+        prev_buchung = az_get(a, "aktive_buchung")   # zuletzt gegriffener Block (vom holder)
+
+        # ── Durch die Blockfolge: der FREIE Account blitzt den nächsten Block bei
+        #    dessen Öffnung, dann (nach ~5 Min) storniert der bisherige seinen alten
+        #    Block. Beim ALLERLETZTEN Block wird NICHT storniert → die beiden
+        #    Ziel-Blöcke bleiben gehalten (= 3h). Nie >1 Buchung pro Account. ──────
+        for i in range(1, len(blocks)):
+            si, ei = blocks[i]
+            is_last = (i == len(blocks) - 1)
+            if not warte_bis(unlock(si)):
+                return
+            if not blitz(frei, hhmm(si), hhmm(ei), unlock(si)) or not az_get(frei, "aktive_buchung"):
+                senden(f"❌ Safe-3h: {frei} bekam {hhmm(si)}–{hhmm(ei)} nicht.\n"
+                       f"✅ {holder} hält weiter {prev_buchung['fromTime']}–{prev_buchung['toTime']} "
+                       f"– gestoppt.\n🆘 {BASE_URL}/padel?currentDate={datum_api}")
+                return
+            neu_buchung = az_get(frei, "aktive_buchung")
+            if not is_last:
+                # kein Stress: kurz halten beide, dann Vorgänger-Block freigeben
+                senden(f"⏸️ Safe-3h: {frei} hat {hhmm(si)}–{hhmm(ei)}. "
+                       f"{holder} gibt {prev_buchung['fromTime']}–{prev_buchung['toTime']} "
+                       f"in ~{SAFE_CANCEL_DELAY_SEC // 60} Min frei.")
+                if not schlafe(SAFE_CANCEL_DELAY_SEC):
+                    return
+                if not _safe_storno(holder, prev_buchung.get("booking_id"), datum_api):
+                    senden(f"⚠️ Safe-3h: Storno {prev_buchung['fromTime']}–{prev_buchung['toTime']} "
+                           f"({holder}) fehlgeschlagen – bitte ggf. manuell löschen.")
+            holder, frei = frei, holder   # der freie hält jetzt den neuesten Block
+            prev_buchung = neu_buchung
+
+        if aktiv():
+            hold_t1 = az_get(frei, "aktive_buchung")     # vorletzter Block = Ziel-Block 1
+            hold_t2 = az_get(holder, "aktive_buchung")   # letzter Block   = Ziel-Block 2
+            senden(f"🎯 <b>Safe-3h: Ziel-Fenster erreicht!</b>\n"
+                   f"🔴 {frei}: {hold_t1['fromTime']}–{hold_t1['toTime']}\n"
+                   f"🔴 {holder}: {hold_t2['fromTime']}–{hold_t2['toTime']}\n"
+                   f"📅 {_datum_mit_tag(datum_de)} | Court {court}\n"
+                   f"= {ziel_str}–{hhmm(t2_ende)} 🎾")
+    except Exception as e:
+        log.error(f"[Safe3h {a}/{b}] CRASH: {e}", exc_info=True)
+        senden(f"💥 <b>Safe-3h abgestürzt!</b>\n{e}")
+    finally:
+        az_set(a, "schiebe_aktiv", False)
+        az_set(b, "schiebe_aktiv", False)
+        zeige_account_auswahl()
+
+
 def _starte_safe(a: str, b: str, court: int, datum: str, ziel: str,
                  strategie: str, buchbar_ab: str):
     for k in (a, b):
         az_set_multi(k, schiebe_aktiv=True, duo_court=court, flow=None,
                      schiebe_datum=datum, schiebe_ziel=ziel, schiebe_court=court,
                      schiebe_dauer=DUO_DAUER_MIN, schiebe_modus="safe")
-    strat_lbl = "Leapfrog" if strategie == "leapfrog" else "Übergabe"
-    senden(f"🛡️ <b>Safe-Modus gestartet!</b> ({strat_lbl})\n"
-           f"🏟️ Court {court} | 📅 {_datum_mit_tag(datum)} | 🎯 {ziel} Uhr | 90 Min\n"
-           f"🔴 {a} blitzt zuerst, danach wechseln sich {a} + {b} ab.\n"
-           f"🔓 Buchbar ab {buchbar_ab} Uhr.")
-    t = threading.Thread(target=_safe_schiebe_loop,
-                         args=(a, b, court, datum, ziel, DUO_DAUER_MIN, buchbar_ab, strategie),
-                         daemon=True)
+    if strategie == "block3h":
+        ziel_dt = datetime.strptime(ziel, "%H:%M")
+        senden(f"🧱 <b>Safe 3-Std-Block gestartet!</b>\n"
+               f"🏟️ Court {court} | 📅 {_datum_mit_tag(datum)}\n"
+               f"🎯 Ziel-Fenster: {ziel}–"
+               f"{(ziel_dt + timedelta(minutes=180)).strftime('%H:%M')} Uhr\n"
+               f"🔴 {a} + {b} halten am Ende 2 Blöcke (je 90 Min).\n"
+               f"🔓 Buchbar ab {buchbar_ab} Uhr.")
+        t = threading.Thread(target=_safe3h_loop,
+                             args=(a, b, court, datum, ziel, buchbar_ab),
+                             daemon=True)
+    else:
+        strat_lbl = "Leapfrog" if strategie == "leapfrog" else "Übergabe"
+        senden(f"🛡️ <b>Safe-Modus gestartet!</b> ({strat_lbl})\n"
+               f"🏟️ Court {court} | 📅 {_datum_mit_tag(datum)} | 🎯 {ziel} Uhr | 90 Min\n"
+               f"🔴 {a} blitzt zuerst, danach wechseln sich {a} + {b} ab.\n"
+               f"🔓 Buchbar ab {buchbar_ab} Uhr.")
+        t = threading.Thread(target=_safe_schiebe_loop,
+                             args=(a, b, court, datum, ziel, DUO_DAUER_MIN, buchbar_ab, strategie),
+                             daemon=True)
     t.start()
     az_set(a, "schiebe_thread", t)
     az_set(b, "schiebe_thread", t)
@@ -3045,10 +3245,12 @@ def handle_safe_callback(data: str):
         z = data[len("safe_ziel_"):]
         with _safe_lock:
             _safe["ziel"] = z
-        btns = [[{"text": "🤝 Übergabe (Storno → Partner blitzt)",
+        btns = [[{"text": "🤝 Übergabe (1 Block · Storno → Partner blitzt)",
                   "callback_data": "safe_strat_uebergabe"}],
-                [{"text": "🐸 Leapfrog (Partner sichert vor, dann Storno)",
+                [{"text": "🐸 Leapfrog (1 Block · Partner sichert vor, dann Storno)",
                   "callback_data": "safe_strat_leapfrog"}],
+                [{"text": "🧱 3-Std-Block (2 Accounts halten 2 Blöcke)",
+                  "callback_data": "safe_strat_block3h"}],
                 [{"text": "❌ Abbrechen", "callback_data": "safe_cancel"}]]
         senden(f"🛡️ Safe | 🎯 {z} Uhr\n\nWelche <b>Strategie</b>?", buttons=btns)
         return
@@ -3068,10 +3270,15 @@ def handle_safe_callback(data: str):
             _safe_reset()
             zeige_account_auswahl()
             return
+        s_lbl = {"block3h": "3-Std-Block", "leapfrog": "Leapfrog"}.get(s, "Übergabe")
+        ziel_hint = ""
+        if s == "block3h":
+            zdt = datetime.strptime(ziel, "%H:%M")
+            ziel_hint = (f"\n🧱 Ziel-Fenster: {ziel}–"
+                         f"{(zdt + timedelta(minutes=180)).strftime('%H:%M')} Uhr (2×90 Min)")
         senden(f"🛡️ <b>Safe-Modus</b>\n"
                f"{a} + {b} | 🏟️ Court {court}\n"
-               f"📅 {datum} | 🎯 {ziel} Uhr | "
-               f"{'Leapfrog' if s == 'leapfrog' else 'Übergabe'}\n\n"
+               f"📅 {datum} | 🎯 {ziel} Uhr | {s_lbl}{ziel_hint}\n\n"
                f"⏰ <b>Ab wann ist der Slot buchbar?</b>\n"
                f"Bitte Uhrzeit tippen (30-Min-Raster, z.B. <b>17:30</b>):")
         return
