@@ -1,5 +1,46 @@
 #!/usr/bin/env python3
-"""Padel Bot V12 GODMODE
+"""Padel Bot V13 GODMODE 2.0
+
+NEU V13-GODMODE-2.0 (Schiebe "bekannte Uhrzeit": Lücke Storno→Neubuchung ~halbiert):
+        Anlass: Wunsch, das offene Fenster zwischen Storno und Neubuchung beim
+        Schieben so klein zu machen, dass kein fremder Sniper reingrätscht.
+        HEBEL 1 – r2-PREFIRE VOR DEM STORNO: Bisher wurde vor dem Storno nur r1
+           (Formular/Token) vorgewärmt; nach dem Storno mussten r2+r3 raus
+           (~270ms). Jetzt wird auch r2 schon gefeuert, SOLANGE DIE ALTE BUCHUNG
+           NOCH HÄLT (Server lässt den Flow trotz Überlappung mit der eigenen
+           Altbuchung bis zum Commit laufen). Nach dem Storno fehlt nur noch das
+           r3-Commit (~100ms). Lehnt der Server das frühe r2 ab → frischer Token
+           + voller r2+r3-Burst wie bisher (kein Risiko).
+        HEBEL 2 – STORNO-DIALOG VORLADEN: Der Storno besteht aus 2 GETs (Dialog
+           laden + bestätigen). Der Dialog wird jetzt VOR dem kritischen Moment
+           geladen; im Fenster bleibt nur der eine Bestätigungs-Request. Der
+           Confirm ist stateless (fester CONFIRM_KEY). Storno-Retries nutzen
+           weiter den vollen, robusten Storniere-Ablauf.
+        ERGEBNIS: kritisches Fenster ~4 Requests → ~2 Requests (~300–500ms →
+           ~100–150ms). Betrifft NUR den Blitz-Schiebe-Pfad (_schiebe_phase3);
+           Safe-Modus, Sniper, Direkt-Blitz, Telegram unverändert.
+        SCHUTZ 1 – ZIEL-CHECK VOR STORNO: Vor jedem Schiebe-Storno wird der
+           Court-Plan geprüft. Liegt im Ziel-Slot eine FREMDE Buchung (eigene
+           alte zählt nicht), wird NICHT storniert → alte Buchung bleibt sicher,
+           statt am Ende mit nichts dazustehen. Fail-open: Check-Fehler
+           blockieren das Schieben nie.
+        SCHUTZ 2 – ROLLBACK: Scheitert die Neubuchung trotz allem, holt der Bot
+           sofort die gerade stornierte alte Buchung zurück (10 Versuche),
+           bevor er "manuell buchen!" ruft. Nie mehr mit leeren Händen.
+        SCHUTZ 3 – SESSION-HÄRTUNG (Kinderkrankheiten): my-bookings liefert bei
+           toter Session 200 OHNE Karten statt 401 → Verify/Sync meldeten
+           fälschlich "nicht gebucht"/"Keine aktive Buchung" (siehe 08.07.
+           13:02). Jetzt: leeres Ergebnis ohne sichtbare Buchungskarten →
+           Login-Check → Re-Login → 1× wiederholen; Sync löscht den lokalen
+           Buchungs-Status dann NICHT mehr.
+        HINWEIS Selbst-Konflikt: Direkt nach eigenem Storno kann der Server die
+           alte (überlappende) Buchung noch ~0,3–1s "sehen" → Welle 1 kann mit
+           "Konflikt mit bestehendem Termin" abblitzen (Log 08.07. 16:16). Das
+           ist normal; die Wellen 2–6 + buche_slot-Fallback laufen im
+           Schiebe-Pfad bei Konflikt bewusst WEITER (kein Abbruch wie beim
+           Freischaltungs-Blitz, wo Konflikt = fremd-vergeben bedeutet).
+        Baut auf V12 GODMODE auf (r2-Prefire-Baustein, Konflikt-Erkennung,
+        Zeitsync, Diagnose-Log) inkl. V11-Stornofix.
 
 NEU V12-GODMODE (Anti-Rival-Blitz – Kern: schneller committen als fremde Bots):
         Anlass: 08.07. 13:00 – fremder Bot hat den Slot innerhalb von <350ms
@@ -985,6 +1026,29 @@ def berechne_freie_slots(k: str, datum_de: str, dauer_min: int,
             t += timedelta(minutes=30)
     return freie
 
+
+def _ziel_slot_fremd_belegt(k: str, court: int, von: str, bis: str,
+                            datum_api: str, eigene_booking_id: int | None) -> str | None:
+    """GODMODE2 (Schutz): prüft den Court-Plan, ob im Ziel-Slot [von,bis] auf
+    `court` eine FREMDE Buchung/Blockung liegt (die eigene alte Buchung wird per
+    booking_id ignoriert). Liefert die Fremd-Zeiten als Text oder None (= frei).
+    Fail-open: bei Fehler/leerem Plan None → ein kaputter Check darf das
+    Schieben niemals blockieren, nur eine POSITIVE Fremd-Belegung stoppt es."""
+    try:
+        res = hole_reservierungen(k, datum_api)
+        for r in res:
+            if r.get("court") != court:
+                continue
+            if eigene_booking_id and (r.get("booking") == eigene_booking_id
+                                      or r.get("bookingOrBlockingId") == eigene_booking_id):
+                continue
+            if _slots_ueberlappen(r.get("fromTime", "00:00"),
+                                  r.get("toTime", "00:00"), von, bis):
+                return f"{r.get('fromTime')}–{r.get('toTime')}"
+    except Exception as e:
+        log.warning(f"[{k}] Ziel-Slot-Check: {e}")
+    return None
+
 # ══════════════════════════════════════════════
 # BUCHUNG
 # ══════════════════════════════════════════════
@@ -1142,6 +1206,47 @@ def storniere_buchung(k: str, booking_id: int, datum_api: str) -> bool:
         log.error(f"[{k}] Stornierung: {e}")
         return False
 
+
+def storno_dialog_vorladen(k: str, booking_id: int, datum_api: str) -> None:
+    """GODMODE2 (Hebel 2): lädt die Storno-Bestätigungsseite VOR – nur der erste
+    GET, storniert NICHT. Wärmt Verbindung/Server-State, damit im kritischen
+    Storno→Rebook-Fenster nur noch der Bestätigungs-Request nötig ist.
+    Best effort – Fehler werden ignoriert (der volle Storno-Retry fängt alles ab)."""
+    snap = az_snap(k, "csrf_token", "http")
+    h = _ajax_header(snap["csrf_token"], accept="text/html, */*; q=0.01",
+                     referer=f"{BASE_URL}/padel?currentDate={datum_api}")
+    try:
+        snap["http"].get(
+            f"{BASE_URL}/court-module/{MODULE}/bookings/{booking_id}/cancel",
+            headers=h, timeout=10)
+    except Exception as e:
+        log.warning(f"[{k}] Storno-Dialog-Vorladen ID {booking_id}: {e}")
+
+
+def storno_bestaetigen(k: str, booking_id: int, datum_api: str) -> bool:
+    """GODMODE2 (Hebel 2): feuert NUR den Bestätigungs-Request des Stornos
+    (button_confirm) – ein einziger GET statt Dialog+Bestätigen. Der Confirm ist
+    stateless (fester CONFIRM_KEY), funktioniert also auch ohne vorgeladenen
+    Dialog; storno_dialog_vorladen() macht ihn nur schneller. Für den kritischen
+    Storno→Rebook-Moment im Blitz-Schiebe. Rückgabe wie storniere_buchung()."""
+    snap = az_snap(k, "csrf_token", "http")
+    h = _ajax_header(snap["csrf_token"], accept="*/*",
+                     referer=f"{BASE_URL}/padel?currentDate={datum_api}")
+    try:
+        r = snap["http"].get(
+            f"{BASE_URL}/court-module/{MODULE}/bookings/{booking_id}/cancel",
+            params={"button_confirm": CONFIRM_KEY}, headers=h, timeout=10)
+        if r.status_code in [200, 302]:
+            az_set(k, "aktive_buchung", None)
+            log.info(f"✅ [{k}] Stornierung OK (Schnell-Bestätigung)")
+            return True
+        log.warning(f"[{k}] Storno-Bestätigung FAIL ID {booking_id}: "
+                    f"r={r.status_code} | body={_modal_debug(r.text, 300)!r}")
+        return False
+    except Exception as e:
+        log.error(f"[{k}] Storno-Bestätigung: {e}")
+        return False
+
 # ══════════════════════════════════════════════
 # SERVER-SYNC
 # ══════════════════════════════════════════════
@@ -1208,6 +1313,7 @@ def sync_buchung_vom_server(k: str, debug_telegram: bool = False):
     if not sync_erfolgreich:
         return
 
+    karten_mit_datum = False   # GODMODE2: sahen wir überhaupt echte Buchungskarten?
     try:
         for page in range(total_pages):
             if gefunden:
@@ -1239,6 +1345,8 @@ def sync_buchung_vom_server(k: str, debug_telegram: bool = False):
                     continue
                 text        = karte.get_text(" ", strip=True)
                 datum_match = _RE_DATUM_DE.search(text)
+                if datum_match:
+                    karten_mit_datum = True
                 if not datum_match:
                     continue
                 datum_de  = datum_match.group(1)
@@ -1285,17 +1393,29 @@ def sync_buchung_vom_server(k: str, debug_telegram: bool = False):
     if gefunden:
         az_set(k, "aktive_buchung", gefunden)
     elif sync_erfolgreich:
+        # GODMODE2 (Schutz 3 – Session-Härtung): bei toter Session liefert
+        # my-bookings 200 OHNE Karten statt 401 → "Keine aktive Buchung" wäre
+        # ein Falsch-Negativ (siehe 08.07. 13:02, AB/NH/MH). Dann Ergebnis
+        # verwerfen, neu einloggen und aktive_buchung NICHT löschen – der
+        # nächste Sync liefert das korrekte Bild.
+        if not karten_mit_datum and not ist_eingeloggt(k):
+            log.warning(f"[{k}] Sync verworfen: my-bookings leer + Session tot → Re-Login")
+            einloggen(k)
+            return
         if aktuell and not az_get(k, "schiebe_aktiv"):
             log.info(f"[{k}] Keine aktive Buchung auf dem Server.")
         az_set(k, "aktive_buchung", None)
 
 
-def verifiziere_slot_via_my_bookings(k: str, expected_slot: dict) -> dict | None:
+def verifiziere_slot_via_my_bookings(k: str, expected_slot: dict,
+                                     _zweiter_versuch: bool = False) -> dict | None:
     """
     R10/R11/R12-konformer Verifikations-Helper für Multi-Shot-Bursts.
     Fragt /user/my-bookings ab und sucht NUR den expected_slot (court, fromTime, toTime, datum_de).
     Liefert verifiziertes Buchungs-Dict (inkl. booking_id) oder None.
     Hat KEINE Seiteneffekte (verändert aktive_buchung nicht).
+    GODMODE2: erkennt stille tote Sessions (200 ohne Karten statt 401) und
+    wiederholt dann EINMAL mit frischem Login (_zweiter_versuch verhindert Schleife).
     """
     http_sess = acc[k]["http"]
     csrf_t    = az_get(k, "csrf_token")
@@ -1332,6 +1452,7 @@ def verifiziere_slot_via_my_bookings(k: str, expected_slot: dict) -> dict | None
             total_pages = 1
         total_pages = max(1, min(total_pages, 5))
 
+        karten_mit_datum = False   # GODMODE2: sahen wir überhaupt echte Buchungskarten?
         for page in range(total_pages):
             r_page = http_sess.get(
                 f"{BASE_URL}/user/my-bookings/page",
@@ -1349,6 +1470,8 @@ def verifiziere_slot_via_my_bookings(k: str, expected_slot: dict) -> dict | None
                     continue
                 text = karte.get_text(" ", strip=True)
                 d_m  = _RE_DATUM_DE.search(text)
+                if d_m:
+                    karten_mit_datum = True
                 if not d_m or d_m.group(1) != exp_datum_de:
                     continue
                 z_m = _RE_ZEIT_RANGE.search(text)
@@ -1384,6 +1507,16 @@ def verifiziere_slot_via_my_bookings(k: str, expected_slot: dict) -> dict | None
                 }
     except Exception as e:
         log.warning(f"[{k}] verifiziere_slot_via_my_bookings Fehler: {e}")
+        return None
+    # GODMODE2 (Schutz 3 – Session-Härtung): my-bookings liefert bei toter
+    # Session 200 OHNE Karten statt 401 → ein leeres Ergebnis wäre dann ein
+    # Falsch-Negativ (Buchung existiert, wird aber nicht gesehen). Waren gar
+    # keine Buchungskarten sichtbar: Login prüfen, neu einloggen, 1× wiederholen.
+    if not karten_mit_datum and not _zweiter_versuch and not ist_eingeloggt(k):
+        log.warning(f"[{k}] Verify leer + Session tot → Re-Login + zweiter Versuch")
+        if einloggen(k):
+            return verifiziere_slot_via_my_bookings(k, expected_slot,
+                                                    _zweiter_versuch=True)
     return None
 
 # ══════════════════════════════════════════════
@@ -2008,19 +2141,60 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
         blitz_court  = duo_court if duo_court in (1, 2) else aktive_b["court"]
         ziel_slot    = _baue_slot_dict(blitz_court, naechster_von, naechster_bis,
                                        datum_de, datum_api, dauer_min)
+
+        # GODMODE2 (Schutz 1): NIEMALS ins Verderben stornieren. Liegt im
+        # Ziel-Slot eine FREMDE Buchung (eigene alte zählt nicht), würde die
+        # Neubuchung sicher am Konflikt scheitern → alte Buchung BEHALTEN,
+        # statt am Ende mit NICHTS dazustehen.
+        fremd = _ziel_slot_fremd_belegt(k, blitz_court, naechster_von,
+                                        naechster_bis, datum_api, booking_id)
+        if fremd:
+            beende(f"⛔ [{k}] Ziel-Slot {naechster_von}–{naechster_bis} "
+                   f"(Court {blitz_court}) ist fremd belegt ({fremd}) – "
+                   f"Storno abgebrochen.\n"
+                   f"✅ Behalte {aktive_b['fromTime']}–{aktive_b['toTime']}.\n"
+                   f"💡 Tipp: Sniper auf das fremde Buchungsende ansetzen.")
+            return
+
         prewarm_exec = pre_warm_r1(k, blitz_court, datum_api,
                                    naechster_von, naechster_bis)
+        # GODMODE2 (Hebel 1): r2 schon VOR dem Storno feuern, solange die alte
+        # Buchung noch hält. Der Server lässt den Flow trotz Slot-Überlappung mit
+        # der EIGENEN Altbuchung bis zum Commit laufen (v12-Blitzschiebe live
+        # bestätigt). Nach dem Storno fehlt dann nur noch das r3-Commit → halbes
+        # Klau-Fenster. Lehnt der Server das frühe r2 ab (prewarm_exec2 leer):
+        # frischer r1-Token, danach normaler r2+r3-Burst – exakt wie bisher.
+        prewarm_exec2 = None
         if prewarm_exec:
-            log.info(f"⚡ [{k}] Schiebe-Prewarm Court {blitz_court} OK → {prewarm_exec}")
+            log.info(f"⚡ [{k}] Schiebe-Prewarm r1 Court {blitz_court} OK → {prewarm_exec}")
+            if R2_PREFIRE_MS > 0:
+                prewarm_exec2 = pre_fire_r2(k, blitz_court, prewarm_exec, ziel_slot)
+                if prewarm_exec2:
+                    log.info(f"⚡ [{k}] Schiebe-Prefire r2 Court {blitz_court} OK → "
+                             f"{prewarm_exec2} (nach Storno nur noch Commit)")
+                else:
+                    # frühes r2 abgelehnt → Flow evtl. verbrannt, frisch vorwärmen
+                    prewarm_exec = pre_warm_r1(k, blitz_court, datum_api,
+                                               naechster_von, naechster_bis)
         else:
             log.warning(f"[{k}] Schiebe-Prewarm Court {blitz_court} leer "
                         f"→ Fallback buche_slot")
+
+        # GODMODE2 (Hebel 2): Storno-Bestätigungsseite vorladen → im kritischen
+        # Moment bleibt nur der eine Bestätigungs-Request (statt Dialog+Bestätigen).
+        storno_dialog_vorladen(k, booking_id, datum_api)
 
         storno_ok = False
         for storno_versuch in range(6):
             if not aktiv():
                 return
-            if storniere_buchung(k, booking_id, datum_api):
+            # Versuch 0 = Schnellpfad (Dialog vorgeladen → nur Bestätigen).
+            # Retries = voller Storno (Dialog neu laden + bestätigen), robust.
+            if storno_versuch == 0:
+                storniert = storno_bestaetigen(k, booking_id, datum_api)
+            else:
+                storniert = storniere_buchung(k, booking_id, datum_api)
+            if storniert:
                 storno_ok = True
                 break
             log.warning(f"[{k}] Storno-Retry {storno_versuch+1}/6 (kein Telegram-Spam)")
@@ -2055,24 +2229,40 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
         # "bei Freischaltung". Nur EIN Court (aktueller/Duo-Court), Multi-Shot,
         # SPEED-Verifikation per my-bookings (kein 1–2,5s Verify-Sleep pro Schuss).
         ok = False
-        if prewarm_exec:
-            execution = prewarm_exec
+        if prewarm_exec2 or prewarm_exec:
+            # Nach erfolgreichem Prefire ist der r1-Token verbraucht → Welle 1+
+            # wärmt frisch vor (execution=None). Ohne Prefire = alter Ablauf.
+            execution = None if prewarm_exec2 else prewarm_exec
             for welle in range(MULTI_SHOT_COUNT + 1):
                 if not aktiv():
                     return
-                if not execution:
-                    execution = pre_warm_r1(k, blitz_court, datum_api,
-                                            naechster_von, naechster_bis)
-                    if not execution:
-                        time.sleep(MULTI_SHOT_GAP_MS / 1000.0)
-                        continue
                 t0 = time.perf_counter()
-                erfolg, burst_dict = burst_r2_r3(k, blitz_court, execution, ziel_slot)
+                if welle == 0 and prewarm_exec2:
+                    # GODMODE2: r2 lief schon vor dem Storno → nur noch Commit.
+                    erfolg, burst_dict = burst_commit_only(k, blitz_court,
+                                                           prewarm_exec2, ziel_slot)
+                    art = "Schiebe-Commit-Blitz"
+                else:
+                    if not execution:
+                        execution = pre_warm_r1(k, blitz_court, datum_api,
+                                                naechster_von, naechster_bis)
+                        if not execution:
+                            time.sleep(MULTI_SHOT_GAP_MS / 1000.0)
+                            continue
+                    erfolg, burst_dict = burst_r2_r3(k, blitz_court, execution, ziel_slot)
+                    art = "Schiebe-Burst"
                 dt_ms = (time.perf_counter() - t0) * 1000.0
-                log.info(f"⚡ [{k}] Schiebe-Burst {welle+1}/{MULTI_SHOT_COUNT+1} "
+                log.info(f"⚡ [{k}] {art} {welle+1}/{MULTI_SHOT_COUNT+1} "
                          f"Court {blitz_court}: ok={erfolg} ({dt_ms:.0f}ms)")
                 if erfolg:
                     verifiziert = verifiziere_slot_via_my_bookings(k, ziel_slot)
+                    if not verifiziert and burst_dict and burst_dict.get("erfolg_text"):
+                        # Server meldete Erfolg → my-bookings-Lag abfedern
+                        for _lag in range(2):
+                            time.sleep(0.5)
+                            verifiziert = verifiziere_slot_via_my_bookings(k, ziel_slot)
+                            if verifiziert:
+                                break
                     if verifiziert:
                         az_set(k, "aktive_buchung", verifiziert)
                         ok = True
@@ -2090,12 +2280,27 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
         # lagen. Verhält sich dann exakt wie bisher – nur ohne Court-Alternieren
         # (User-Vorgabe: nur aktueller Court).
         if not ok:
+            konflikte = 0
             for versuch in range(30):
                 if not aktiv():
                     return
                 if buche_slot(k, ziel_slot):
                     ok = True
                     break
+                # GODMODE2: Dauerkonflikt = Ziel ist fest vergeben (Log 08.07.
+                # 16:16: alle Wellen + 30 Fallback-Versuche konfliktet, Slot
+                # war weg). Dann nicht minutenlang hämmern, sondern SOFORT zum
+                # Rollback – nur so ist die alte Buchung evtl. noch zu retten.
+                # Die Storno-Propagation (~1s) ist hier längst vorbei (die
+                # Burst-Wellen liefen bereits davor).
+                if _KONFLIKT_FLAG.get(f"{k}:{blitz_court}"):
+                    konflikte += 1
+                    if konflikte >= 3:
+                        log.warning(f"⛔ [{k}] Schiebe-Fallback: {konflikte}× Konflikt "
+                                    f"in Folge – Ziel fest vergeben → Rollback.")
+                        break
+                else:
+                    konflikte = 0
                 time.sleep(0.1 if versuch < 15 else 0.5)
 
         # Sicherheitsnetz: r3 kann serverseitig gebucht haben, während die
@@ -2138,8 +2343,29 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
                        f"🕐 {naechster_von}–{naechster_bis} | Court {eff_court}\n"
                        f"🔄 Weiter → {ziel_str} Uhr...")
         else:
-            beende(f"❌ [{k}] Neubuchung nach Stornierung fehlgeschlagen!\n"
-                   f"🆘 SOFORT manuell buchen:\n{BASE_URL}/padel?currentDate={datum_api}")
+            # GODMODE2 (Schutz 2) – ROLLBACK: nie mit leeren Händen dastehen.
+            # Der alte Slot wurde gerade erst storniert und ist sehr
+            # wahrscheinlich noch frei → sofort zurückholen.
+            senden(f"⚠️ [{k}] Neubuchung {naechster_von}–{naechster_bis} fehlgeschlagen – "
+                   f"hole alte Buchung {aktive_b['fromTime']}–{aktive_b['toTime']} zurück...")
+            alter_slot = _baue_slot_dict(
+                gerade_court, aktive_b["fromTime"], aktive_b["toTime"],
+                datum_de, datum_api,
+                dauer_minuten(aktive_b["fromTime"], aktive_b["toTime"]))
+            rollback = False
+            for _rb in range(10):
+                if not aktiv():
+                    break
+                if buche_slot(k, alter_slot):
+                    rollback = True
+                    break
+                time.sleep(1)
+            if rollback:
+                beende(f"🛟 [{k}] Rollback OK: {aktive_b['fromTime']}–{aktive_b['toTime']} "
+                       f"(Court {gerade_court}) wieder gebucht – Schieben gestoppt.")
+            else:
+                beende(f"❌ [{k}] Neubuchung UND Rollback fehlgeschlagen!\n"
+                       f"🆘 SOFORT manuell buchen:\n{BASE_URL}/padel?currentDate={datum_api}")
             return
 
     zeige_account_menue(k)
@@ -4341,7 +4567,7 @@ def telegram_loop():
 
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("🎾 Padel Bot V12 GODMODE – r2-Prefire | Zeitsync | Konflikt-Stopp | Stornofix")
+    log.info("🎾 Padel Bot V13 GODMODE 2.0 – Schiebe-Lücke halbiert (r2-Prefire+Dialog-Vorladen vor Storno)")
     log.info("   FIX 1: buche_slot() kein False-Positiv mehr (kein verifiziert=True Fallback)")
     log.info("   FIX 2: Rebook nach Storno: 30× mit 0.1s | Storno-Retry: aktiv()-Check")
     log.info("   NEU 3: Sniper-Modus – sekündlicher Dauerhammer + Schiebe nach Treffer")
@@ -4382,7 +4608,7 @@ if __name__ == "__main__":
     anzahl      = len(ACCOUNTS)
     modus_label = "Dual-Account" if anzahl > 1 else "Einzel-Account"
     startup_msg = (
-        f"🎾 <b>Padel Bot V12 GODMODE gestartet!</b>\n\n"
+        f"🎾 <b>Padel Bot V13 GODMODE 2.0 gestartet!</b>\n\n"
         f"{modus_label}  |  3 Schiebe-Modi  |  🎯 Sniper-Modus\n\n"
         f"<b>NEU v10:</b>\n"
         f"🔒 Buchung nur bestätigt wenn Server-Sync OK (kein False-Positiv)\n"
@@ -4411,4 +4637,4 @@ if __name__ == "__main__":
             time.sleep(10)
     except KeyboardInterrupt:
         log.info("Bot beendet.")
-        senden("⏹️ Padel Bot V12 GODMODE wurde beendet.")
+        senden("⏹️ Padel Bot V13 GODMODE 2.0 wurde beendet.")
