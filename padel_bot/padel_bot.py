@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
-"""Padel Bot v13.0.0
+"""Padel Bot V12 GODMODE
+
+NEU V12-GODMODE (Anti-Rival-Blitz – Kern: schneller committen als fremde Bots):
+        Anlass: 08.07. 13:00 – fremder Bot hat den Slot innerhalb von <350ms
+        nach Freischaltung weggeschnappt (unser r2+r3 brauchte ~350–500ms).
+        1. r2-PREFIRE: r2 (_eventId=next) wird bereits R2_PREFIRE_MS vor T-0
+           gefeuert (gleiche Idee wie Pre-Warm r1 bei T-10s). Welle 0 schickt
+           bei T-0 nur noch das r3-Commit → Commit landet ~50–150ms nach
+           Freischaltung statt ~350–500ms. Lehnt der Server das frühe r2 ab:
+           automatischer Fallback auf den bewährten vollen r2+r3-Burst.
+        2. ZEITSYNC: Serveruhr-Offset wird vor jedem Blitz über den Date-Header
+           gemessen (12 leichte Requests, ~2s). Geht die Serveruhr vor/nach,
+           verschiebt sich der Feuerzeitpunkt entsprechend (Clamp ±2s,
+           unplausible Messungen werden ignoriert → Verhalten wie bisher).
+        3. KONFLIKT-ERKENNUNG: "Konflikt mit einem bestehenden Termin" gilt
+           jetzt als harter Fehlschlag (vorher ok=True → 2 Minuten sinnloses
+           Nachfeuern, siehe Log 08.07. 13:00–13:02). Burst-Wellen brechen nach
+           2 Konflikten ab, der Hartnäckig-Loop nach 3 in Folge – mit
+           Telegram-Meldung "Slot wurde von jemand anderem gebucht".
+        4. ERFOLGS-TEXT: "Ihre Buchung war erfolgreich" in r3 wird erkannt; bei
+           Erfolgstext + my-bookings-Miss wird die Verifikation 2× kurz
+           wiederholt (my-bookings-Lag ≠ verlorener Slot). Eigentums-Check
+           via my-bookings bleibt in jedem Fall Pflicht.
+        5. DIAGNOSE: Burst-r3-Log ohne <style>-Blöcke und mit 1200 Zeichen →
+           Modal-Titel ist künftig immer lesbar.
+        Enthält den V11-Stornofix (Session-Refresh vor Safe-Storno).
 
 NEU v13.0.0: 3h-MODUS (Block). Rein additiv – KERN-CODE UNVERÄNDERT.
         Zwei Accounts erzeugen zusammen einen durchgehenden 3-Stunden-Block
@@ -105,6 +130,7 @@ import threading
 import time
 import logging
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 
@@ -239,6 +265,14 @@ BLITZ_FIRE_OFFSET_MS   = 0       # ms: Feuer-Offset relativ buchbar_dt (nie nega
 MULTI_SHOT_COUNT       = 5       # Anzahl Burst-Wellen nach erstem Miss
 MULTI_SHOT_GAP_MS      = 150     # ms: Pause zwischen Bursts
 PHASE1_HANDOFF_MARGIN  = 180     # s: Direkt-Modus wacht so viel vor Freischaltung auf (Phase 2 macht Login+Pre-Warm+Blitz)
+
+# GODMODE-Blitz (V12): schneller als fremde Bots, ohne mehr Requests zu feuern
+R2_PREFIRE_MS          = 250     # ms: r2 SO VIEL vor T-0 feuern → Welle 0 = nur r3-Commit. 0 = aus
+ZEITSYNC_AKTIV         = True    # Serveruhr-Offset messen, Feuerzeitpunkt korrigieren
+ZEITSYNC_MAX_OFFSET_S  = 2.0     # s: größere Messwerte gelten als unplausibel → keine Korrektur
+KONFLIKT_TEXT          = "konflikt mit einem bestehenden termin"  # exakter Server-Text (lowercase)
+ERFOLG_TEXTE           = ("buchung war erfolgreich", "aktion erfolgreich")
+KONFLIKT_STOP_N        = 3       # Hartnäckig-Loop: nach so vielen Konflikten in Folge stoppen
 
 # Duo-Modus: zwei Accounts parallel auf Court 1 + Court 2 (Basis = Direkte Taktik).
 # Versetzter Schiebe-Rhythmus, damit beide nie gleichzeitig schieben:
@@ -985,6 +1019,7 @@ def buche_slot(k: str, slot: dict, verify_person_id: bool = True) -> bool:
             return False
 
     log.info(f"🎾 [{k}] Buche Court {court} | {datum_de} | {from_t}–{to_t}")
+    _KONFLIKT_FLAG.pop(f"{k}:{court}", None)
     h  = _ajax_header(csrf_t, referer=f"{BASE_URL}/padel?currentDate={datum_api}")
     hp = {**h, "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
           "origin": BASE_URL}
@@ -1025,6 +1060,11 @@ def buche_slot(k: str, slot: dict, verify_person_id: bool = True) -> bool:
                        timeout=10)
 
         if r3.status_code not in [200, 302]:
+            return False
+        if KONFLIKT_TEXT in r3.text.lower():
+            _KONFLIKT_FLAG[f"{k}:{court}"] = True
+            log.warning(f"⛔ [{k}] Court {court} {from_t}–{to_t}: Konflikt mit "
+                        f"bestehendem Termin – Slot vergeben.")
             return False
         if any(w in r3.text.lower() for w in ["fehler", "error", "nicht möglich"]):
             log.warning(f"[{k}] Buchung: Server-Fehler")
@@ -1437,6 +1477,52 @@ def _aggressiv_buchen_ab(k: str, datum_de: str, datum_api: str, dauer_min: int,
 # BLITZ-PFAD: Pre-Warm + Burst
 # ══════════════════════════════════════════════
 
+_RE_STYLE_BLOCK = re.compile(r"<style[^>]*>.*?</style>", re.S | re.I)
+
+# f"{k}:{court}" → True, wenn der letzte buche_slot-Versuch ein Server-Konflikt
+# ("Slot fremd belegt") war. Wird vom Hartnäckig-Loop gelesen (Schnellabbruch).
+_KONFLIKT_FLAG: dict[str, bool] = {}
+
+def _modal_debug(text: str, n: int = 1200) -> str:
+    """Antwort-Body für Diagnose-Logs: <style>-Blöcke raus, Whitespace eindampfen,
+    damit der Modal-Titel (Erfolg/Konflikt/Reload) im Log immer lesbar ist."""
+    t = _RE_STYLE_BLOCK.sub("", text or "")
+    return re.sub(r"\s+", " ", t).strip()[:n]
+
+def _messe_server_offset(k: str) -> float | None:
+    """GODMODE-Zeitsync: schätzt (Serverzeit − lokale Zeit) in Sekunden über den
+    Sekundensprung des Date-Headers (~12 leichte Requests, ≤2s Messdauer).
+    Positiv = Serveruhr geht vor → der Slot schaltet LOKAL entsprechend früher
+    frei. None = keine verwertbare Messung (dann keine Korrektur)."""
+    snap = az_snap(k, "csrf_token", "http")
+    http = snap["http"]
+    h = {**_ajax_header(snap["csrf_token"], referer=f"{BASE_URL}/"),
+         "accept": "application/json, text/javascript, */*; q=0.01"}
+    prev_sec = prev_mid = None
+    try:
+        for _ in range(12):
+            t0 = time.time()
+            r = http.get(f"{BASE_URL}/user/my-bookings/total-pages",
+                         params={"size": "50"}, headers=h, timeout=3)
+            t1 = time.time()
+            dh = r.headers.get("Date")
+            if not dh:
+                return None
+            sec = parsedate_to_datetime(dh).timestamp()
+            mid = (t0 + t1) / 2.0
+            if (t1 - t0) <= 0.35:      # nur Samples mit kleiner RTT verwerten
+                if (prev_sec is not None and sec - prev_sec == 1
+                        and (mid - prev_mid) < 0.6):
+                    # Date-Header ist zwischen zwei Requests umgesprungen:
+                    # Server stand bei sec.000, lokal war es ~Mitte der Lücke
+                    return sec - (prev_mid + mid) / 2.0
+                prev_sec, prev_mid = sec, mid
+            time.sleep(0.1)
+    except Exception as e:
+        log.warning(f"[{k}] Zeitsync-Messung: {e}")
+    return None
+
+
 def pre_warm_r1(k: str, court: int, datum_api: str, from_t: str, to_t: str) -> str | None:
     """
     R5/R15: Sendet NUR r1 (GET /court-single-booking-flow), liefert execution=eXs1 Token.
@@ -1502,33 +1588,112 @@ def burst_r2_r3(k: str, court: int, execution: str, slot: dict) -> tuple[bool, d
         m2 = re.search(r"execution=(e\d+s\d+)", r2.text)
         if m2:
             exec2 = m2.group(1)
-        if any(w in r2.text.lower() for w in ["fehler", "error", "nicht möglich"]):
+        low2 = r2.text.lower()
+        if KONFLIKT_TEXT in low2:
+            log.warning(f"⛔ [{k}] Court {court}: Konflikt bereits in r2 – Slot vergeben.")
+            return False, {"konflikt": True}
+        if any(w in low2 for w in ["fehler", "error", "nicht möglich"]):
             return False, None
 
-        r3 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
-                       params={"execution": exec2, "_eventId": "commit"},
-                       data=f"purchaseTemplate.comment=&_csrf={csrf_t}",
-                       timeout=10)
-        if r3.status_code not in [200, 302]:
-            return False, None
-        if any(w in r3.text.lower() for w in ["fehler", "error", "nicht möglich"]):
-            return False, None
-
-        booking_id = None
-        for pat in [r'"bookingId"\s*:\s*(\d+)', r'/bookings/(\d+)', r'booking[=_](\d+)']:
-            mid = re.search(pat, r3.text)
-            if mid:
-                booking_id = int(mid.group(1))
-                break
-        # DIAGNOSE (temporär): Warum landet ein "ok=True"-Burst nie in my-bookings?
-        # Zeigt r3-Status + geparste ID + Body-Anfang → verrät, ob r3 wirklich gebucht
-        # hat (echte Buchungsseite/-ID) oder nur eine 200-Overlap-/Bestätigungsseite kam.
-        _b3 = (r3.text or "")[:400].replace("\n", " ")
-        log.info(f"🔎 [{k}] Burst-r3 Court {court}: status={r3.status_code} "
-                 f"parsed_id={booking_id} | body={_b3!r}")
-        return True, {**slot, "court": int(court), "booking_id": booking_id}
+        return _feuer_r3_commit(k, court, http, hp, csrf_t, exec2, slot)
     except Exception as e:
         log.warning(f"[{k}] burst_r2_r3 Court {court}: {e}")
+        return False, None
+
+
+def _feuer_r3_commit(k: str, court: int, http, hp: dict, csrf_t: str,
+                     exec2: str, slot: dict) -> tuple[bool, dict | None]:
+    """Gemeinsames r3-Commit für burst_r2_r3 und burst_commit_only (GODMODE).
+    Erkennt Konflikt ("Slot fremd belegt") und Erfolgs-Text explizit."""
+    r3 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
+                   params={"execution": exec2, "_eventId": "commit"},
+                   data=f"purchaseTemplate.comment=&_csrf={csrf_t}",
+                   timeout=10)
+    if r3.status_code not in [200, 302]:
+        return False, None
+
+    booking_id = None
+    for pat in [r'"bookingId"\s*:\s*(\d+)', r'/bookings/(\d+)', r'booking[=_](\d+)']:
+        mid = re.search(pat, r3.text)
+        if mid:
+            booking_id = int(mid.group(1))
+            break
+    # DIAGNOSE: r3-Status + geparste ID + Body (ohne <style>) → Erfolgs-,
+    # Konflikt- oder Reload-Modal ist im Log im Klartext erkennbar.
+    log.info(f"🔎 [{k}] Burst-r3 Court {court}: status={r3.status_code} "
+             f"parsed_id={booking_id} | body={_modal_debug(r3.text)!r}")
+
+    low = r3.text.lower()
+    if KONFLIKT_TEXT in low:
+        log.warning(f"⛔ [{k}] Court {court}: Konflikt mit bestehendem Termin – Slot vergeben.")
+        return False, {"konflikt": True}
+    if any(w in low for w in ["fehler", "error", "nicht möglich"]):
+        return False, None
+    erfolg_text = any(t in low for t in ERFOLG_TEXTE)
+    return True, {**slot, "court": int(court), "booking_id": booking_id,
+                  "erfolg_text": erfolg_text}
+
+
+def pre_fire_r2(k: str, court: int, execution: str, slot: dict) -> str | None:
+    """GODMODE: feuert NUR r2 (_eventId=next) kurz VOR der Freischaltung mit dem
+    Pre-Warm-Token. Bei T-0 fehlt dann nur noch das r3-Commit → ~halbe Latenz im
+    Rennen gegen fremde Bots. Liefert exec2 (eXs2) oder None → Caller fällt auf
+    den bewährten vollen r2+r3-Burst zurück (kein Risiko, wie Prewarm-Fallback)."""
+    from_t    = slot["fromTime"]
+    to_t      = slot["toTime"]
+    datum_de  = slot["datum_de"]
+    datum_api = slot["datum_api"]
+    snap      = az_snap(k, "csrf_token", "person_id", "http")
+    csrf_t    = snap["csrf_token"]
+    person_id = snap["person_id"]
+    http      = snap["http"]
+    if not person_id:
+        log.warning(f"[{k}] r2-Prefire Court {court}: Person-ID fehlt!")
+        return None
+    hp = {**_ajax_header(csrf_t, referer=f"{BASE_URL}/padel?currentDate={datum_api}"),
+          "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "origin": BASE_URL}
+    try:
+        r2 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
+                       params={"execution": execution, "_eventId": "next"},
+                       data=(f"purchaseTemplate.repetition.date={datum_de}"
+                             f"&purchaseTemplate.repetition.fromTime={from_t.replace(':', '%3A')}"
+                             f"&purchaseTemplate.repetition.toTime={to_t.replace(':', '%3A')}"
+                             f"&bookingModel.courts%5B0%5D={court}"
+                             f"&purchaseTemplate.court={court}"
+                             f"&purchaseTemplate.person={person_id}"
+                             f"&purchaseTemplate.bookingType={BOOKING_TYPE}"
+                             f"&_csrf={csrf_t}"),
+                       timeout=10)
+        low2 = r2.text.lower()
+        if (r2.status_code not in [200, 302] or KONFLIKT_TEXT in low2
+                or any(w in low2 for w in ["fehler", "error", "nicht möglich"])):
+            log.warning(f"[{k}] r2-Prefire Court {court} abgelehnt: "
+                        f"status={r2.status_code} | body={_modal_debug(r2.text, 300)!r}")
+            return None
+        exec2 = execution.replace("s1", "s2")
+        m2 = re.search(r"execution=(e\d+s\d+)", r2.text)
+        if m2:
+            exec2 = m2.group(1)
+        return exec2
+    except Exception as e:
+        log.warning(f"[{k}] pre_fire_r2 Court {court}: {e}")
+        return None
+
+
+def burst_commit_only(k: str, court: int, exec2: str, slot: dict) -> tuple[bool, dict | None]:
+    """GODMODE Welle 0: nur noch r3-Commit (r2 wurde bereits per pre_fire_r2
+    vorgefeuert). Gleiche Verifikations-Pflichten wie burst_r2_r3 (R10)."""
+    snap   = az_snap(k, "csrf_token", "http")
+    csrf_t = snap["csrf_token"]
+    http   = snap["http"]
+    hp = {**_ajax_header(csrf_t, referer=f"{BASE_URL}/padel?currentDate={slot['datum_api']}"),
+          "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "origin": BASE_URL}
+    try:
+        return _feuer_r3_commit(k, court, http, hp, csrf_t, exec2, slot)
+    except Exception as e:
+        log.warning(f"[{k}] burst_commit_only Court {court}: {e}")
         return False, None
 
 
@@ -1555,6 +1720,22 @@ def _direkt_blitz(k: str, datum_de: str, datum_api: str, dauer_min: int,
     treffer      = {}      # court -> verifizierte Buchung
     treffer_lock = threading.Lock()
 
+    # GODMODE-Zeitsync: Serveruhr-Offset einmal messen und alle Feuerzeitpunkte
+    # darauf beziehen. Unplausible/fehlende Messung → Verhalten exakt wie bisher.
+    zeit_korr = 0.0
+    if ZEITSYNC_AKTIV and (buchbar_dt - jetzt_lokal()).total_seconds() > BLITZ_PREWARM_SECONDS + 5:
+        _off = _messe_server_offset(k)
+        if _off is not None and 0.05 <= abs(_off) <= ZEITSYNC_MAX_OFFSET_S:
+            zeit_korr = _off
+            log.info(f"⏱️ [{k}] Serveruhr-Offset {_off*1000:+.0f}ms → Blitz feuert "
+                     f"entsprechend {'früher' if _off > 0 else 'später'}")
+        elif _off is not None:
+            log.info(f"⏱️ [{k}] Serveruhr-Offset {_off*1000:+.0f}ms → keine Korrektur "
+                     f"({'vernachlässigbar' if abs(_off) < 0.05 else 'unplausibel'})")
+        else:
+            log.info(f"⏱️ [{k}] Zeitsync: keine verwertbare Messung → keine Korrektur")
+    basis_dt = buchbar_dt - timedelta(seconds=zeit_korr)
+
     def warte_bis_genau(ziel_dt: datetime):
         """Schläft präzise bis ziel_dt (lokale Berlin-Zeit, naiv)."""
         while True:
@@ -1573,7 +1754,7 @@ def _direkt_blitz(k: str, datum_de: str, datum_api: str, dauer_min: int,
         slot = _baue_slot_dict(court, from_t, to_t, datum_de, datum_api, dauer_min)
 
         # Pre-Warm bei T-10s
-        prewarm_dt = buchbar_dt - timedelta(seconds=BLITZ_PREWARM_SECONDS)
+        prewarm_dt = basis_dt - timedelta(seconds=BLITZ_PREWARM_SECONDS)
         warte_bis_genau(prewarm_dt)
         if not az_get(k, "schiebe_aktiv"):
             return
@@ -1583,37 +1764,70 @@ def _direkt_blitz(k: str, datum_de: str, datum_api: str, dauer_min: int,
         else:
             log.warning(f"[{k}] Pre-Warm Court {court} fehlgeschlagen")
 
+        # GODMODE: r2 schon bei T−R2_PREFIRE_MS feuern → Welle 0 muss bei T-0
+        # nur noch committen. Lehnt der Server das frühe r2 ab, holt der
+        # Fallback sofort einen frischen Token (alter Flow evtl. verbrannt)
+        # und Welle 0 feuert wie bisher den vollen r2+r3-Burst.
+        exec2 = None
+        if execution and R2_PREFIRE_MS > 0:
+            warte_bis_genau(basis_dt - timedelta(milliseconds=R2_PREFIRE_MS))
+            if not az_get(k, "schiebe_aktiv"):
+                return
+            exec2 = pre_fire_r2(k, court, execution, slot)
+            if exec2:
+                log.info(f"⚡ [{k}] r2-Prefire Court {court} OK → {exec2}")
+            else:
+                execution = pre_warm_r1(k, court, datum_api, from_t, to_t)
+
         # Burst-Wellen bei T-0, T+gap, T+2*gap, ...
+        konflikte = 0
         for burst in range(MULTI_SHOT_COUNT + 1):
             with treffer_lock:
                 if treffer:
                     return
             if not az_get(k, "schiebe_aktiv"):
                 return
-            fire_dt = buchbar_dt + timedelta(milliseconds=BLITZ_FIRE_OFFSET_MS
-                                                          + burst * MULTI_SHOT_GAP_MS)
+            fire_dt = basis_dt + timedelta(milliseconds=BLITZ_FIRE_OFFSET_MS
+                                                        + burst * MULTI_SHOT_GAP_MS)
             warte_bis_genau(fire_dt)
-            if not execution:
-                execution = pre_warm_r1(k, court, datum_api, from_t, to_t)
-                if not execution:
-                    continue
 
             t0 = time.perf_counter()
-            ok, parsed = burst_r2_r3(k, court, execution, slot)
+            if burst == 0 and exec2:
+                ok, parsed = burst_commit_only(k, court, exec2, slot)
+                art = "Commit-Blitz"
+            else:
+                if not execution:
+                    execution = pre_warm_r1(k, court, datum_api, from_t, to_t)
+                    if not execution:
+                        continue
+                ok, parsed = burst_r2_r3(k, court, execution, slot)
+                art = "Burst"
             dt_ms = (time.perf_counter() - t0) * 1000.0
-            log.info(f"⚡ [{k}] Burst {burst+1}/{MULTI_SHOT_COUNT+1} Court {court}: "
+            log.info(f"⚡ [{k}] {art} {burst+1}/{MULTI_SHOT_COUNT+1} Court {court}: "
                      f"ok={ok} ({dt_ms:.0f}ms)")
             if ok:
                 # Sicherheitsnetz: my-bookings verifizieren
                 verifiziert = verifiziere_slot_via_my_bookings(k, slot)
+                if not verifiziert and parsed and parsed.get("erfolg_text"):
+                    # Server meldete explizit Erfolg → my-bookings-Lag abfedern
+                    for _lag in range(2):
+                        time.sleep(0.5)
+                        verifiziert = verifiziere_slot_via_my_bookings(k, slot)
+                        if verifiziert:
+                            break
                 if verifiziert:
                     with treffer_lock:
                         if not treffer:
                             treffer[court] = verifiziert
                     return
-                else:
-                    log.warning(f"[{k}] Burst Court {court}: r3 OK aber NICHT in my-bookings "
-                                f"→ ignoriere (False-Positive verhindert)")
+                log.warning(f"[{k}] Burst Court {court}: r3 OK aber NICHT in my-bookings "
+                            f"→ ignoriere (False-Positive verhindert)")
+            elif parsed and parsed.get("konflikt"):
+                konflikte += 1
+                if konflikte >= 2:
+                    log.warning(f"⛔ [{k}] Court {court}: {konflikte}× Konflikt – "
+                                f"Slot fremd vergeben, Burst-Wellen abgebrochen.")
+                    return
             # Neuer Pre-Warm für nächste Welle (execution ist verbraucht)
             execution = pre_warm_r1(k, court, datum_api, from_t, to_t)
 
@@ -2783,12 +2997,20 @@ def _safe_grab(k: str, court: int, datum_api: str, von: str, bis: str,
 def _safe_storno(k: str, booking_id, datum_api: str) -> bool:
     if not booking_id:
         return True
+    # WICHTIG: Frische Session ERZWINGEN vor dem Storno – genau wie der klassische
+    # Schiebe-Storno ("Erzwungener Login vor Stornierung"). Zwischen Blitz und Storno
+    # liegen im Safe-/3h-Modus oft >1h → die alte Session ist tot → sonst 401
+    # Unauthorized (INVALID_REQUEST), egal wie oft man retryt.
+    _session_refresh_vor_aktion(k, "Safe-Storno")
     for _v in range(6):
         if not az_get(k, "schiebe_aktiv"):
             return False
         if storniere_buchung(k, booking_id, datum_api):
             az_set(k, "aktive_buchung", None)
             return True
+        # Bei erneutem Fehlschlag Session nochmal auffrischen (könnte wieder abgelaufen sein)
+        if _v == 2:
+            _session_refresh_vor_aktion(k, "Safe-Storno-Retry")
         time.sleep(2)
     return False
 
@@ -2807,11 +3029,24 @@ def _safe_blitz_hartnaeckig(k: str, court: int, datum_de: str, datum_api: str,
         return True
     ziel_slot = _baue_slot_dict(court, von, bis, datum_de, datum_api, dauer_min)
     ende = time.time() + weiter_sec
+    konflikte = 0
     while time.time() < ende:
         if not az_get(k, "schiebe_aktiv"):
             return False
         if buche_slot(k, ziel_slot):
             return True
+        # GODMODE: Server-Konflikt = Slot gehört jemand anderem → nicht 2 Min
+        # sinnlos weiterhämmern (DoS-Gefahr!), sondern nach N Konflikten stoppen.
+        if _KONFLIKT_FLAG.get(f"{k}:{court}"):
+            konflikte += 1
+            if konflikte >= KONFLIKT_STOP_N:
+                log.warning(f"⛔ [{k}] {von}–{bis} Court {court}: {konflikte}× Konflikt "
+                            f"in Folge – Slot fremd vergeben, Dauerversuche gestoppt.")
+                senden(f"⛔ [{k}] Slot {von}–{bis} (Court {court}, {datum_de}) wurde "
+                       f"von jemand anderem gebucht – Versuche gestoppt.")
+                return bool(az_get(k, "aktive_buchung"))
+        else:
+            konflikte = 0
         time.sleep(1)
     return bool(az_get(k, "aktive_buchung"))
 
@@ -4106,7 +4341,7 @@ def telegram_loop():
 
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("🎾 Padel Bot v10.0.0 – Fixes: Verifikation | Schiebe-Speed | Sniper")
+    log.info("🎾 Padel Bot V12 GODMODE – r2-Prefire | Zeitsync | Konflikt-Stopp | Stornofix")
     log.info("   FIX 1: buche_slot() kein False-Positiv mehr (kein verifiziert=True Fallback)")
     log.info("   FIX 2: Rebook nach Storno: 30× mit 0.1s | Storno-Retry: aktiv()-Check")
     log.info("   NEU 3: Sniper-Modus – sekündlicher Dauerhammer + Schiebe nach Treffer")
@@ -4147,7 +4382,7 @@ if __name__ == "__main__":
     anzahl      = len(ACCOUNTS)
     modus_label = "Dual-Account" if anzahl > 1 else "Einzel-Account"
     startup_msg = (
-        f"🎾 <b>Padel Bot v10.0.0 gestartet!</b>\n\n"
+        f"🎾 <b>Padel Bot V12 GODMODE gestartet!</b>\n\n"
         f"{modus_label}  |  3 Schiebe-Modi  |  🎯 Sniper-Modus\n\n"
         f"<b>NEU v10:</b>\n"
         f"🔒 Buchung nur bestätigt wenn Server-Sync OK (kein False-Positiv)\n"
@@ -4176,4 +4411,4 @@ if __name__ == "__main__":
             time.sleep(10)
     except KeyboardInterrupt:
         log.info("Bot beendet.")
-        senden("⏹️ Padel Bot v10.0.0 wurde beendet.")
+        senden("⏹️ Padel Bot V12 GODMODE wurde beendet.")
