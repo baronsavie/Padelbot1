@@ -1,5 +1,63 @@
 #!/usr/bin/env python3
-"""Padel Bot V17 SPAM-COMMIT ÜBERALL
+"""Padel Bot V18 TIMING (M1 Diagnose + M2 Freischaltungs-Fix)
+
+NEU V18 (Anlass: Logs 15.07. + 25.–27.07. + HAR 28.07.):
+    BEFUND 1 – Der Freischaltungs-Blitz scheiterte in 6 von 6 protokollierten
+        Läufen reproduzierbar identisch: "unerwartete Antwort nach 2 Weiter →
+        Fallback" bei ca. T-0,5s. Danach setzte V17 execution=None, wodurch das
+        r2-Prefire ausfiel und Welle 0 bei T-0 erst r1, dann r2, dann r3 senden
+        musste. Gemessene Commit-Zeitpunkte: T+394, +398, +402, +545 ms – in drei
+        Fällen war der Slot da schon fremd vergeben ("Konflikt").
+    BEFUND 2 (HAR 28.07., Slot 04.08. 09:30 um 00:19 aufgenommen) – Vor der
+        Freischaltung antwortet der Server auf "Weiter" mit 302 zurück auf
+        execution=eXs1. Der Token ist dabei BELIEBIG oft wiederverwendbar
+        (18 POSTs am Stück belegt). Folgt man dem Redirect, steht dort:
+          "Leider kann Ihre Buchung nicht durchgeführt werden.
+           Grund: Es darf maximal 7 Tage im Voraus gebucht werden."
+        Dieser Body enthält KEINES der Wörter aus FEHLER_INDIZIEN – deshalb hielt
+        pre_fire_r2() ihn für Erfolg und lieferte per _parse_execution() das
+        S1-Token als "exec2" zurück. Ein Commit darauf kann nie buchen.
+        ⇒ Am Freischalt-Punkt ist ein vorgezogenes r2 PRINZIPIELL unmöglich.
+        Der einzig gangbare Weg ist das "Weiter"-Dauerfeuer auf einem s1-Token.
+
+    M1 – TIMING-DIAGNOSE (rein additiv):
+        _weiter_status() loggte bisher bei "ERROR" GAR NICHTS – kein Statuscode,
+        kein Location-Header, kein Body. Deshalb blieb Befund 1 seit dem 15.07.
+        unsichtbar. Jetzt pro Request: Sendezeitpunkt relativ zu T-0, RTT,
+        Statuscode, Redirect-Ziel, Serveruhr aus dem Date-Header. Gedrosselt
+        (erste N + jeder N-te), damit das Log auf eMMC nicht überläuft.
+        Auch der Schiebe-Pfad setzt jetzt beim Storno ein T-0 → das kritische
+        Fenster Storno→Neubuchung ist erstmals exakt messbar.
+
+    M2 – FREISCHALTUNGS-FIX:
+        a) Der bei T-10s vorgewärmte Token wird an den Spam DURCHGEREICHT.
+           Vorher holte spam_commit_blitz() einen zweiten (Log: "Pre-Warm →
+           e2s1" / "Spam Token e3s1") → zwei offene Flows, während der Browser
+           laut HAR immer nur einen offenen hat.
+        b) WARMHALTEN statt Leerlauf: Der Spam startet sofort nach dem Pre-Warm
+           im Sekundentakt und schaltet erst ab T-800ms auf Vollgas. Vorher lagen
+           9s Leerlauf zwischen Token-Erzeugung und erstem Weiter – Token UND
+           TCP-Verbindung standen brach. Der funktionierende Sniper-Spam
+           (443 bzw. 81 Weiter am Stück, Treffer) nutzt seinen Token durchgehend.
+        c) Bei FALLBACK wird sofort frisch vorgewärmt, statt execution=None zu
+           setzen → Welle 0 startet direkt mit r2+r3 statt mit r1+r2+r3.
+        d) r2-Prefire am Freischalt-Punkt AUS (Befund 2). Im Schiebe-Pfad bleibt
+           es aktiv und bewährt. Zusätzlich weist pre_fire_r2() ein s1-Token
+           jetzt grundsätzlich zurück (Sicherheitsnetz, wirkt in allen Pfaden).
+
+    UNVERÄNDERT: Schiebe-Reihenfolge und -Absicherungen, die strikte
+        my-bookings-Verifikation, schiebe_moment auf jetzt.date(), Sniper, Safe,
+        Duo, 3h, Telegram, Konflikt-/DoS-Stopps. Alle Änderungen fallen bei
+        Problemen auf den bisherigen Weg zurück.
+        Zurück auf V17-Verhalten: R2_PREFIRE_BEI_FREISCHALTUNG=True und
+        SPAM_HOCHFREQUENZ_MS=SPAM_FENSTER_VOR_MS. Ganz ohne Spam:
+        SPAM_COMMIT_AKTIV=False. Diagnose aus: TIMING_LOG_AKTIV=False.
+
+    ENTHÄLT AUSSERDEM den einmaligen Messlauf aus V17.1 (Uhr-Offset gegen
+        ptbtime1.ptb.de, TCP/TLS-Jitter, Serveruhr) – Schalter MESS_BEIM_START.
+
+──────────────────────────────────────────────────────────────────────
+Basis: Padel Bot V17 SPAM-COMMIT ÜBERALL
 
 NEU V17 (Spam-Commit in ALLE Renn-Pfade – gemeinsamer, getesteter Kern):
         Der V16-Spam-Commit (Weiter-Dauerfeuer → beim Aufspringen sofort buchen)
@@ -452,10 +510,74 @@ PHASE1_HANDOFF_MARGIN  = 180     # s: Direkt-Modus wacht so viel vor Freischaltu
 #   bewährten V15-Burst (kann nie schlechter sein). Redirect wird NICHT verfolgt
 #   (nur Location gelesen) → kein Laden der 6–15 KB-Seite im kritischen Fenster.
 SPAM_COMMIT_AKTIV      = True    # False = exakt V15-Verhalten (klassischer Burst)
-SPAM_FENSTER_VOR_MS    = 800     # ms: so früh vor T-0 mit dem "Weiter"-Dauerfeuer beginnen
-SPAM_NEXT_INTERVAL     = 0.05    # s: Pause zwischen "Weiter"-Versuchen, solange der Slot zu ist
+SPAM_FENSTER_VOR_MS    = 800     # ms: (V18 nur noch Fallback-Wert, siehe SPAM_WARMHALTEN_*)
+SPAM_NEXT_INTERVAL     = 0.05    # s: Pause zwischen "Weiter"-Versuchen im HOCHFREQUENZ-Fenster
 SPAM_DEADLINE_S        = 8       # s: nach T-0 so lange spammen, dann Rückfall/Abbruch
 SPAM_KONFLIKT_STOP     = 3       # commit-Konflikte in Folge (fremd vergeben) → stoppen (DoS-Schutz)
+
+# ── V18 WARMHALTEN (Kern-Fix des Freischaltungs-Blitzes) ──────────────────────
+# Befund aus den Logs 15.07./25.-27.07.: Der Blitz-Spam scheiterte in 6 von 6
+# Läufen reproduzierbar mit "unerwartete Antwort nach 2 Weiter → Fallback".
+# Der Sniper-Spam mit demselben Kern funktioniert dagegen (443 bzw. 81 Weiter
+# am Stück, Treffer). Die zwei belegbaren Unterschiede im Blitz waren:
+#   1. Es wurden ZWEI Flows gleichzeitig geöffnet (Pre-Warm e2s1 + Spam e3s1) –
+#      der Browser hat laut HAR immer nur einen offenen.
+#   2. Zwischen Token-Erzeugung (T-10s) und erstem "Weiter" (T-0,8s) lagen
+#      9 Sekunden Leerlauf – Token UND TCP-Verbindung standen brach.
+# V18 macht es wie der funktionierende Sniper: EIN Token, der ab dem Pre-Warm
+# durchgehend benutzt wird – erst langsam (hält Token + Keep-Alive-Verbindung
+# warm), kurz vor T-0 dann im Hochfrequenz-Takt.
+SPAM_START_VOR_S        = 10     # s vor T-0: so früh mit dem Dauerfeuer beginnen
+SPAM_WARMHALTE_INTERVAL = 1.0    # s: Takt im Warmhalte-Fenster (T-10s … T-3s)
+SPAM_HOCHFREQUENZ_MS    = 3000   # ms vor T-0: ab hier auf SPAM_NEXT_INTERVAL umschalten
+# PRINZIP: Der Bot misst NICHT, wann der Slot aufspringt, und feuert auch nicht
+# auf einen berechneten Zeitpunkt. Er tippt durchgehend "Weiter" und schlägt zu,
+# sobald der Redirect auf s2 springt – die Freischaltung meldet sich von selbst.
+# Belegt durch HAR 28.07.: 18 "Weiter" am Stück auf demselben Token e1s1, jedes
+# Mal die 7-Tage-Absage – der Token nutzt sich dabei NICHT ab.
+#
+# WARUM 10s UND NICHT 60s: Login/CSRF/Person-ID sind längst frisch (Direkt und
+# Früh loggen T-90s ein, Safe3h T-180s). Ein früherer Start bringt nichts außer
+# Requests. 10s reichen bequem für r1 (~100ms) plus ein paar Sekunden
+# durchgehende Nutzung, damit die TCP-Verbindung garantiert warm in T-0 läuft.
+#
+# WARUM NICHT 5s: Der Puffer ist für den Fall, dass r1 einmal 1–2s braucht oder
+# einen Retry benötigt – sonst startet das Dauerfeuer im ungünstigsten Moment.
+#
+# GEGEN UHR-FEHLER schützt NICHT der Startzeitpunkt, sondern das
+# Hochfrequenzfenster: 3s Vollgas decken ±3s Abweichung ab (lokal ODER
+# serverseitig). T-0 dient nur noch zwei Zwecken:
+#   1. Takt-Umschaltung langsam→schnell (reine Serverschonung)
+#   2. Log-Ausgabe "send=T-412ms" (reine Diagnose)
+# Last je Court-Thread und Blitz: ~7 langsame + ~60 schnelle Requests
+# (der Sniper feuert im Vergleich 443 in 50s).
+# Lastabschätzung pro Court-Thread und Blitz: ~9 Requests warm + ~16 hochfrequent.
+# Der Sniper feuert im Vergleich 443 in 50s. Bei mehreren Accounts/Courts
+# vervielfacht sich das – deshalb bewusst konservativ (kein 10ms-Dauerfeuer).
+
+# ── V18: r2-PREFIRE AM FREISCHALT-PUNKT IST UNMÖGLICH (HAR-Beweis 28.07.) ─────
+# Vor der Freischaltung lehnt der Server r2 mit der 7-Tage-Regel ab:
+#   Status 200, Modal "Wählen Sie Ihre Buchung...", Text
+#   "Es darf maximal 7 Tage im Voraus gebucht werden."
+# Dieser Body enthält WEDER "fehler"/"error"/"nicht möglich" NOCH den
+# Konflikt-Text → _hat_fehler_indiz() greift nicht, pre_fire_r2() hielt das für
+# Erfolg und lieferte per _parse_execution() das S1-Token (!) als "exec2"
+# zurück. Ein Commit darauf kann grundsätzlich nicht buchen.
+# → Am Freischalt-Punkt gibt es KEIN vorziehbares r2. Der einzig mögliche Weg
+#   ist das "Weiter"-Dauerfeuer (Spam) auf einem s1-Token. Im SCHIEBE-Pfad
+#   bleibt das Prefire dagegen aktiv und bewährt (dort ist der Slot buchbar,
+#   nur die eigene Altbuchung überlappt – der Server lässt r2 durch).
+R2_PREFIRE_BEI_FREISCHALTUNG = False   # bewusst AUS – siehe Begründung oben
+
+# ── V18 M1: TIMING-DIAGNOSE ──────────────────────────────────────────────────
+# Bisher loggte _weiter_status() bei "ERROR" GAR NICHTS – kein Statuscode, kein
+# Location-Header, kein Body. Deshalb blieb der Hauptfehler dieser Version seit
+# dem 15.07. unsichtbar. Ab V18: pro Request Sendezeitpunkt relativ zu T-0, RTT,
+# Statuscode, Location-Ziel, Serveruhr aus dem Date-Header.
+TIMING_LOG_AKTIV       = True
+TIMING_LOG_ALLE_WEITER = False   # True = wirklich JEDER Weiter (sehr gesprächig)
+TIMING_LOG_ERSTE_N     = 5       # die ersten N Weiter immer loggen
+TIMING_LOG_JEDER_NTE   = 25      # danach nur noch jeden N-ten als Lebenszeichen
 
 # GODMODE-Blitz (V12): schneller als fremde Bots, ohne mehr Requests zu feuern
 R2_PREFIRE_MS          = 350     # ms: r2 SO VIEL vor T-0 feuern → Welle 0 = nur r3-Commit. 0 = aus.
@@ -472,6 +594,13 @@ ZEITSYNC_MAX_OFFSET_S  = 2.0     # s: größere Messwerte gelten als unplausibel
 ZEITSYNC_MAX_STREUUNG_S = 0.35   # s: streuen die Einzelmessungen weiter → Messung verworfen (V15)
 KONFLIKT_TEXT          = "konflikt mit einem bestehenden termin"  # exakter Server-Text (lowercase)
 ERFOLG_TEXTE           = ("buchung war erfolgreich", "aktion erfolgreich")
+# V18, belegt durch HAR 28.07. (Slot 04.08. 09:30, aufgenommen um 00:19):
+# Voller Servertext im Modal "Wählen Sie Ihre Buchung...":
+#   "Leider kann Ihre Buchung nicht durchgeführt werden.
+#    Grund: Es darf maximal 7 Tage im Voraus gebucht werden."
+# WICHTIG: Dieser Body enthält KEINES der Wörter aus FEHLER_INDIZIEN
+# ("fehler"/"error"/"nicht möglich") – deshalb lief er bisher unerkannt durch.
+NOCH_NICHT_BUCHBAR_TEXT = "maximal 7 tage im voraus"
 KONFLIKT_STOP_N        = 3       # Hartnäckig-Loop: nach so vielen Konflikten in Folge stoppen
 
 # Duo-Modus: zwei Accounts parallel auf Court 1 + Court 2 (Basis = Direkte Taktik).
@@ -1192,6 +1321,52 @@ def _format_restzeit(sek: float) -> str:
     if std > 0:
         return f"{std}h {minu}min"
     return f"{minu}min"
+
+# ══════════════════════════════════════════════
+# V18 M1: TIMING-DIAGNOSE (rein additiv, keine Verhaltensänderung)
+# ══════════════════════════════════════════════
+
+# Je Thread der Bezugszeitpunkt T-0 (Freischaltung / Storno-Moment). Jeder
+# Thread schreibt ausschließlich seinen EIGENEN Schlüssel → kein Lock nötig.
+_t0_referenz: dict = {}
+
+def _tref_setzen(basis_dt: datetime | None):
+    """T-0 für diesen Thread merken, damit Requests relativ dazu geloggt werden."""
+    tid = threading.get_ident()
+    if basis_dt is None:
+        _t0_referenz.pop(tid, None)
+    else:
+        _t0_referenz[tid] = basis_dt
+
+def _tdelta(zeitpunkt: datetime | None = None) -> str:
+    """'T+123ms' relativ zum gemerkten T-0, oder 'T?' wenn keins gesetzt ist."""
+    basis = _t0_referenz.get(threading.get_ident())
+    if basis is None:
+        return "T?"
+    return f"T{((zeitpunkt or jetzt_lokal()) - basis).total_seconds() * 1000:+.0f}ms"
+
+def _tlog(k: str, label: str, court, send_dt: datetime, send_perf: float,
+          resp=None, extra: str = ""):
+    """Eine Zeile pro Request: Sendezeitpunkt relativ T-0, RTT, Status,
+    Redirect-Ziel, Serveruhr. Bewusst EINZEILIG (Log läuft auf eMMC)."""
+    if not TIMING_LOG_AKTIV:
+        return
+    teile = [f"⏱️ [{k}] {label} C{court}",
+             f"send={_tdelta(send_dt)}",
+             f"rtt={(time.perf_counter() - send_perf) * 1000:.0f}ms"]
+    if resp is not None:
+        teile.append(f"status={resp.status_code}")
+        loc = resp.headers.get("Location", "")
+        if loc:
+            m = re.search(r"execution=(e\d+s\d+)", loc)
+            teile.append(f"loc={m.group(1) if m else loc[:60]}")
+        srv = resp.headers.get("Date", "")
+        if srv:
+            teile.append(f"srv={srv[-12:-4]}")     # nur HH:MM:SS aus dem Date-Header
+    if extra:
+        teile.append(extra)
+    log.info(" | ".join(teile))
+
 
 def warte_bis_genau(ziel_dt: datetime):
     """Schläft präzise bis ziel_dt (lokale Berlin-Zeit, naiv); die letzten
@@ -1957,10 +2132,14 @@ def _feuer_r3_commit(k: str, court: int, http, hp: dict, csrf_t: str,
                      exec2: str, slot: dict) -> tuple[bool, dict | None]:
     """Gemeinsames r3-Commit für burst_r2_r3 und burst_commit_only (GODMODE).
     Erkennt Konflikt ("Slot fremd belegt") und Erfolgs-Text explizit."""
+    _send_dt, _send_perf = jetzt_lokal(), time.perf_counter()
     r3 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
                    params={"execution": exec2, "_eventId": "commit"},
                    data=f"purchaseTemplate.comment=&_csrf={csrf_t}",
                    timeout=10)
+    # V18 M1: DER entscheidende Zeitstempel – wann ging der Commit raus,
+    # relativ zur Freischaltung, und wie lange brauchte der Server?
+    _tlog(k, "COMMIT", court, _send_dt, _send_perf, r3, extra=f"exec2={exec2}")
     if r3.status_code not in [200, 302]:
         return False, None
 
@@ -1996,17 +2175,30 @@ def pre_fire_r2(k: str, court: int, execution: str, slot: dict) -> str | None:
         return None
     hp = _post_header(csrf_t, datum_api)
     try:
+        _send_dt, _send_perf = jetzt_lokal(), time.perf_counter()
         r2 = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
                        params={"execution": execution, "_eventId": "next"},
                        data=_r2_data(slot, court, person_id, csrf_t),
                        timeout=10)
         low2 = r2.text.lower()
         if (r2.status_code not in [200, 302] or KONFLIKT_TEXT in low2
-                or _hat_fehler_indiz(low2)):
+                or _hat_fehler_indiz(low2) or NOCH_NICHT_BUCHBAR_TEXT in low2):
             log.warning(f"[{k}] r2-Prefire Court {court} abgelehnt: "
                         f"status={r2.status_code} | body={_modal_debug(r2.text, 300)!r}")
             return None
         exec2 = _parse_execution(r2.text, execution.replace("s1", "s2"))
+        # ── V18 SICHERHEITSNETZ (HAR 28.07.) ────────────────────────────────
+        # Lehnt der Server r2 ab, ohne eines der obigen Muster zu liefern,
+        # bleibt der Flow auf Schritt 1 stehen und der Body enthält NUR
+        # "execution=eXs1". _parse_execution() gibt dann dieses s1-Token
+        # zurück – ein Commit darauf kann prinzipiell nicht buchen und hätte
+        # die Welle 0 verbrannt. Ein s1-Token ist NIE ein Commit-Token.
+        if exec2.endswith("s1"):
+            log.warning(f"[{k}] r2-Prefire Court {court}: Flow steht noch auf "
+                        f"Schritt 1 ({exec2}) → kein Commit-Token, verwerfe. "
+                        f"body={_modal_debug(r2.text, 200)!r}")
+            return None
+        _tlog(k, "r2-Prefire", court, _send_dt, _send_perf, r2, extra=f"exec2={exec2}")
         return exec2
     except Exception as e:
         log.warning(f"[{k}] pre_fire_r2 Court {court}: {e}")
@@ -2033,7 +2225,8 @@ def burst_commit_only(k: str, court: int, exec2: str, slot: dict) -> tuple[bool,
 
 _RE_EXEC_STEP = re.compile(r"execution=e\d+s(\d+)")
 
-def _weiter_status(k: str, court: int, execution: str, slot: dict) -> tuple[str, str | None]:
+def _weiter_status(k: str, court: int, execution: str, slot: dict,
+                   log_diesen: bool = False) -> tuple[str, str | None]:
     """V16-Kern: feuert EIN "Weiter" (_eventId=next) auf `execution` und liest NUR
     den Redirect (folgt ihm NICHT → lädt die 6–15 KB-Seite nicht). Belegt durch
     HAR 10.07.:
@@ -2052,6 +2245,7 @@ def _weiter_status(k: str, court: int, execution: str, slot: dict) -> tuple[str,
         return "ERROR", None
     hp = _post_header(csrf_t, slot["datum_api"])
     try:
+        _send_dt, _send_perf = jetzt_lokal(), time.perf_counter()
         r = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
                       params={"execution": execution, "_eventId": "next"},
                       data=_r2_data(slot, court, person_id, csrf_t),
@@ -2064,16 +2258,38 @@ def _weiter_status(k: str, court: int, execution: str, slot: dict) -> tuple[str,
                 if step >= 2:
                     # Sprung auf Bestätigungsseite → exec2 aus der Location
                     exec2 = re.search(r"execution=(e\d+s\d+)", loc).group(1)
+                    _tlog(k, "Weiter→OFFEN", court, _send_dt, _send_perf, r,
+                          extra=f"exec2={exec2}")
                     return "OPEN", exec2
+                if log_diesen:
+                    _tlog(k, "Weiter", court, _send_dt, _send_perf, r, extra="zu")
                 return "LOCKED", None      # zurück auf s1 → noch zu
+            # Redirect ohne execution im Ziel → unerwartet, Ziel mitloggen
+            _tlog(k, "Weiter⚠️", court, _send_dt, _send_perf, r,
+                  extra=f"KEIN execution im Location: {loc[:120]!r}")
             return "ERROR", None
         # Kein Redirect (200 o.ä.): Body prüfen (Konflikt/Commit-Formular)
         low = r.text.lower()
         if KONFLIKT_TEXT in low:
+            if log_diesen:
+                _tlog(k, "Weiter", court, _send_dt, _send_perf, r, extra="Konflikt")
+            return "LOCKED", None
+        # V18 (HAR 28.07.): "Es darf maximal 7 Tage im Voraus gebucht werden"
+        # heißt NICHT "kaputt", sondern "noch nicht dran" → weiter warten.
+        if NOCH_NICHT_BUCHBAR_TEXT in low:
+            if log_diesen:
+                _tlog(k, "Weiter", court, _send_dt, _send_perf, r,
+                      extra="noch nicht buchbar (7-Tage-Regel)")
             return "LOCKED", None
         if "_eventid=commit" in low or "sind alle angaben" in low:
             exec2 = _parse_execution(r.text, execution.replace("s1", "s2"))
+            _tlog(k, "Weiter→OFFEN", court, _send_dt, _send_perf, r,
+                  extra=f"exec2={exec2} (ohne Redirect)")
             return "OPEN", exec2
+        # UNERWARTET – das ist der Fall, der den Blitz seit 15.07. ausbremst.
+        # Ab jetzt mit Statuscode und Body im Log, damit er erklärbar wird.
+        _tlog(k, "Weiter⚠️", court, _send_dt, _send_perf, r,
+              extra=f"UNERWARTET → Fallback | body={_modal_debug(r.text, 400)!r}")
         return "ERROR", None
     except Exception as e:
         log.warning(f"[{k}] Weiter-Status Court {court}: {e}")
@@ -2083,7 +2299,8 @@ def _weiter_status(k: str, court: int, execution: str, slot: dict) -> tuple[str,
 def _spam_weiter_commit(k: str, court: int, slot: dict, deadline_ts: float,
                         aktiv_fn, execution: str | None = None,
                         konflikt_stop: int = SPAM_KONFLIKT_STOP,
-                        label: str = "Spam") -> tuple[str, dict | None]:
+                        label: str = "Spam",
+                        t0_dt: datetime | None = None) -> tuple[str, dict | None]:
     """V17-KERN (gemeinsam für alle Modi): hält EINEN eXs1-Token und feuert
     "Weiter" im Dauerfeuer, bis der Slot aufspringt (Redirect → s2), dann SOFORT
     commit. Kein r1-Neuladen pro Versuch. Spammt bis `deadline_ts`
@@ -2104,16 +2321,31 @@ def _spam_weiter_commit(k: str, court: int, slot: dict, deadline_ts: float,
     konflikte = 0
     weiter_versuche = 0
     while aktiv_fn() and time.time() < deadline_ts:
-        status, exec2 = _weiter_status(k, court, execution, slot)
+        # V18 M1: die ersten N und danach jeden N-ten Weiter mitloggen – so ist
+        # der Ablauf nachvollziehbar, ohne das Log (eMMC!) zu fluten.
+        log_diesen = (TIMING_LOG_ALLE_WEITER
+                      or weiter_versuche < TIMING_LOG_ERSTE_N
+                      or weiter_versuche % TIMING_LOG_JEDER_NTE == 0)
+        status, exec2 = _weiter_status(k, court, execution, slot,
+                                       log_diesen=log_diesen)
         weiter_versuche += 1
 
         if status == "LOCKED":
-            time.sleep(SPAM_NEXT_INTERVAL)      # noch zu → gleicher Token, weiter
+            # V18 WARMHALTEN: Solange T-0 noch weit weg ist, im Sekundentakt
+            # weitertippen. Das hält den Flow-Token UND die TCP-Verbindung warm
+            # (der Sniper-Spam macht es genauso und funktioniert – der Blitz
+            # ließ beides 9s brachliegen). Erst kurz vor T-0 auf Vollgas.
+            if (t0_dt is not None
+                    and (t0_dt - jetzt_lokal()).total_seconds()
+                        > SPAM_HOCHFREQUENZ_MS / 1000.0):
+                time.sleep(SPAM_WARMHALTE_INTERVAL)
+            else:
+                time.sleep(SPAM_NEXT_INTERVAL)  # noch zu → gleicher Token, weiter
             continue
 
         if status == "ERROR":
             log.warning(f"[{k}] {label} Court {court}: unerwartete Antwort nach "
-                        f"{weiter_versuche} Weiter → Fallback")
+                        f"{weiter_versuche} Weiter ({_tdelta()}) → Fallback")
             return "FALLBACK", None
 
         # status == OPEN → Slot ist auf, sofort committen
@@ -2150,20 +2382,35 @@ def _spam_weiter_commit(k: str, court: int, slot: dict, deadline_ts: float,
 
 
 def spam_commit_blitz(k: str, court: int, slot: dict, basis_dt: datetime,
-                      aktiv_fn) -> tuple[str, dict | None]:
-    """Freischaltungs-Blitz (Direkt/Duo/3h/Safe): Token holen, kurz vor T-0 mit
-    dem "Weiter"-Dauerfeuer beginnen, bei Aufspringen sofort commit. Dünner
-    Wrapper um den gemeinsamen Kern _spam_weiter_commit."""
-    execution = pre_warm_r1(k, court, slot["datum_api"], slot["fromTime"], slot["toTime"])
+                      aktiv_fn, execution: str | None = None) -> tuple[str, dict | None]:
+    """Freischaltungs-Blitz (Direkt/Duo/3h/Safe): EINEN Token halten und damit
+    bis T-0 durchgehend "Weiter" tippen, bei Aufspringen sofort commit. Dünner
+    Wrapper um den gemeinsamen Kern _spam_weiter_commit.
+
+    V18 – zwei Änderungen gegenüber V17 (siehe Konstantenblock oben):
+      1. `execution` wird jetzt vom Aufrufer durchgereicht. Vorher holte diese
+         Funktion einen ZWEITEN Token, während der Pre-Warm-Token aus
+         _direkt_blitz ungenutzt verfiel → zwei offene Flows gleichzeitig
+         (im Log als "Pre-Warm → e2s1" / "Spam Token e3s1" sichtbar).
+      2. Kein `warte_bis_genau` mehr vor dem Start: der Spam läuft ab sofort,
+         im Warmhalte-Takt. Vorher lagen 9s Leerlauf zwischen Token-Erzeugung
+         und erstem Weiter – Token und TCP-Verbindung standen brach.
+    """
+    if not execution:
+        execution = pre_warm_r1(k, court, slot["datum_api"],
+                                slot["fromTime"], slot["toTime"])
     if not execution:
         log.warning(f"[{k}] Spam Court {court}: Pre-Warm leer → Fallback")
         return "FALLBACK", None
-    log.info(f"⚡ [{k}] Spam Court {court}: Token {execution} → warte auf Freischaltung")
-    # "Weiter"-Dauerfeuer erst kurz vor T-0 starten (davor eh nur LOCKED).
-    warte_bis_genau(basis_dt - timedelta(milliseconds=SPAM_FENSTER_VOR_MS))
-    deadline = time.time() + SPAM_DEADLINE_S + SPAM_FENSTER_VOR_MS / 1000.0
+
+    rest_s = max(0.0, (basis_dt - jetzt_lokal()).total_seconds())
+    log.info(f"⚡ [{k}] Spam Court {court}: Token {execution} → Warmhalten "
+             f"({rest_s:.1f}s bis T-0, Takt {SPAM_WARMHALTE_INTERVAL}s → "
+             f"{SPAM_NEXT_INTERVAL}s ab T-{SPAM_HOCHFREQUENZ_MS}ms)")
+    deadline = time.time() + rest_s + SPAM_DEADLINE_S
     return _spam_weiter_commit(k, court, slot, deadline, aktiv_fn,
-                               execution=execution, label="Spam")
+                               execution=execution, label="Spam",
+                               t0_dt=basis_dt)
 
 
 def _direkt_blitz(k: str, datum_de: str, datum_api: str, dauer_min: int,
@@ -2211,27 +2458,36 @@ def _direkt_blitz(k: str, datum_de: str, datum_api: str, dauer_min: int,
 
     def court_worker(court: int):
         slot = _baue_slot_dict(court, from_t, to_t, datum_de, datum_api, dauer_min)
+        # V18 M1: T-0 für diesen Thread merken → alle Requests werden relativ
+        # dazu geloggt ("send=T-412ms"). Rein diagnostisch.
+        _tref_setzen(basis_dt)
 
-        # Pre-Warm bei T-10s
-        prewarm_dt = basis_dt - timedelta(seconds=BLITZ_PREWARM_SECONDS)
+        # V18: Mit aktivem Spam deutlich früher starten (T-60s), damit das
+        # "Weiter"-Dauerfeuer die Freischaltung selbst entdeckt, statt sich auf
+        # einen berechneten Zeitpunkt zu verlassen. Ohne Spam bleibt es beim
+        # bewährten T-10s-Pre-Warm (ein Token soll dort nicht 60s brachliegen).
+        vorlauf_s  = SPAM_START_VOR_S if SPAM_COMMIT_AKTIV else BLITZ_PREWARM_SECONDS
+        prewarm_dt = basis_dt - timedelta(seconds=vorlauf_s)
         warte_bis_genau(prewarm_dt)
         if not az_get(k, "schiebe_aktiv"):
             return
         execution = pre_warm_r1(k, court, datum_api, from_t, to_t)
         if execution:
-            log.info(f"⚡ [{k}] Pre-Warm Court {court} OK → {execution}")
+            log.info(f"⚡ [{k}] Pre-Warm Court {court} OK → {execution} ({_tdelta()})")
         else:
             log.warning(f"[{k}] Pre-Warm Court {court} fehlgeschlagen")
 
-        # ── V16: SPAM-COMMIT ZUERST ("Weiter"-Dauerfeuer → beim Aufspringen
+        # ── V16/V18: SPAM-COMMIT ZUERST ("Weiter"-Dauerfeuer → beim Aufspringen
         #    sofort buchen). HIT/CONFLICT beenden diesen Court; nur bei FALLBACK
-        #    läuft der bewährte V15-Burst unten weiter (kann nie schlechter sein).
+        #    läuft der bewährte Burst unten weiter (kann nie schlechter sein).
+        #    V18: der oben geholte Token wird DURCHGEREICHT (kein zweiter Flow).
         if SPAM_COMMIT_AKTIV:
             with treffer_lock:
                 if treffer:
                     return
             ausgang, buchung = spam_commit_blitz(
-                k, court, slot, basis_dt, lambda: az_get(k, "schiebe_aktiv"))
+                k, court, slot, basis_dt, lambda: az_get(k, "schiebe_aktiv"),
+                execution=execution)
             if ausgang == "HIT":
                 with treffer_lock:
                     if not treffer:
@@ -2239,17 +2495,23 @@ def _direkt_blitz(k: str, datum_de: str, datum_api: str, dauer_min: int,
                 return
             if ausgang == "CONFLICT":
                 return
-            # FALLBACK: frisch in den klassischen Burst (basis_dt liegt jetzt in
-            # der Vergangenheit → Burst feuert sofort, wie ein verspäteter Blitz).
-            execution = None
-            log.info(f"[{k}] Spam Court {court} → Fallback auf klassischen Burst")
+            # FALLBACK: Der Spam-Token ist in unklarem Zustand (der Flow kann
+            # weitergelaufen sein). V17 setzte hier execution=None und ließ
+            # Welle 0 bei T-0 erst r1 holen → der Commit landete gemessen
+            # 394–545ms nach der Freischaltung. V18 wärmt SOFORT frisch vor,
+            # damit Welle 0 direkt mit r2+r3 startet (~100ms gespart).
+            log.info(f"[{k}] Spam Court {court} → Fallback auf klassischen Burst "
+                     f"({_tdelta()}), wärme frischen Token vor")
+            execution = pre_warm_r1(k, court, datum_api, from_t, to_t)
 
-        # GODMODE: r2 schon bei T−R2_PREFIRE_MS feuern → Welle 0 muss bei T-0
-        # nur noch committen. Lehnt der Server das frühe r2 ab, holt der
-        # Fallback sofort einen frischen Token (alter Flow evtl. verbrannt)
-        # und Welle 0 feuert wie bisher den vollen r2+r3-Burst.
+        # ── r2-PREFIRE ──────────────────────────────────────────────────────
+        # V18: Am FREISCHALT-Punkt ist ein vorgezogenes r2 nachweislich unmöglich
+        # (HAR 28.07.: der Server lehnt vor der Freischaltung mit der 7-Tage-
+        # Regel ab und bleibt auf Schritt 1). Deshalb standardmäßig AUS – siehe
+        # R2_PREFIRE_BEI_FREISCHALTUNG. Im Schiebe-Pfad bleibt das Prefire aktiv,
+        # dort ist es bewährt (Slot buchbar, nur eigene Altbuchung überlappt).
         exec2 = None
-        if execution and R2_PREFIRE_MS > 0:
+        if execution and R2_PREFIRE_MS > 0 and R2_PREFIRE_BEI_FREISCHALTUNG:
             warte_bis_genau(basis_dt - timedelta(milliseconds=R2_PREFIRE_MS))
             if not az_get(k, "schiebe_aktiv"):
                 return
@@ -2311,7 +2573,15 @@ def _direkt_blitz(k: str, datum_de: str, datum_api: str, dauer_min: int,
             # Neuer Pre-Warm für nächste Welle (execution ist verbraucht)
             execution = pre_warm_r1(k, court, datum_api, from_t, to_t)
 
-    threads = [threading.Thread(target=court_worker, args=(c,), daemon=True)
+    def _worker_mit_cleanup(court: int):
+        # V18 M1: T-0-Referenz des Threads am Ende immer freigeben, damit der
+        # Diagnose-Speicher über die Bot-Laufzeit nicht mitwächst.
+        try:
+            court_worker(court)
+        finally:
+            _tref_setzen(None)
+
+    threads = [threading.Thread(target=_worker_mit_cleanup, args=(c,), daemon=True)
                for c in courts_zu_versuchen]
     for t in threads:
         t.start()
@@ -2571,6 +2841,12 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
             if not schlafe(30):
                 return
             continue
+
+        # V18 M1: Ab hier ist der Slot offen. Der Storno-Moment ist das T-0 des
+        # Schiebens – alle folgenden Requests werden relativ dazu geloggt, damit
+        # das kritische Fenster (Storno → Neubuchung) exakt messbar wird.
+        _tref_setzen(jetzt_lokal())
+        log.info(f"[{k}] ⏱️ Storno durch – kritisches Fenster offen (T-0 gesetzt)")
 
         gerade_court = aktive_b["court"]   # für eff_court-Fallback weiter unten
 
@@ -4908,6 +5184,168 @@ def telegram_loop():
             time.sleep(1)
 
 # ══════════════════════════════════════════════
+# V17.1 MESSUNG (rein additiv – kein Eingriff in Buchungs-/Schiebe-Logik)
+# ══════════════════════════════════════════════
+# Läuft EINMAL beim Start in einem Hintergrund-Thread und schreibt das Ergebnis
+# ins normale Add-on-Log. Bucht nichts, loggt sich nirgends ein, fasst keine
+# Account-Session an. Last: ~2,7 Requests/s für ~45s (Blitz-Bursts sind ein
+# Vielfaches davon) – aber trotzdem NICHT kurz vor einem geplanten Blitz neu
+# starten. Alles Standardbibliothek, keine neuen Abhängigkeiten.
+
+import socket
+import ssl
+import struct
+import statistics
+import urllib.request
+
+MESS_BEIM_START   = True          # False = Messung komplett aus
+MESS_STARTVERZUG  = 20            # s: erst nach dem Login-Getümmel messen
+_NTP_HOST         = "ptbtime1.ptb.de"
+_NTP_EPOCH        = 2208988800
+_MESS_HOST        = BASE_URL.replace("https://", "").replace("http://", "")
+
+
+def _mess_log(zeile: str):
+    log.info(f"📏 MESSUNG | {zeile}")
+
+
+def _ntp_probe(host: str) -> tuple[float, float]:
+    """Ein NTP-Roundtrip nach RFC. Liefert (offset_s, delay_s).
+    offset > 0 = die lokale Uhr geht NACH."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3)
+    try:
+        t1 = time.time()
+        s.sendto(b"\x1b" + 47 * b"\0", (host, 123))
+        daten, _ = s.recvfrom(1024)
+        t4 = time.time()
+    finally:
+        s.close()
+    t2 = (struct.unpack("!I", daten[32:36])[0]
+          + struct.unpack("!I", daten[36:40])[0] / 2**32 - _NTP_EPOCH)
+    t3 = (struct.unpack("!I", daten[40:44])[0]
+          + struct.unpack("!I", daten[44:48])[0] / 2**32 - _NTP_EPOCH)
+    return ((t2 - t1) + (t3 - t4)) / 2, (t4 - t1) - (t3 - t2)
+
+
+def _mess_uhr_offset(n: int = 12):
+    """3.1 – Geht die Uhr des Green richtig? Basis für die Schuss-Genauigkeit."""
+    _mess_log(f"── 3.1 UHR-OFFSET gegen {_NTP_HOST} ──")
+    offsets = []
+    for _ in range(n):
+        try:
+            off, delay = _ntp_probe(_NTP_HOST)
+            offsets.append(off)
+            _mess_log(f"   NTP: offset {off*1000:+8.1f} ms | delay {delay*1000:6.1f} ms")
+        except Exception as e:
+            _mess_log(f"   NTP-Fehler: {e}")
+        time.sleep(0.5)
+
+    if not offsets:
+        _mess_log("   ERGEBNIS: keine NTP-Messung möglich (UDP/123 im Container geblockt?)")
+        return
+    med = statistics.median(offsets)
+    _mess_log(f"   ERGEBNIS: Median {med*1000:+.1f} ms | "
+              f"Streuung {(max(offsets)-min(offsets))*1000:.1f} ms "
+              f"(positiv = Green geht NACH)")
+    if abs(med) > 0.030:
+        _mess_log("   BEFUND: lokale Uhr taugt NICHT als Schussbasis → NTP am HA-Host fixen!")
+    else:
+        _mess_log("   BEFUND: lokale Uhr ist sauber.")
+
+
+def _mess_rtt(n: int = 40):
+    """3.2 – TCP-/TLS-Zeiten zum Zielhost. p95 und MAX sind die relevanten
+    Zahlen (Jitter am Hausanschluss), nicht der Median."""
+    _mess_log(f"── 3.2 RTT/JITTER zu {_MESS_HOST} ──")
+    try:
+        ip = socket.gethostbyname(_MESS_HOST)
+    except Exception as e:
+        _mess_log(f"   DNS fehlgeschlagen: {e}")
+        return
+    _mess_log(f"   {_MESS_HOST} → {ip} ({n} Verbindungen)")
+
+    ctx = ssl.create_default_context()
+    tcp, tls = [], []
+    for i in range(n):
+        try:
+            t0 = time.perf_counter()
+            sock = socket.create_connection((ip, 443), timeout=5)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            t1 = time.perf_counter()
+            conn = ctx.wrap_socket(sock, server_hostname=_MESS_HOST)
+            t2 = time.perf_counter()
+            conn.close()
+            tcp.append((t1 - t0) * 1000)
+            tls.append((t2 - t1) * 1000)
+        except Exception as e:
+            _mess_log(f"   Verbindung #{i} fehlgeschlagen: {e}")
+        time.sleep(0.5)
+
+    if not tcp:
+        _mess_log("   ERGEBNIS: keine Verbindung möglich.")
+        return
+    for name, werte in (("TCP-Connect ", tcp), ("TLS-Handshake", tls)):
+        werte.sort()
+        p95 = werte[min(int(len(werte) * 0.95), len(werte) - 1)]
+        sd  = statistics.stdev(werte) if len(werte) > 1 else 0.0
+        _mess_log(f"   {name}: min {werte[0]:6.1f} | med {statistics.median(werte):6.1f} | "
+                  f"p95 {p95:6.1f} | MAX {werte[-1]:6.1f} | stdev {sd:5.1f}  (ms)")
+    if statistics.median(tls) > 100:
+        _mess_log("   BEFUND: TLS-Handshake teuer → Keep-Alive-Ping kurz vor T-0 lohnt (M4).")
+
+
+def _mess_serveruhr(n: int = 40):
+    """3.3 – Serveruhr aus dem Date-Header. Der Header hat nur 1s-Auflösung,
+    darum ist der MAXIMALWERT der Differenz der Schätzer für den Offset.
+    Das 0,37s-Intervall wandert bewusst gegen das Sekundenraster."""
+    _mess_log(f"── 3.3 SERVERUHR via Date-Header von {_MESS_HOST} ──")
+    diffs = []
+    for _ in range(n):
+        try:
+            t0 = time.time()
+            resp = urllib.request.urlopen(f"{BASE_URL}/", timeout=5)
+            resp.read(1)
+            t1 = time.time()
+            kopf = resp.headers.get("Date")
+            resp.close()
+            if not kopf:
+                _mess_log("   ERGEBNIS: Server liefert KEINEN Date-Header!")
+                return
+            srv = parsedate_to_datetime(kopf).timestamp()
+            mid = (t0 + t1) / 2.0
+            diffs.append(srv - mid)
+            _mess_log(f"   {kopf} | diff {(srv-mid)*1000:+7.0f} ms | rtt {(t1-t0)*1000:6.1f} ms")
+        except Exception as e:
+            _mess_log(f"   Date-Fehler: {e}")
+        time.sleep(0.37)
+
+    if not diffs:
+        return
+    schaetzer = max(diffs)
+    _mess_log(f"   ERGEBNIS: min {min(diffs)*1000:+.0f} ms | max {schaetzer*1000:+.0f} ms")
+    _mess_log(f"   BEFUND: geschätzter Serveruhr-Offset {schaetzer*1000:+.0f} ms "
+              f"{'– AUFFÄLLIG, über mehrere Tage prüfen!' if abs(schaetzer) > 0.15 else '– synchron.'}")
+
+
+def _mess_lauf():
+    time.sleep(MESS_STARTVERZUG)
+    _mess_log("=" * 54)
+    _mess_log("START Messlauf V17.1 (einmalig, ~90s, bucht nichts)")
+    _mess_log("=" * 54)
+    for name, fn in (("Uhr-Offset", _mess_uhr_offset),
+                     ("RTT/Jitter", _mess_rtt),
+                     ("Serveruhr",  _mess_serveruhr)):
+        try:
+            fn()
+        except Exception as e:
+            _mess_log(f"   {name} abgebrochen: {e}")
+    _mess_log("=" * 54)
+    _mess_log("ENDE Messlauf – alle '📏 MESSUNG'-Zeilen aus dem Log kopieren.")
+    _mess_log("=" * 54)
+
+
+# ══════════════════════════════════════════════
 # START
 # ══════════════════════════════════════════════
 
@@ -4976,6 +5414,12 @@ if __name__ == "__main__":
     zeige_account_auswahl()
 
     threading.Thread(target=telegram_loop, daemon=True).start()
+
+    # V17.1: einmaliger Messlauf im Hintergrund (Uhr, RTT/Jitter, Serveruhr).
+    # Blockiert den Bot nicht; Ergebnis landet als "📏 MESSUNG" im Log.
+    if MESS_BEIM_START:
+        threading.Thread(target=_mess_lauf, daemon=True).start()
+        log.info(f"📏 Messlauf startet in {MESS_STARTVERZUG}s (Ergebnis im Log)")
 
     log.info("✅ Bot läuft. Strg+C zum Beenden.")
     try:
