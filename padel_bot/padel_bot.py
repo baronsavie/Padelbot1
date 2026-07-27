@@ -601,6 +601,15 @@ ERFOLG_TEXTE           = ("buchung war erfolgreich", "aktion erfolgreich")
 # WICHTIG: Dieser Body enthält KEINES der Wörter aus FEHLER_INDIZIEN
 # ("fehler"/"error"/"nicht möglich") – deshalb lief er bisher unerkannt durch.
 NOCH_NICHT_BUCHBAR_TEXT = "maximal 7 tage im voraus"
+# V18, belegt durch Log 27.07. 08:30:00,401 – das explizite Fehlschlag-Modal:
+#   Titel "Aktion fehlgeschlagen"
+#   "Leider war Ihre Buchung nicht erfolgreich! Bitte wenden Sie sich an den
+#    eBuSy Support oder probieren Sie es zu einem späteren Zeitpunkt erneut."
+# Auch dieser Text enthält KEIN Wort aus FEHLER_INDIZIEN ("fehlgeschlagen"
+# enthält kein "fehler"!) → _feuer_r3_commit() meldete dafür ok=True. Gerettet
+# hat nur die strikte my-bookings-Verifikation ("r3 OK aber NICHT in
+# my-bookings → ignoriere"), aber die Welle war verschenkt.
+MISSERFOLG_TEXTE       = ("aktion fehlgeschlagen", "buchung nicht erfolgreich")
 KONFLIKT_STOP_N        = 3       # Hartnäckig-Loop: nach so vielen Konflikten in Folge stoppen
 
 # Duo-Modus: zwei Accounts parallel auf Court 1 + Court 2 (Basis = Direkte Taktik).
@@ -2119,8 +2128,26 @@ def burst_r2_r3(k: str, court: int, execution: str, slot: dict) -> tuple[bool, d
         if KONFLIKT_TEXT in low2:
             log.warning(f"⛔ [{k}] Court {court}: Konflikt bereits in r2 – Slot vergeben.")
             return False, {"konflikt": True}
+        # ── V18 (Messung 28.07. + HAR): DERSELBE FEHLER WIE IN pre_fire_r2 ──
+        # Die Serveruhr geht ~0,3s nach. Eine Welle, die lokal bei T+300ms
+        # feuert, schickt ihr r2 also noch VOR der echten Freischaltung. Der
+        # Server antwortet dann mit der 7-Tage-Absage: Status 200, kein
+        # "fehler"/"error"/"nicht möglich", kein Konflikt-Text – rutschte also
+        # durch beide Prüfungen. _parse_execution() fand im Body nur
+        # "execution=eXs1" und lieferte dieses SCHRITT-1-Token als exec2 zurück,
+        # worauf r3 blind committete → "Aktion fehlgeschlagen" (Log 27.07. 08:30).
+        # Ein s1-Token ist NIE ein Commit-Token.
+        if NOCH_NICHT_BUCHBAR_TEXT in low2:
+            log.info(f"[{k}] Court {court}: r2 zu früh – Slot laut Server noch "
+                     f"nicht buchbar (7-Tage-Regel).")
+            return False, {"zu_frueh": True}
         if _hat_fehler_indiz(low2):
             return False, None
+        if exec2.endswith("s1"):
+            log.warning(f"[{k}] Court {court}: r2 blieb auf Schritt 1 ({exec2}) → "
+                        f"kein Commit-Token, Welle verworfen. "
+                        f"body={_modal_debug(r2.text, 200)!r}")
+            return False, {"zu_frueh": True}
 
         return _feuer_r3_commit(k, court, http, hp, csrf_t, exec2, slot)
     except Exception as e:
@@ -2153,6 +2180,12 @@ def _feuer_r3_commit(k: str, court: int, http, hp: dict, csrf_t: str,
     if KONFLIKT_TEXT in low:
         log.warning(f"⛔ [{k}] Court {court}: Konflikt mit bestehendem Termin – Slot vergeben.")
         return False, {"konflikt": True}
+    # V18: expliziter Fehlschlag des Servers. Muss VOR _hat_fehler_indiz stehen,
+    # denn "fehlgeschlagen" enthält kein "fehler" → rutschte bisher als ok=True
+    # durch (Log 27.07. 08:30). Macht die Prüfung strenger, nie lockerer.
+    if any(t in low for t in MISSERFOLG_TEXTE):
+        log.warning(f"⛔ [{k}] Court {court}: Server meldet Buchung fehlgeschlagen.")
+        return False, None
     if _hat_fehler_indiz(low):
         return False, None
     erfolg_text = any(t in low for t in ERFOLG_TEXTE)
