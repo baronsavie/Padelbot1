@@ -1085,6 +1085,7 @@ def zeige_account_menue(k: str):
                [{"text": "📊 Status",                  "callback_data": f"menu_status_{k}"}],
                [{"text": "⏹️ Stoppen (Schiebe/Sniper)", "callback_data": f"menu_stopp_{k}"}],
                [{"text": "🗑️ Buchung stornieren",      "callback_data": f"menu_storno_{k}"}],
+               [{"text": "🧪 Flow-Test (Diagnose)",     "callback_data": f"ft_start_{k}"}],
                *([back_btn] if back_btn else []),
            ])
 
@@ -4915,6 +4916,11 @@ def handle_callback(cb: dict):
         handle_safe_callback(data)
         return
 
+    # ── V19.1 Flow-Test (eigener Wizard) – ebenfalls früh abfangen ────────────
+    if data.startswith("ft_"):
+        handle_flowtest_callback(data)
+        return
+
     # V2.1 FIX E: Account-Suffix nur bei echten Account-Menü-Buttons strippen.
     # Vorher kollidierten numerische Account-Labels (z.B. "1", "90") mit
     # Callbacks wie "schiebe_court_1" oder "slots_dauer_90" → falsches Routing.
@@ -5513,6 +5519,113 @@ def _flowtest_lauf(k: str, datum_de: str, von: str, court: int, dauer_min: int =
     log.info(f"🧪 [{k}] ===== FLOW-TEST ENDE (gebucht={bool(gebucht)}) =====")
     senden("🧪 <b>Flow-Test Ergebnis</b>\n<pre>" +
            "\n".join(zeilen).replace("<", "&lt;").replace(">", "&gt;") + "</pre>")
+
+
+# ── Button-Ablauf: Account → Datum → Dauer → Court → Uhrzeit → Bestätigung ───
+_ft = {"acc": None, "datum": None, "dauer": None, "court": None, "zeit": None}
+_ft_lock = threading.Lock()
+
+
+def _ft_reset():
+    with _ft_lock:
+        _ft.update(acc=None, datum=None, dauer=None, court=None, zeit=None)
+
+
+def _ft_kopf() -> str:
+    """Zeigt bei jedem Schritt, was bereits gewählt ist."""
+    with _ft_lock:
+        s = _ft.copy()
+    teile = [f"Account {s['acc']}"] if s["acc"] else []
+    if s["datum"]:
+        teile.append(_datum_mit_tag(s["datum"]))
+    if s["dauer"]:
+        teile.append(f"{s['dauer']} Min")
+    if s["court"]:
+        teile.append(f"Court {s['court']}")
+    if s["zeit"]:
+        teile.append(f"{s['zeit']} Uhr")
+    return "🧪 <b>Flow-Test</b>\n" + (" | ".join(teile) if teile else "") + "\n\n"
+
+
+def handle_flowtest_callback(data: str):
+    if data == "ft_abbruch":
+        _ft_reset()
+        senden("↩️ Flow-Test abgebrochen.")
+        zeige_account_auswahl()
+        return
+
+    if data.startswith("ft_start_"):
+        k = data[len("ft_start_"):]
+        if k not in ACCOUNTS:
+            senden("❌ Unbekannter Account.")
+            return
+        _ft_reset()
+        with _ft_lock:
+            _ft["acc"] = k
+        senden(_ft_kopf() + "Für welchen <b>Tag</b>?\n"
+               "<i>Ab 8 Tagen voraus kann nichts gebucht werden – das ist der "
+               "gefahrlose Testfall.</i>",
+               buttons=erstelle_datum_buttons("ft_datum"))
+        return
+
+    if data.startswith("ft_datum_"):
+        with _ft_lock:
+            _ft["datum"] = data[len("ft_datum_"):]
+        senden(_ft_kopf() + "Wie <b>lange</b>?", buttons=dauer_buttons("ft_dauer"))
+        return
+
+    if data.startswith("ft_dauer_"):
+        with _ft_lock:
+            _ft["dauer"] = int(data[len("ft_dauer_"):])
+        senden(_ft_kopf() + "Welcher <b>Court</b>?",
+               buttons=[[{"text": "🏟️ Court 1", "callback_data": "ft_court_1"},
+                         {"text": "🏟️ Court 2", "callback_data": "ft_court_2"}],
+                        [{"text": "❌ Abbrechen", "callback_data": "ft_abbruch"}]])
+        return
+
+    if data.startswith("ft_court_"):
+        with _ft_lock:
+            _ft["court"] = int(data[len("ft_court_"):])
+            dauer = _ft["dauer"] or 90
+        senden(_ft_kopf() + "Welche <b>Startzeit</b>?",
+               buttons=zielzeit_buttons("ft_zeit", dauer))
+        return
+
+    if data.startswith("ft_zeit_"):
+        with _ft_lock:
+            _ft["zeit"] = data[len("ft_zeit_"):]
+            s = _ft.copy()
+        if not all([s["acc"], s["datum"], s["dauer"], s["court"], s["zeit"]]):
+            _ft_reset()
+            senden("❌ Auswahl unvollständig – bitte neu starten.")
+            return
+        bis = (datetime.strptime(s["zeit"], "%H:%M")
+               + timedelta(minutes=s["dauer"])).strftime("%H:%M")
+        tage = (datetime.strptime(s["datum"], "%d.%m.%Y").date() - jetzt_lokal().date()).days
+        warnung = ("\n\n⚠️ <b>{} Tage voraus – das liegt IM Buchungsfenster.\n"
+                   "Dabei kann eine ECHTE Buchung entstehen!</b>".format(tage)
+                   if tage <= 7 else
+                   "\n\n✅ {} Tage voraus – außerhalb der 7 Tage, "
+                   "es kann nichts gebucht werden.".format(tage))
+        senden(_ft_kopf() + f"<b>Bereit:</b> {s['zeit']}–{bis}{warnung}",
+               buttons=[[{"text": "🧪 Test starten", "callback_data": "ft_los"}],
+                        [{"text": "❌ Abbrechen", "callback_data": "ft_abbruch"}]])
+        return
+
+    if data == "ft_los":
+        with _ft_lock:
+            s = _ft.copy()
+        if not all([s["acc"], s["datum"], s["dauer"], s["court"], s["zeit"]]):
+            senden("❌ Auswahl unvollständig – bitte neu starten.")
+            return
+        _ft_reset()
+        if not _account_frei(s["acc"]):
+            senden(f"⚠️ Account {s['acc']} ist gerade beschäftigt (Schiebe/Sniper) – "
+                   f"erst stoppen oder anderen Account wählen.")
+            return
+        threading.Thread(target=_flowtest_lauf, daemon=True,
+                         args=(s["acc"], s["datum"], s["zeit"], s["court"], s["dauer"])).start()
+        return
 
 
 def handle_flowtest(text: str):
