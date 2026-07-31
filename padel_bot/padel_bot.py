@@ -1,5 +1,36 @@
 #!/usr/bin/env python3
-"""Padel Bot V18 TIMING (M1 Diagnose + M2 Freischaltungs-Fix)
+"""Padel Bot V19 PARALLELE STRÖME (Tail-Latenz-Absicherung)
+
+NEU V19 (Anlass: Log 28.07. – V18 holte 5 von 6 Blöcken, einer ging verloren):
+    V18 hat den Freischaltungs-Blitz repariert; die Zahlen des 28.07.:
+        07:00  OFFEN T+123  COMMIT T+198  → ✅
+        08:30  OFFEN T-5    COMMIT T+78   → ✅
+        10:00  OFFEN T-32   COMMIT T+82   → ✅
+        11:30  OFFEN T+8    COMMIT T+84   → ✅
+        13:00  OFFEN T+130  COMMIT T+225  → ✅
+        14:30  OFFEN T+105  COMMIT T+311  → ❌ Konflikt (Antwort erst T+471)
+    Der Verlust lag NICHT an der Logik – der Commit ging in derselben
+    Millisekunde raus, in der die Weiter-Antwort eintraf, wie in allen
+    Treffern auch. Ursache war eine EINZELNE hängende Serverantwort: die
+    entscheidende "Weiter"-Anfrage brauchte 205 ms, während alle übrigen
+    Requests desselben Tages zwischen 43 und 113 ms lagen. Ein serieller
+    Strom steht damit still.
+    FIX: SPAM_STROEME parallele, voneinander unabhängige "Weiter"-Ströme mit
+    je EIGENEM Flow-Token, versetzt gestartet. Wer zuerst "offen" sieht,
+    bucht sofort; die anderen stellen ein. Erkennungslücke ~110ms → ~55ms,
+    und eine hängende Antwort blockiert nichts mehr.
+    SPAM_STROEME = 1 ergibt exakt das V18-Verhalten.
+    Betrifft NUR spam_commit_blitz (Freischaltungs-Blitz). Sniper, Schiebe-
+    Rebook und Safe-Übergabe laufen unverändert seriell.
+
+    OFFEN: Ob die 205 ms allgemeine Serverlast um 14:30:00 waren oder
+    Warteschlangen-Zufall, ließ sich aus einem Ausreißer nicht entscheiden.
+    Der Log beantwortet es künftig selbst – sind BEIDE Ströme gleichzeitig
+    langsam, war es Last (dann bringt Parallelität nichts und wir drehen
+    SPAM_STROEME zurück auf 1).
+
+──────────────────────────────────────────────────────────────────────
+Basis: Padel Bot V18 TIMING (M1 Diagnose + M2 Freischaltungs-Fix)
 
 NEU V18 (Anlass: Logs 15.07. + 25.–27.07. + HAR 28.07.):
     BEFUND 1 – Der Freischaltungs-Blitz scheiterte in 6 von 6 protokollierten
@@ -528,8 +559,45 @@ SPAM_KONFLIKT_STOP     = 3       # commit-Konflikte in Folge (fremd vergeben) �
 # durchgehend benutzt wird – erst langsam (hält Token + Keep-Alive-Verbindung
 # warm), kurz vor T-0 dann im Hochfrequenz-Takt.
 SPAM_START_VOR_S        = 10     # s vor T-0: so früh mit dem Dauerfeuer beginnen
-SPAM_WARMHALTE_INTERVAL = 1.0    # s: Takt im Warmhalte-Fenster (T-10s … T-3s)
-SPAM_HOCHFREQUENZ_MS    = 3000   # ms vor T-0: ab hier auf SPAM_NEXT_INTERVAL umschalten
+SPAM_WARMHALTE_INTERVAL = 1.0    # s: Takt im Warmhalte-Fenster (T-10s … T-2s)
+SPAM_HOCHFREQUENZ_MS    = 2000   # ms vor T-0: ab hier auf SPAM_NEXT_INTERVAL umschalten
+                                 # V19: 3000→2000, damit die Gesamtlast trotz
+                                 # zweier Ströme vergleichbar bleibt.
+
+# ── V19 PARALLELE STRÖME (Anlass: Log 28.07. 14:30, Slot verloren) ───────────
+# Der Blitz holte an dem Tag 5 von 6 Blöcken. Der eine Verlust hatte eine klar
+# messbare Ursache: Die entscheidende "Weiter"-Antwort brauchte 205 ms, während
+# alle anderen Requests desselben Tages zwischen 43 und 113 ms lagen.
+#   T+3ms    Weiter raus → T+55 zurück: noch zu
+#   T+105ms  Weiter raus → 205 ms (!) → erst T+310 zurück
+#   T+311ms  Commit raus → T+471 zurück → Konflikt, Slot weg
+# Ein einzelner serieller Strom steht also still, sobald EINE Antwort hängt.
+# V19 fährt deshalb mehrere UNABHÄNGIGE Ströme, jeder mit EIGENEM Flow-Token,
+# versetzt gestartet. Wer zuerst "offen" sieht, bucht sofort; die anderen hören
+# auf. Effekt: Erkennungslücke ~110ms → ~55ms UND eine hängende Antwort
+# blockiert nichts mehr.
+# HINWEIS zur alten Sorge "zwei offene Flows waren doch der V17-Bug": nein –
+# der V17-Fehler war der 302/200-Wechsel des Servers (siehe NOCH_NICHT_BUCHBAR_TEXT),
+# nachgewiesen im Log vom 28.07. Mehrere Flows sind unbedenklich.
+# LAST: SPAM_STROEME × ~40 Requests im Hochfrequenzfenster (bei 2 also ~80 je
+# Blitz und Court, Spitze ~40/s). Achtung bei Court "Egal": dann läuft das je
+# Court, also doppelt. Bei festem Court (Normalfall) unkritisch.
+SPAM_STROEME           = 2       # 1 = exakt V18-Verhalten (ein Strom, ein Token)
+
+# ── V19.1 FLOW-TEST (Diagnose, standardmäßig gesperrt) ───────────────────────
+# Beantwortet EINE Frage: Nimmt der Server ein "Buchen" (_eventId=commit) an,
+# das losgeschickt wird, BEVOR die Antwort auf "Weiter" (_eventId=next) zurück
+# ist? Wenn ja, sparen wir nach der Freischaltung einen kompletten Rückweg
+# (~50–80 ms) und im Schiebe-Fenster sogar einen ganzen Roundtrip.
+# Wichtig zum Verständnis: Der Commit trägt KEINE Slot-Daten (nur Kommentar +
+# CSRF) – Datum/Uhrzeit/Court/Person stehen ausschließlich im "Weiter". Ein
+# Commit, der VOR der Verarbeitung des Weiter ankommt, hat also nichts zu
+# buchen. Die Idee funktioniert nur, wenn der Server die zweite Anfrage zum
+# selben Flow hinten anstellt, statt sie zu verwerfen. Genau das misst der Test.
+# Der Befehl ist bereits dadurch geschützt, dass der Telegram-Listener nur
+# Nachrichten aus TELEGRAM_CHAT_ID annimmt und alles andere verwirft.
+FLOWTEST_BEFEHL     = "/flowtest"
+FLOWTEST_VERSATZ_MS = 15      # ms Vorsprung für "Weiter" vor dem Commit
 # PRINZIP: Der Bot misst NICHT, wann der Slot aufspringt, und feuert auch nicht
 # auf einen berechneten Zeitpunkt. Er tippt durchgehend "Weiter" und schlägt zu,
 # sobald der Redirect auf s2 springt – die Freischaltung meldet sich von selbst.
@@ -578,6 +646,12 @@ TIMING_LOG_AKTIV       = True
 TIMING_LOG_ALLE_WEITER = False   # True = wirklich JEDER Weiter (sehr gesprächig)
 TIMING_LOG_ERSTE_N     = 5       # die ersten N Weiter immer loggen
 TIMING_LOG_JEDER_NTE   = 25      # danach nur noch jeden N-ten als Lebenszeichen
+# V19.1: Beim Sniper-Lauern (stundenlanges Antippen ohne festes T-0) flutete
+# diese Drosselung das Log trotzdem – im Log vom 31.07. waren rund 700 der 1000
+# Zeilen reines Lauer-Rauschen, wodurch die tatsächlichen Blitz- und Schiebe-
+# Ereignisse aus der Rotation gefallen sind. Im Lauer-Betrieb daher viel seltener.
+TIMING_LOG_JEDER_NTE_LAUER = 400 # ≈ alle 80s statt alle 5s
+TIMING_T0_MAX_ALTER_S  = 120     # ältere T-0-Marken gelten als ungültig ("T?")
 
 # GODMODE-Blitz (V12): schneller als fremde Bots, ohne mehr Requests zu feuern
 R2_PREFIRE_MS          = 350     # ms: r2 SO VIEL vor T-0 feuern → Welle 0 = nur r3-Commit. 0 = aus.
@@ -1348,11 +1422,19 @@ def _tref_setzen(basis_dt: datetime | None):
         _t0_referenz[tid] = basis_dt
 
 def _tdelta(zeitpunkt: datetime | None = None) -> str:
-    """'T+123ms' relativ zum gemerkten T-0, oder 'T?' wenn keins gesetzt ist."""
+    """'T+123ms' relativ zum gemerkten T-0, oder 'T?' wenn keins gesetzt ist.
+    V19.1: Thread-IDs werden vom Betriebssystem wiederverwendet, und ein
+    Sniper-Thread, der vorher _schiebe_phase3 durchlaufen hat, erbte dessen
+    alte T-0-Marke – im Log vom 31.07. als 'send=T+2078606ms' (35 Minuten!)
+    sichtbar. Alles jenseits von TIMING_T0_MAX_ALTER_S ist kein sinnvoller
+    Bezugspunkt mehr und wird als 'T?' ausgewiesen."""
     basis = _t0_referenz.get(threading.get_ident())
     if basis is None:
         return "T?"
-    return f"T{((zeitpunkt or jetzt_lokal()) - basis).total_seconds() * 1000:+.0f}ms"
+    d = ((zeitpunkt or jetzt_lokal()) - basis).total_seconds()
+    if abs(d) > TIMING_T0_MAX_ALTER_S:
+        return "T?"
+    return f"T{d * 1000:+.0f}ms"
 
 def _tlog(k: str, label: str, court, send_dt: datetime, send_perf: float,
           resp=None, extra: str = ""):
@@ -2356,9 +2438,12 @@ def _spam_weiter_commit(k: str, court: int, slot: dict, deadline_ts: float,
     while aktiv_fn() and time.time() < deadline_ts:
         # V18 M1: die ersten N und danach jeden N-ten Weiter mitloggen – so ist
         # der Ablauf nachvollziehbar, ohne das Log (eMMC!) zu fluten.
+        # Ohne t0_dt läuft der Aufruf im Lauer-Betrieb (Sniper Phase 1) und kann
+        # Stunden dauern → deutlich stärker drosseln, sonst ertrinkt das Log.
+        _drossel = TIMING_LOG_JEDER_NTE if t0_dt is not None else TIMING_LOG_JEDER_NTE_LAUER
         log_diesen = (TIMING_LOG_ALLE_WEITER
                       or weiter_versuche < TIMING_LOG_ERSTE_N
-                      or weiter_versuche % TIMING_LOG_JEDER_NTE == 0)
+                      or weiter_versuche % _drossel == 0)
         status, exec2 = _weiter_status(k, court, execution, slot,
                                        log_diesen=log_diesen)
         weiter_versuche += 1
@@ -2429,21 +2514,87 @@ def spam_commit_blitz(k: str, court: int, slot: dict, basis_dt: datetime,
          im Warmhalte-Takt. Vorher lagen 9s Leerlauf zwischen Token-Erzeugung
          und erstem Weiter – Token und TCP-Verbindung standen brach.
     """
-    if not execution:
-        execution = pre_warm_r1(k, court, slot["datum_api"],
-                                slot["fromTime"], slot["toTime"])
-    if not execution:
-        log.warning(f"[{k}] Spam Court {court}: Pre-Warm leer → Fallback")
-        return "FALLBACK", None
-
-    rest_s = max(0.0, (basis_dt - jetzt_lokal()).total_seconds())
-    log.info(f"⚡ [{k}] Spam Court {court}: Token {execution} → Warmhalten "
-             f"({rest_s:.1f}s bis T-0, Takt {SPAM_WARMHALTE_INTERVAL}s → "
-             f"{SPAM_NEXT_INTERVAL}s ab T-{SPAM_HOCHFREQUENZ_MS}ms)")
+    rest_s   = max(0.0, (basis_dt - jetzt_lokal()).total_seconds())
     deadline = time.time() + rest_s + SPAM_DEADLINE_S
-    return _spam_weiter_commit(k, court, slot, deadline, aktiv_fn,
-                               execution=execution, label="Spam",
-                               t0_dt=basis_dt)
+
+    # ── EIN Strom (SPAM_STROEME <= 1): exakt das V18-Verhalten ────────────────
+    if SPAM_STROEME <= 1:
+        if not execution:
+            execution = pre_warm_r1(k, court, slot["datum_api"],
+                                    slot["fromTime"], slot["toTime"])
+        if not execution:
+            log.warning(f"[{k}] Spam Court {court}: Pre-Warm leer → Fallback")
+            return "FALLBACK", None
+        log.info(f"⚡ [{k}] Spam Court {court}: Token {execution} → Warmhalten "
+                 f"({rest_s:.1f}s bis T-0, Takt {SPAM_WARMHALTE_INTERVAL}s → "
+                 f"{SPAM_NEXT_INTERVAL}s ab T-{SPAM_HOCHFREQUENZ_MS}ms)")
+        return _spam_weiter_commit(k, court, slot, deadline, aktiv_fn,
+                                   execution=execution, label="Spam",
+                                   t0_dt=basis_dt)
+
+    # ── V19: MEHRERE UNABHÄNGIGE STRÖME ──────────────────────────────────────
+    log.info(f"⚡ [{k}] Spam Court {court}: {SPAM_STROEME} parallele Ströme "
+             f"({rest_s:.1f}s bis T-0, Versatz "
+             f"{SPAM_NEXT_INTERVAL / SPAM_STROEME * 1000:.0f}ms)")
+    stop       = threading.Event()
+    ergebnisse: dict = {}
+    erg_lock   = threading.Lock()
+
+    def strom(idx: int, vorgewaermt: str | None):
+        # T-0-Referenz auch in diesem Thread setzen, damit die ⏱️-Zeilen
+        # relativ zur Freischaltung geloggt werden.
+        _tref_setzen(basis_dt)
+        try:
+            if idx > 0:
+                # Versetzt starten, damit sich die Anfragen der Ströme
+                # gleichmäßig verteilen statt gleichzeitig zu feuern.
+                time.sleep(idx * SPAM_NEXT_INTERVAL / SPAM_STROEME)
+            ex = vorgewaermt or pre_warm_r1(k, court, slot["datum_api"],
+                                            slot["fromTime"], slot["toTime"])
+            if not ex:
+                log.warning(f"[{k}] Spam-Strom {idx+1} Court {court}: Pre-Warm leer")
+                with erg_lock:
+                    ergebnisse[idx] = ("FALLBACK", None)
+                return
+            log.info(f"⚡ [{k}] Spam-Strom {idx+1}/{SPAM_STROEME} Court {court}: "
+                     f"Token {ex}")
+            ausgang, buchung = _spam_weiter_commit(
+                k, court, slot, deadline,
+                lambda: aktiv_fn() and not stop.is_set(),
+                execution=ex, label=f"Spam{idx+1}", t0_dt=basis_dt)
+            with erg_lock:
+                ergebnisse[idx] = (ausgang, buchung)
+            # Treffer ODER fremd vergeben → die anderen Ströme sofort einstellen.
+            if ausgang in ("HIT", "CONFLICT"):
+                stop.set()
+        except Exception as e:
+            log.warning(f"[{k}] Spam-Strom {idx+1} Court {court}: {e}")
+            with erg_lock:
+                ergebnisse[idx] = ("FALLBACK", None)
+        finally:
+            _tref_setzen(None)
+
+    # Strom 0 bekommt den bereits vorgewärmten Token, die übrigen holen sich
+    # ihren eigenen (jeder Strom braucht einen EIGENEN Flow – zwei Threads auf
+    # demselben Token würden sich gegenseitig den Schritt wegnehmen).
+    threads = [threading.Thread(target=strom, daemon=True,
+                                args=(i, execution if i == 0 else None))
+               for i in range(SPAM_STROEME)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Auswertung: EIN Treffer genügt. Sollten zwei Ströme fast gleichzeitig
+    # committen, lehnt der Server den zweiten mit "Konflikt mit bestehendem
+    # Termin" ab (die eigene frische Buchung überlappt) → keine Doppelbuchung.
+    for ausgang, buchung in ergebnisse.values():
+        if ausgang == "HIT":
+            return "HIT", buchung
+    for ausgang, _ in ergebnisse.values():
+        if ausgang == "CONFLICT":
+            return "CONFLICT", None
+    return "FALLBACK", None
 
 
 def _direkt_blitz(k: str, datum_de: str, datum_api: str, dauer_min: int,
@@ -2893,11 +3044,23 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
         #    mit der gerade stornierten eigenen Buchung weg ist → sofort buchen).
         #    Kein Treffer → EXAKT der bewährte v12-Ablauf unten (Prefire-Commit +
         #    Burst + buche_slot + ROLLBACK) läuft unverändert weiter. ──────────
-        if SPAM_COMMIT_AKTIV:
+        # ── V19.1 FIX (Log 31.07. 14:19): Der vor dem Storno geholte Token wird
+        #    jetzt DURCHGEREICHT. Vorher rief _spam_weiter_commit intern
+        #    pre_warm_r1 auf – ein kompletter Roundtrip (~100ms) MITTEN im
+        #    kritischen Fenster, obwohl der Token längst bereitlag. Im Log gut
+        #    sichtbar: vorgewärmt war e3s1, gefeuert wurde auf e4s1 (loc=e4s2),
+        #    der erste "Weiter" ging erst bei T+109ms raus. Der Slot war bei
+        #    T+375ms weg; der erfolgreiche Schub um 18:47 lag bei T+298ms.
+        #    Liegt bereits ein gültiges s2-Token aus dem Prefire vor, ist der
+        #    direkte Commit unten der schnellste Weg (EIN Roundtrip) – dann wird
+        #    der Spam übersprungen, statt ihn zu verbrennen.
+        prewarm_verbraucht = False
+        if SPAM_COMMIT_AKTIV and not prewarm_exec2:
             spam_deadline = time.time() + SPAM_DEADLINE_S
             ausgang, buchung = _spam_weiter_commit(
                 k, blitz_court, ziel_slot, spam_deadline, aktiv,
-                label="Schiebe-Spam")
+                execution=prewarm_exec, label="Schiebe-Spam")
+            prewarm_verbraucht = True   # Spam hat den Token benutzt/erneuert
             if ausgang == "HIT":
                 az_set(k, "aktive_buchung", buchung)
                 ok = True
@@ -2908,7 +3071,8 @@ def _schiebe_phase3(k: str, datum_de: str, datum_api: str, dauer_min: int, ziel_
         if not ok and (prewarm_exec2 or prewarm_exec):
             # Nach erfolgreichem Prefire ist der r1-Token verbraucht → Welle 1+
             # wärmt frisch vor (execution=None). Ohne Prefire = alter Ablauf.
-            execution = None if prewarm_exec2 else prewarm_exec
+            # V19.1: auch nach dem Spam ist der Token verbraucht → frisch holen.
+            execution = None if (prewarm_exec2 or prewarm_verbraucht) else prewarm_exec
             for welle in range(MULTI_SHOT_COUNT + 1):
                 if not aktiv():
                     return
@@ -5191,6 +5355,13 @@ def telegram_loop():
                     if chat_id != str(TELEGRAM_CHAT_ID):
                         continue
                     text   = msg.get("text", "").strip()
+                    # V19.1: Flow-Test vor allen Wizard-Handlern abfangen und in
+                    # einem eigenen Thread laufen lassen, damit der Telegram-
+                    # Listener währenddessen bedienbar bleibt.
+                    if text.lower().startswith(FLOWTEST_BEFEHL):
+                        threading.Thread(target=handle_flowtest, args=(text,),
+                                         daemon=True).start()
+                        continue
                     if _duo_awaiting_text():
                         handle_duo_text(text)
                     elif _block_awaiting_text():
@@ -5215,6 +5386,161 @@ def telegram_loop():
             # pollt bereits serverseitig bis zu 5s (kein Busy-Loop). Nur im
             # Fehlerfall kurz pausieren, um Hot-Looping zu vermeiden.
             time.sleep(1)
+
+# ══════════════════════════════════════════════
+# V19.1 FLOW-TEST (Diagnose auf Zuruf per Telegram – siehe Konstantenblock)
+# ══════════════════════════════════════════════
+
+_RE_FT_TITEL = re.compile(r'modal-title">\s*(.*?)\s*</h4>', re.S)
+_RE_FT_ALERT = re.compile(r'alert alert-\w+">\s*(.*?)\s*</div>', re.S)
+
+
+def _ft_kurz(r) -> str:
+    """Antwort auf das Wesentliche eindampfen: Modal-Titel + Hinweistext."""
+    txt = re.sub(r"<script.*?</script>", "", r.text or "", flags=re.S)
+    titel = _RE_FT_TITEL.search(txt)
+    alert = _RE_FT_ALERT.search(txt)
+    teile = []
+    if titel:
+        teile.append(re.sub(r"\s+", " ", titel.group(1))[:90])
+    if alert:
+        teile.append("» " + re.sub(r"<[^>]+>", "", alert.group(1)).strip()[:160])
+    if not teile:
+        teile.append(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", txt)).strip()[:120])
+    return " | ".join(teile)
+
+
+def _ft_schritt(k: str, nr: str, verb: str, execution: str, slot: dict,
+                court: int, mit_daten: bool) -> tuple:
+    """Einen Flow-Schritt feuern und vollständig protokollieren.
+    mit_daten=True  → "Weiter" (trägt Datum/Zeit/Court/Person)
+    mit_daten=False → "Buchen" (trägt nur Kommentar + CSRF)."""
+    snap = az_snap(k, "csrf_token", "person_id", "http")
+    csrf_t, pid, http = snap["csrf_token"], snap["person_id"], snap["http"]
+    hp = _post_header(csrf_t, slot["datum_api"])
+    daten = (_r2_data(slot, court, pid, csrf_t) if mit_daten
+             else f"purchaseTemplate.comment=&_csrf={csrf_t}")
+    t0 = time.perf_counter()
+    r = http.post(f"{BASE_URL}/court-single-booking-flow", headers=hp,
+                  params={"execution": execution, "_eventId": verb},
+                  data=daten, timeout=15, allow_redirects=False)
+    ms = (time.perf_counter() - t0) * 1000.0
+    loc = r.headers.get("Location", "")
+    m = re.search(r"execution=(e\d+s\d+)", loc)
+    zeile = (f"[{nr}] {verb:6s} auf {execution:8s} → status={r.status_code} "
+             f"({ms:.0f}ms)" + (f" → {m.group(1)}" if m else ""))
+    log.info(f"🧪 [{k}] {zeile}")
+    log.info(f"🧪 [{k}]      Location: {loc[:160]!r}")
+    log.info(f"🧪 [{k}]      Body    : {_modal_debug(r.text, 900)!r}")
+    return r, zeile, _ft_kurz(r)
+
+
+def _flowtest_lauf(k: str, datum_de: str, von: str, court: int, dauer_min: int = 90):
+    """Die eigentliche Messung. Schickt bewusst KEINE gültige Buchung los,
+    solange das Datum außerhalb des 7-Tage-Fensters liegt."""
+    datum_api = datum_de_zu_api(datum_de)
+    bis = (datetime.strptime(von, "%H:%M") + timedelta(minutes=dauer_min)).strftime("%H:%M")
+    slot = _baue_slot_dict(court, von, bis, datum_de, datum_api, dauer_min)
+
+    tage_hin = (datetime.strptime(datum_de, "%d.%m.%Y").date() - jetzt_lokal().date()).days
+    im_fenster = tage_hin <= 7
+    kopf = (f"🧪 <b>Flow-Test</b>\n"
+            f"📅 {datum_de} {von}–{bis} | Court {court} | Account {k}\n"
+            f"🗓️ {tage_hin} Tage voraus → "
+            + ("<b>IM Fenster – hier kann WIRKLICH gebucht werden!</b>"
+               if im_fenster else "außerhalb der 7 Tage, Buchung unmöglich"))
+    senden(kopf)
+    log.info(f"🧪 [{k}] ===== FLOW-TEST {datum_de} {von} Court {court} "
+             f"({tage_hin} Tage voraus, im_fenster={im_fenster}) =====")
+
+    if not _session_refresh_vor_aktion(k, "Flow-Test"):
+        senden("❌ Flow-Test: Login fehlgeschlagen.")
+        return
+
+    zeilen = []
+
+    # ── TEST A: Commit OHNE vorheriges Weiter ────────────────────────────────
+    # Beantwortet: Was sagt der Server zu einem "Buchen" auf einen Flow, der
+    # noch auf Schritt 1 steht? Und überlebt das Ticket das?
+    ex_a = pre_warm_r1(k, court, datum_api, von, bis)
+    if not ex_a:
+        senden("❌ Flow-Test: kein Ticket erhalten (r1 leer).")
+        return
+    zeilen.append(f"Ticket A: {ex_a}")
+    _, z, kurz = _ft_schritt(k, "A1", "commit", ex_a.replace("s1", "s2"), slot, court, False)
+    zeilen.append(f"{z}\n     {kurz}")
+    # Lebt das Ticket danach noch?
+    _, z, kurz = _ft_schritt(k, "A2", "next", ex_a, slot, court, True)
+    zeilen.append(f"{z}\n     {kurz}")
+
+    # ── TEST B: Weiter und Commit quasi gleichzeitig ─────────────────────────
+    # Das ist der eigentliche Kandidat: Commit losschicken, ohne die Antwort
+    # auf Weiter abzuwarten – nur um FLOWTEST_VERSATZ_MS versetzt.
+    ex_b = pre_warm_r1(k, court, datum_api, von, bis)
+    if not ex_b:
+        senden("\n".join(zeilen) + "\n\n❌ Test B: kein zweites Ticket.")
+        return
+    zeilen.append(f"\nTicket B: {ex_b}  (Weiter + Buchen quasi gleichzeitig, "
+                  f"Versatz {FLOWTEST_VERSATZ_MS}ms)")
+    erg: dict = {}
+    tor = threading.Barrier(2)
+
+    def _weiter():
+        tor.wait()
+        erg["w"] = _ft_schritt(k, "B1", "next", ex_b, slot, court, True)
+
+    def _commit():
+        tor.wait()
+        time.sleep(FLOWTEST_VERSATZ_MS / 1000.0)
+        erg["c"] = _ft_schritt(k, "B2", "commit", ex_b.replace("s1", "s2"),
+                               slot, court, False)
+
+    tw = threading.Thread(target=_weiter, daemon=True)
+    tc = threading.Thread(target=_commit, daemon=True)
+    tw.start(); tc.start(); tw.join(); tc.join()
+    for key in ("w", "c"):
+        if key in erg:
+            zeilen.append(f"{erg[key][1]}\n     {erg[key][2]}")
+
+    # ── Ergebnis: ist dabei eine echte Buchung entstanden? ───────────────────
+    gebucht = verifiziere_slot_via_my_bookings(k, slot)
+    if gebucht:
+        zeilen.append(f"\n⚠️ <b>ES WURDE GEBUCHT</b> – ID {gebucht.get('booking_id')}\n"
+                      f"Falls ungewollt: über das Account-Menü stornieren.")
+    else:
+        zeilen.append("\n✅ Keine Buchung entstanden.")
+
+    log.info(f"🧪 [{k}] ===== FLOW-TEST ENDE (gebucht={bool(gebucht)}) =====")
+    senden("🧪 <b>Flow-Test Ergebnis</b>\n<pre>" +
+           "\n".join(zeilen).replace("<", "&lt;").replace(">", "&gt;") + "</pre>")
+
+
+def handle_flowtest(text: str):
+    """/flowtest &lt;TT.MM.JJJJ&gt; &lt;HH:MM&gt; [court] [account]"""
+    teile = text.split()
+    if len(teile) < 3:
+        senden("🧪 <b>Flow-Test</b>\n<code>/flowtest "
+               "&lt;TT.MM.JJJJ&gt; &lt;HH:MM&gt; [court] [account]</code>\n\n"
+               "Beispiel (außerhalb der 7 Tage, kann nichts buchen):\n"
+               "<code>/flowtest 20.08.2026 19:30</code>")
+        return
+
+    datum_de, von = teile[1], teile[2]
+    try:
+        datetime.strptime(datum_de, "%d.%m.%Y")
+        datetime.strptime(von, "%H:%M")
+    except ValueError:
+        senden("❌ Datum als TT.MM.JJJJ und Uhrzeit als HH:MM angeben.")
+        return
+    court = int(teile[3]) if len(teile) > 3 and teile[3].isdigit() else 2
+    k     = teile[4] if len(teile) > 4 and teile[4] in ACCOUNTS else next(iter(ACCOUNTS))
+    if not _account_frei(k):
+        senden(f"⚠️ Account {k} ist gerade beschäftigt (Schiebe/Sniper). "
+               f"Anderen Account angeben oder erst stoppen.")
+        return
+    log.info(f"🧪 Flow-Test angefordert: {datum_de} {von} Court {court} Account {k}")
+    _flowtest_lauf(k, datum_de, von, court)
+
 
 # ══════════════════════════════════════════════
 # V17.1 MESSUNG (rein additiv – kein Eingriff in Buchungs-/Schiebe-Logik)
